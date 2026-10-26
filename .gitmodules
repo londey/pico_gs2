@@ -1,0 +1,12 @@
+[submodule ".claude/skills/claude-skill-rust"]
+	path = .claude/skills/claude-skill-rust
+	url = https://github.com/londey/claude-skill-rust.git
+[submodule ".claude/skills/claude-skill-verilog"]
+	path = .claude/skills/claude-skill-verilog
+	url = https://github.com/londey/claude-skill-verilog.git
+[submodule ".claude/skills/ecp5-sv-yosys-verilator"]
+	path = .claude/skills/ecp5-sv-yosys-verilator
+	url = https://github.com/londey/ecp5-sv-yosys-verilator-skill.git
+[submodule "external/icepi-zero"]
+	path = external/icepi-zero
+	url = https://github.com/cheyao/icepi-zero.git
