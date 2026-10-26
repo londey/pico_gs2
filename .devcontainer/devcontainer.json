@@ -9,6 +9,7 @@
   ],
   "containerEnv": {
     "OSS_CAD_SUITE_PATH": "/opt/oss-cad-suite",
+    "CLAUDE_CONFIG_DIR": "${containerWorkspaceFolder}/.claude",
     "GIT_EDITOR": "code --wait"
   },
   "remoteEnv": {

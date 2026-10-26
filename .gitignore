@@ -1,2 +1,10 @@
 build/
 target/
+
+# Claude Code config (CLAUDE_CONFIG_DIR points here in the devcontainer so it
+# survives rebuilds). Only shared skills, agents and settings are committed;
+# credentials, history and session state stay local.
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/settings.json
