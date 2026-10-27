@@ -10,3 +10,5 @@ target/
 !.claude/settings.json
 # Account skills Claude Code syncs from claude.ai: per-user, re-downloaded.
 .claude/skills/synced/
+# Leftovers from Claude Code's skill syncing.
+.claude/skills/.trash/
