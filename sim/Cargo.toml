@@ -13,7 +13,12 @@ publish = false
 
 [workspace.dependencies]
 gpu-sim = { path = "../build/sinter/gpu-sim" }
+tmds-encoder-sim = { package = "video__tmds_encoder-sim", path = "../build/sinter/video__tmds_encoder-sim" }
+png = { version = "0.18", default-features = false }
 
 # The generated simulators are hot loops; optimise them even in test builds.
 [profile.dev.package.gpu-sim]
+opt-level = 3
+
+[profile.dev.package."video__tmds_encoder-sim"]
 opt-level = 3

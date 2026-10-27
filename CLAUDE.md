@@ -18,6 +18,8 @@ board/                  hand-written SystemVerilog top + constraints
   icepi_zero.lpf        pin constraints for the ports top.sv uses
 hw/                     Sinter sources (the design)
   gpu.snt               the root: the #[clock] struct the core module is named after
+  video.snt             video timing generator and TMDS encoder (#[module]s)
+  *_tb.snt              test-harness roots that expose a block's ports to `sinter sim`
   tests/                directed stimulus: <root>.<case>.csv drives hw/<root>.snt
 sim/                    Rust workspace: testbenches and chip models
   tb/                   integration tests driving the generated simulator
@@ -95,7 +97,14 @@ The rules that most often trip people up:
 Known gaps in v1.0.0-rc.1: `sinter build --pins` emits iCE40 PCF, not ECP5
 LPF (so `board/` is hand-written); there is no co-simulation of the
 generated Verilog against the simulator; `--faults` doesn't work with
-`#[module]`.
+`#[module]`; a `#[module]` in a child source module (`video::TmdsEncoder`)
+gets a simulator crate and type named `video__…`, which rustc warns about
+(harmless, in the generated crate).
+
+The generated Verilog must stay lint-clean under `-Wall`. Verilator flags
+unused bits of named wires, so don't bind a wide intermediate with `let` and
+narrow it later: cast in the same expression, or build shifted values with
+`@` and slices instead of `<<`.
 
 ## Coding standards
 

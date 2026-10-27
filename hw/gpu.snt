@@ -1,24 +1,117 @@
 // The pico-gs2 GPU core.
 //
-// Placeholder until board bring-up: a free-running counter whose top bits
-// drive the LEDs, so the whole flow (sinter, lint, synthesis, place and
-// route, the Rust twin) has something to build.
+// Board bring-up: a heartbeat on the LEDs in the core domain (100 MHz), and
+// a 640x480 colour-bar test pattern encoded for DVI in the pixel domain
+// (25 MHz). A `sync` crossing carries one bit from core to pixel that inverts
+// the pattern every few seconds. board/top.sv serialises the TMDS symbols.
+
+mod video;
+
+use root::video::TmdsEncoder;
+use root::video::VideoTiming;
+use root::video::vga_640x480;
+
 struct Gpu {
-    count: u30 = 0,
+    // Free-running counter for the heartbeat and the pattern inversion.
+    #[domain(core)]
+    count: u29 = 0,
+
+    // The pixel domain's half: timing, and one encoder per DVI channel.
+    #[domain(pixel)]
+    timing: VideoTiming,
+    #[domain(pixel)]
+    enc_blue: TmdsEncoder,
+    #[domain(pixel)]
+    enc_green: TmdsEncoder,
+    #[domain(pixel)]
+    enc_red: TmdsEncoder,
+
+    // The 10-bit TMDS symbols for board/top.sv to serialise.
+    #[domain(pixel)]
+    pub tmds_blue: u10 = 0,
+    #[domain(pixel)]
+    pub tmds_green: u10 = 0,
+    #[domain(pixel)]
+    pub tmds_red: u10 = 0,
+
+    // Core to pixel: high while the test pattern is inverted.
+    invert: sync<core, pixel>,
 }
 
-// The core's outputs to the board.
-struct GpuOut {
-    // The user LEDs, active high.
+// The core domain's outputs to the board.
+struct CoreOut {
+    // The user LEDs, active high: led[0] is the heartbeat (about 0.75 Hz),
+    // led[1] is lit while the pattern is inverted.
     led: u5,
 }
 
 impl Gpu {
-    #[clock(domain = core)]
-    fn tick(self) -> (Gpu, GpuOut) {
+    #[clock(domain = core, period = 1)]
+    fn tick_core(self) -> (Gpu, CoreOut) {
+        let heartbeat = self.count[26:26];
+        let inverted = self.count[28:28];
         (
-            Gpu { count: (self.count + 1) as u30 wrap },
-            GpuOut { led: self.count[29:25] },
+            Gpu {
+                count: (self.count + 1) as u29 wrap,
+                invert: self.invert.send(inverted),
+                ..self
+            },
+            CoreOut { led: 0_u3 @ inverted @ heartbeat },
         )
     }
+
+    #[clock(domain = pixel, period = 4)]
+    fn tick_pixel(self) -> Gpu {
+        let (timing, beam) = self.timing.step(vga_640x480());
+        let bars = colour_bars(beam.x, beam.y);
+        let rgb = if self.invert.value() == 1 { ~bars } else { bars };
+        // DVI carries HSYNC and VSYNC as C0 and C1 of the blue channel.
+        let sync = beam.vsync_n @ beam.hsync_n;
+        let (enc_blue, blue) = self.enc_blue.step(level(rgb[0:0]), sync, beam.de);
+        let (enc_green, green) = self.enc_green.step(level(rgb[1:1]), 0, beam.de);
+        let (enc_red, red) = self.enc_red.step(level(rgb[2:2]), 0, beam.de);
+        Gpu {
+            timing: timing,
+            enc_blue: enc_blue,
+            enc_green: enc_green,
+            enc_red: enc_red,
+            tmds_blue: blue.symbol,
+            tmds_green: green.symbol,
+            tmds_red: red.symbol,
+            invert: self.invert.recv(),
+            ..self
+        }
+    }
+}
+
+// Eight vertical bars, 80 pixels wide: white, yellow, cyan, green, magenta,
+// red, blue, black, left to right. The bottom quarter of the screen (from
+// line 360) shows them in reverse order. The result is (R, G, B) as bits 2,
+// 1, 0.
+fn colour_bars(x: u10, y: u10) -> u3 {
+    let bar: u3 = if x < 80 {
+        0
+    } else if x < 160 {
+        1
+    } else if x < 240 {
+        2
+    } else if x < 320 {
+        3
+    } else if x < 400 {
+        4
+    } else if x < 480 {
+        5
+    } else if x < 560 {
+        6
+    } else {
+        7
+    };
+    let shown = if y < 360 { bar } else { ~bar };
+    // Red is on in bars 0, 1, 4, 5; green in 0-3; blue in the even bars.
+    !shown[1:1] @ !shown[2:2] @ !shown[0:0]
+}
+
+// A colour component fully on or off.
+fn level(on: u1) -> u8 {
+    if on == 1 { 255 } else { 0 }
 }

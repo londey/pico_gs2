@@ -1,0 +1,156 @@
+// Video timing and DVI (TMDS) encoding.
+
+// One video mode's timing. Horizontal values are in pixels, vertical in
+// lines, both counted from 0 at the first active pixel/line. A sync pulse
+// covers [sync_start, sync_end).
+pub struct Timing {
+    pub h_active: u10,
+    pub h_sync_start: u10,
+    pub h_sync_end: u10,
+    pub h_total: u10,
+    pub v_active: u10,
+    pub v_sync_start: u10,
+    pub v_sync_end: u10,
+    pub v_total: u10,
+}
+
+// 640x480 at 60 Hz: 800x525 total, both syncs active low. Run from a
+// 25 MHz pixel clock (the standard is 25.175 MHz; monitors accept both).
+pub fn vga_640x480() -> Timing {
+    Timing {
+        h_active: 640,
+        h_sync_start: 656,
+        h_sync_end: 752,
+        h_total: 800,
+        v_active: 480,
+        v_sync_start: 490,
+        v_sync_end: 492,
+        v_total: 525,
+    }
+}
+
+// The beam position and the sync and blanking signals for one pixel clock.
+pub struct Beam {
+    // Pixel column, 0 at the first active pixel.
+    pub x: u10,
+    // Line, 0 at the first active line.
+    pub y: u10,
+    // Display enable: high while (x, y) is in the active picture.
+    pub de: u1,
+    // Horizontal sync, active low.
+    pub hsync_n: u1,
+    // Vertical sync, active low.
+    pub vsync_n: u1,
+}
+
+// Raster timing generator: walks the beam over the frame, one pixel per
+// cycle, and decodes blanking and sync from its position.
+#[module]
+pub struct VideoTiming {
+    x: u10 = 0,
+    y: u10 = 0,
+}
+
+impl VideoTiming {
+    pub fn step(self, t: Timing) -> (Self, Beam) {
+        let line_end = self.x == (t.h_total - 1) as u10 wrap;
+        let frame_end = self.y == (t.v_total - 1) as u10 wrap;
+        let next_y: u10 = if frame_end { 0 } else { (self.y + 1) as u10 wrap };
+        let in_hsync = self.x >= t.h_sync_start & self.x < t.h_sync_end;
+        let in_vsync = self.y >= t.v_sync_start & self.y < t.v_sync_end;
+        (
+            Self {
+                x: if line_end { 0 } else { (self.x + 1) as u10 wrap },
+                y: if line_end { next_y } else { self.y },
+            },
+            Beam {
+                x: self.x,
+                y: self.y,
+                de: self.x < t.h_active & self.y < t.v_active,
+                hsync_n: !in_hsync,
+                vsync_n: !in_vsync,
+            },
+        )
+    }
+}
+
+// One TMDS channel's 10-bit symbol for this pixel clock.
+pub struct TmdsOut {
+    pub symbol: u10,
+}
+
+// TMDS encoder for one DVI channel (DVI 1.0, section 3.2.2): 8b/10b with
+// transition minimisation and DC balance while `de` is high, and one of
+// four control tokens, selected by `ctrl`, while it is low. Symbols are sent
+// least significant bit first.
+#[module]
+pub struct TmdsEncoder {
+    // Running disparity: ones minus zeros sent since the last blanking
+    // period.
+    disparity: i5 = 0,
+}
+
+impl TmdsEncoder {
+    pub fn step(self, data: u8, ctrl: u2, de: u1) -> (Self, TmdsOut) {
+        // Stage 1: transition minimisation. q_m is 9 bits: q_m8 says
+        // whether the chain used XOR (1) or XNOR (0).
+        let ones_d = popcount8(data);
+        let use_xnor = ones_d > 4 | (ones_d == 4 & data[0:0] == 0);
+        let chain = prefix_xor(data);
+        // An XNOR chain is the XOR chain with every odd bit inverted.
+        let q_m = if use_xnor { chain ^ 0xAA } else { chain };
+        let q_m8: u1 = if use_xnor { 0 } else { 1 };
+
+        // Stage 2: DC balance. diff is ones minus zeros in q_m[7:0].
+        let ones = popcount8(q_m);
+        let diff = ((ones as i8 wrap) + (ones as i8 wrap) - 8) as i8 wrap;
+        let cnt = self.disparity as i8 wrap;
+        let two_q_m8: i8 = if q_m8 == 1 { 2 } else { 0 };
+        let two_not_q_m8: i8 = if q_m8 == 1 { 0 } else { 2 };
+
+        let balanced = cnt == 0 | ones == 4;
+        let invert = (cnt > 0 & ones > 4) | (cnt < 0 & ones < 4);
+        let (symbol, next_cnt) = if balanced {
+            (
+                !q_m8 @ q_m8 @ (if q_m8 == 1 { q_m } else { ~q_m }),
+                if q_m8 == 1 { (cnt + diff) as i5 wrap } else { (cnt - diff) as i5 wrap },
+            )
+        } else if invert {
+            (1_u1 @ q_m8 @ ~q_m, ((cnt + two_q_m8) - diff) as i5 wrap)
+        } else {
+            (0_u1 @ q_m8 @ q_m, ((cnt - two_not_q_m8) + diff) as i5 wrap)
+        };
+
+        if de == 1 {
+            (Self { disparity: next_cnt }, TmdsOut { symbol: symbol })
+        } else {
+            (Self { disparity: 0 }, TmdsOut { symbol: control_token(ctrl) })
+        }
+    }
+}
+
+// The control token for (C1, C0) during blanking.
+fn control_token(ctrl: u2) -> u10 {
+    match ctrl {
+        0 => 0b1101010100,
+        1 => 0b0010101011,
+        2 => 0b0101010100,
+        _ => 0b1010101011,
+    }
+}
+
+// The number of set bits in a byte.
+fn popcount8(x: u8) -> u4 {
+    let a = x[0:0] + x[1:1];
+    let b = x[2:2] + x[3:3];
+    let c = x[4:4] + x[5:5];
+    let d = x[6:6] + x[7:7];
+    (a + b) + (c + d)
+}
+
+// Bit i of the result is the XOR of bits 0 to i of x.
+fn prefix_xor(x: u8) -> u8 {
+    let p1 = x ^ (x[6:0] @ 0_u1);
+    let p2 = p1 ^ (p1[5:0] @ 0_u2);
+    p2 ^ (p2[3:0] @ 0_u4)
+}

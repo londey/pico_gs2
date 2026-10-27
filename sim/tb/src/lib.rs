@@ -1,7 +1,9 @@
 //! Testbench support for the pico-gs2 GPU.
 //!
-//! The tests in `tests/` drive the cycle-accurate simulator that
-//! `sinter build` generates from `hw/gpu.snt` (the `gpu-sim` crate).
+//! The tests in `tests/` drive the cycle-accurate simulators that
+//! `sinter build` generates from `hw/` (the `gpu-sim` crate for the whole
+//! core, and one crate per `#[module]`), and check them against the
+//! reference models here.
 
 #![deny(unsafe_code)]
 #![cfg_attr(all(not(debug_assertions), not(test)), deny(clippy::all))]
@@ -10,4 +12,6 @@
 // Until 1.0.0, allow dead code while the testbench grows.
 #![allow(dead_code)]
 
-pub use gpu_sim::{Gpu, Inputs, Outputs};
+mod tmds;
+
+pub use tmds::{decode, Encoder, Symbol, CONTROL_TOKENS};

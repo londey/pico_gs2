@@ -7,3 +7,7 @@ publish.workspace = true
 
 [dependencies]
 gpu-sim.workspace = true
+tmds-encoder-sim.workspace = true
+
+[dev-dependencies]
+png.workspace = true

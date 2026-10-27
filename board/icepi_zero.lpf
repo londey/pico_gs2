@@ -27,3 +27,15 @@ LOCATE COMP "led[3]" SITE "C13";
 IOBUF  PORT "led[3]" IO_TYPE=LVCMOS33 PULLMODE=DOWN DRIVE=4;
 LOCATE COMP "led[4]" SITE "D13";
 IOBUF  PORT "led[4]" IO_TYPE=LVCMOS33 PULLMODE=DOWN DRIVE=4;
+
+# GPDI (DVI) TMDS outputs. LVCMOS33D is a pseudo-differential pair: only the
+# _p pin is located, and nextpnr drives its complementary _n pin inverted
+# (blue T14, green T15, red R16, clock T13), as in the board's DVI example.
+LOCATE COMP "gpdi_dp[0]" SITE "R13"; # Blue
+IOBUF  PORT "gpdi_dp[0]" IO_TYPE=LVCMOS33D DRIVE=4;
+LOCATE COMP "gpdi_dp[1]" SITE "R15"; # Green
+IOBUF  PORT "gpdi_dp[1]" IO_TYPE=LVCMOS33D DRIVE=4;
+LOCATE COMP "gpdi_dp[2]" SITE "P16"; # Red
+IOBUF  PORT "gpdi_dp[2]" IO_TYPE=LVCMOS33D DRIVE=4;
+LOCATE COMP "gpdi_dp[3]" SITE "R12"; # Clock
+IOBUF  PORT "gpdi_dp[3]" IO_TYPE=LVCMOS33D DRIVE=4;

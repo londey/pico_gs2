@@ -1,0 +1,21 @@
+// Directed-test harness for the video timing generator: exposes its timing
+// input and beam output as ports, so a stimulus file can run it with a small
+// mode and check every sync edge of a whole frame (see hw/tests/).
+
+mod video;
+
+use root::video::Beam;
+use root::video::Timing;
+use root::video::VideoTiming;
+
+struct VideoTimingTb {
+    timing: VideoTiming,
+}
+
+impl VideoTimingTb {
+    #[clock(domain = pixel)]
+    fn tick(self, t: Timing) -> (VideoTimingTb, Beam) {
+        let (timing, beam) = self.timing.step(t);
+        (VideoTimingTb { timing: timing }, beam)
+    }
+}

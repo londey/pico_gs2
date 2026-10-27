@@ -1,0 +1,17 @@
+# The first two pixels out of reset, across both clock domains. Each row is
+# one clock edge: core every time unit, pixel every fourth (time 0, 4, 8).
+# The TMDS symbol registers show reset (0) until the first pixel edge, then
+# lag the beam by one pixel. Pixels (0, 0) and (1, 0) are white, 0xFF on
+# every channel: from zero disparity that encodes to 0b10_0000_0000 (512)
+# and leaves the disparity at -8, so the next 0xFF encodes to 0b00_1111_1111
+# (255). The LEDs are dark out of reset.
+expect.tmds_blue_q, expect.tmds_green_q, expect.tmds_red_q, expect.core_out_led
+0,   0,   0,   0    # time 0: core, pixel
+512, 512, 512, 0
+512, 512, 512, 0
+512, 512, 512, 0
+512, 512, 512, 0    # time 4: core, pixel
+255, 255, 255, 0
+255, 255, 255, 0
+255, 255, 255, 0
+255, 255, 255, 0    # time 8: core, pixel
