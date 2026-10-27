@@ -1,0 +1,19 @@
+# Testbenches and chip models for the pico-gs2 GPU.
+#
+# The testbenches depend on the simulator crates that `sinter build` writes
+# to build/sinter/, so run `just gen` (or `just build`) before any cargo
+# command here.
+[workspace]
+resolver = "2"
+members = ["tb"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+gpu-sim = { path = "../build/sinter/gpu-sim" }
+
+# The generated simulators are hot loops; optimise them even in test builds.
+[profile.dev.package.gpu-sim]
+opt-level = 3

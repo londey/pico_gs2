@@ -1,0 +1,24 @@
+// The pico-gs2 GPU core.
+//
+// Placeholder until board bring-up: a free-running counter whose top bits
+// drive the LEDs, so the whole flow (sinter, lint, synthesis, place and
+// route, the Rust twin) has something to build.
+struct Gpu {
+    count: u30 = 0,
+}
+
+// The core's outputs to the board.
+struct GpuOut {
+    // The user LEDs, active high.
+    led: u5,
+}
+
+impl Gpu {
+    #[clock(domain = core)]
+    fn tick(self) -> (Gpu, GpuOut) {
+        (
+            Gpu { count: (self.count + 1) as u30 wrap },
+            GpuOut { led: self.count[29:25] },
+        )
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "tb"
+version = "0.1.0"
+description = "Testbenches driving the generated pico-gs2 simulator."
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpu-sim.workspace = true

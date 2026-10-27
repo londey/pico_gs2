@@ -1,0 +1,7 @@
+# The LEDs are dark out of reset (they show the top bits of a counter that
+# starts at zero).
+expect.out_led
+0
+0
+0
+0

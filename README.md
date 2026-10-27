@@ -14,3 +14,14 @@ Clone with submodules (`git clone --recurse-submodules` is not needed; the
 container runs `git submodule update --init` on creation).
 
 The setup plan is in [docs/setup.md](docs/setup.md).
+
+## Building
+
+```sh
+just check       # generate, build and run every test
+just bitstream   # build/fpga/top.bit, failing if timing isn't met
+just flash       # load it onto a connected ICEpi Zero
+just ci          # everything CI runs
+```
+
+`just` on its own lists every recipe.
