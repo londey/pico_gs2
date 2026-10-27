@@ -8,3 +8,5 @@ target/
 !.claude/skills/
 !.claude/agents/
 !.claude/settings.json
+# Account skills Claude Code syncs from claude.ai: per-user, re-downloaded.
+.claude/skills/synced/
