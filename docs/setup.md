@@ -230,7 +230,9 @@ from the start:
 
 `board/top.sv` instantiates the core, serializes the three 10-bit symbols
 plus the TMDS clock channel, drives the LEDs, and makes `rst_n` from the
-PLL lock and the reset button (site `C4`, active low). Take pin sites from
+PLL lock and the reset button (site `C4`, active low). (On the board,
+`C4` read low whatever either button did and held the core in reset, so
+`rst_n` now comes from the PLL lock alone.) Take pin sites from
 `external/icepi-zero/gateware/v1.3/icepi-zero-v1_3.lpf` (LEDs `led[0..]`,
 clock) and the old `constraints/icepi_zero.lpf` (TMDS on the GPDI
 connector). Note the old LPF's comment on the pseudo-differential TMDS

@@ -19,7 +19,6 @@
 // shifters is an ordinary synchronous path.
 module top (
     input  wire        clk,      // 50 MHz board oscillator
-    input  wire  [0:0] button,   // button[0]: active-low reset push button
     output logic [4:0] led,      // User LEDs, active high
     output logic [3:0] gpdi_dp   // TMDS to the GPDI connector: blue, green, red, clock
                                  // (LVCMOS33D: the _n pins are driven inverted)
@@ -35,7 +34,7 @@ module top (
     logic             clk_pixel;       // 25 MHz pixel clock
     logic             clk_tmds;        // 125 MHz serialiser clock
     logic             pll_locked;      // PLL lock indicator
-    logic             rst_n;           // Core reset: until lock, or while button[0] is held
+    logic             rst_n;           // Core reset: held until the PLL locks
     logic [9:0]       tmds_blue;       // Blue channel symbol, clk_pixel domain
     logic [9:0]       tmds_green;      // Green channel symbol, clk_pixel domain
     logic [9:0]       tmds_red;        // Red channel symbol, clk_pixel domain
@@ -119,8 +118,10 @@ module top (
     // Reset
     // ------------------------------------------------------------------
 
-    // The core synchronises rst_n into each of its domains itself.
-    assign rst_n = pll_locked & button[0];
+    // The core synchronises rst_n into each of its domains itself. The
+    // buttons aren't used: on the board brought up, button[0] (C4) read low
+    // whether or not either button was pressed, which held the core in reset.
+    assign rst_n = pll_locked;
 
     // clk_tmds domain: asynchronous assert, synchronous release.
     always_comb begin
