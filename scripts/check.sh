@@ -16,7 +16,9 @@ done
 
 manifest=(--manifest-path sim/Cargo.toml)
 echo "==> cargo fmt --check"
-cargo fmt "${manifest[@]}" --check
+# From inside sim/: with --manifest-path, cargo fmt can't find the targets of
+# members outside the workspace directory (models/).
+(cd sim && cargo fmt --check)
 echo "==> cargo clippy"
 cargo clippy "${manifest[@]}" --all-targets -- -D warnings
 echo "==> cargo test"

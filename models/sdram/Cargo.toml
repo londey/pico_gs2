@@ -1,0 +1,9 @@
+[package]
+name = "sdram-model"
+version = "0.1.0"
+description = "Cycle-level model of the Winbond W9825G6KH SDRAM, checked against its datasheet timings"
+edition.workspace = true
+publish.workspace = true
+workspace = "../../sim"
+
+[dependencies]

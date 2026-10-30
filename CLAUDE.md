@@ -14,16 +14,20 @@ The generated simulator is the digital twin; there is no separate model.
 .claude/skills/         coding-standard skills (git submodules)
 .github/workflows/      ci.yml: runs `just ci`
 board/                  hand-written SystemVerilog top + constraints
-  top.sv                PLL, reset, serializers, I/O; instantiates the Sinter core
+  top.sv                PLL, reset, symbol re-timing, serializers, SDRAM clock and
+                        DQ buffers, I/O; instantiates the Sinter core
   icepi_zero.lpf        pin constraints for the ports top.sv uses
 hw/                     Sinter sources (the design)
   gpu.snt               the root: the #[clock] struct the core module is named after
+  sdram.snt             SDRAM controller (#[module])
   video.snt             video timing generator and TMDS encoder (#[module]s)
   *_tb.snt              test-harness roots that expose a block's ports to `sinter sim`
   tests/                directed stimulus: <root>.<case>.csv drives hw/<root>.snt
-sim/                    Rust workspace: testbenches and chip models
-  tb/                   integration tests driving the generated simulator
-models/                 Rust models of external chips (later), reference/ sources
+sim/                    Rust workspace: testbenches (members include models/*)
+  tb/                   integration tests driving the generated simulators
+models/                 Rust models of external chips
+  sdram/                W9825G6KH SDRAM: pin-level, checks datasheet timing
+  reference/            sources the models were written from (datasheet, old C++)
 external/icepi-zero     board repo (git submodule): pin sites, examples
 scripts/  justfile      task runner; every recipe is a script in scripts/
 docs/setup.md           the setup and bring-up plan
@@ -41,7 +45,7 @@ bitstreams all live in `build/`.
 | `just build` | `gen`, then `cargo build` in `sim/` |
 | `just check` | `build`, then `sinter check`, the `hw/tests/*.csv` stimulus tests, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` |
 | `just lint` | Verilator `--lint-only -Wall` over `board/*.sv` and the generated `.sv` |
-| `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met |
+| `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
 | `just flash` | `openFPGALoader -b icepi-zero build/fpga/top.bit` (the user runs this) |
 | `just ci` | everything CI runs, in order |
 | `just clean` | remove `build/` and `sim/target/` |
@@ -99,7 +103,12 @@ LPF (so `board/` is hand-written); there is no co-simulation of the
 generated Verilog against the simulator; `--faults` doesn't work with
 `#[module]`; a `#[module]` in a child source module (`video::TmdsEncoder`)
 gets a simulator crate and type named `video__…`, which rustc warns about
-(harmless, in the generated crate).
+(harmless, in the generated crate); `async_fifo`'s write side recomputes its
+fill level from the gray-coded read pointer every cycle, which only reaches
+about 85 MHz on the ECP5, so the display runs on the 100 MHz core clock with
+a pixel enable and `board/top.sv` re-times the TMDS symbols to the 25 MHz
+pixel clock. `wait` and other SystemVerilog keywords can't name registers,
+and a `fifo` capacity must be a literal.
 
 The generated Verilog must stay lint-clean under `-Wall`. Verilator flags
 unused bits of named wires, so don't bind a wide intermediate with `let` and

@@ -15,7 +15,7 @@ struct VideoTimingTb {
 impl VideoTimingTb {
     #[clock(domain = pixel)]
     fn tick(self, t: Timing) -> (VideoTimingTb, Beam) {
-        let (timing, beam) = self.timing.step(t);
+        let (timing, beam) = self.timing.step(t, 1);
         (VideoTimingTb { timing: timing }, beam)
     }
 }

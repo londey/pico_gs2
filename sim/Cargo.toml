@@ -5,7 +5,7 @@
 # command here.
 [workspace]
 resolver = "2"
-members = ["tb"]
+members = ["tb", "../models/sdram"]
 
 [workspace.package]
 edition = "2021"
@@ -14,6 +14,8 @@ publish = false
 [workspace.dependencies]
 gpu-sim = { path = "../build/sinter/gpu-sim" }
 tmds-encoder-sim = { package = "video__tmds_encoder-sim", path = "../build/sinter/video__tmds_encoder-sim" }
+sdram-controller-sim = { package = "sdram__sdram_controller-sim", path = "../build/sinter/sdram__sdram_controller-sim" }
+sdram-model = { path = "../models/sdram" }
 png = { version = "0.18", default-features = false }
 
 # The generated simulators are hot loops; optimise them even in test builds.
@@ -21,4 +23,10 @@ png = { version = "0.18", default-features = false }
 opt-level = 3
 
 [profile.dev.package."video__tmds_encoder-sim"]
+opt-level = 3
+
+[profile.dev.package."sdram__sdram_controller-sim"]
+opt-level = 3
+
+[profile.dev.package.sdram-model]
 opt-level = 3

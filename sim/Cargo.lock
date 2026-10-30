@@ -87,6 +87,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdram-model"
+version = "0.1.0"
+
+[[package]]
+name = "sdram__sdram_controller-sim"
+version = "0.1.0"
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,6 +106,8 @@ version = "0.1.0"
 dependencies = [
  "gpu-sim",
  "png",
+ "sdram-model",
+ "sdram__sdram_controller-sim",
  "video__tmds_encoder-sim",
 ]
 

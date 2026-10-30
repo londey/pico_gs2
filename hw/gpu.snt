@@ -1,117 +1,161 @@
 // The pico-gs2 GPU core.
 //
-// Board bring-up: a heartbeat on the LEDs in the core domain (100 MHz), and
-// a 640x480 colour-bar test pattern encoded for DVI in the pixel domain
-// (25 MHz). A `sync` crossing carries one bit from core to pixel that inverts
-// the pattern every few seconds. board/top.sv serialises the TMDS symbols.
+// An SDRAM framebuffer, scanned out to 640x480 DVI, all on the 100 MHz core
+// clock. After the SDRAM's power-up sequence the core writes a test pattern
+// into a 640x480 RGB565 framebuffer at word 0, then reads the frame back for
+// ever, in order, into a FIFO. The display side runs at one pixel every
+// fourth cycle (25 MHz): from the first frame start after the fill it takes
+// a word from the FIFO per active pixel and DVI-encodes it.
+//
+// board/top.sv re-times the TMDS symbols to its 25 MHz pixel clock and
+// serialises them, and owns the SDRAM's clock and DQ buffers. (The display
+// side stays on the core clock because Sinter's async FIFO, the way to cross
+// to a 25 MHz domain, doesn't meet timing at 100 MHz on the ECP5.)
 
+mod sdram;
 mod video;
 
+use root::sdram::SdramController;
+use root::sdram::SdramPins;
+use root::sdram::SdramReq;
 use root::video::TmdsEncoder;
 use root::video::VideoTiming;
 use root::video::vga_640x480;
 
+// Start address of the last SDRAM run of the framebuffer: 640 x 480 words,
+// one RGB565 word per pixel, rows packed with no padding, from word 0.
+const LAST_RUN: u19 = 307168;
+
+// Words per SDRAM run. A row is 512 words and the frame starts at word 0,
+// so runs never cross a row.
+const RUN: u6 = 32;
+
+// The scan-out reads another run only while the FIFO has room for it, and
+// for the words of the previous run still in flight.
+const FIFO_ROOM: u9 = 192;
+
+// The scan-out starts at a frame start once the FIFO holds this many words.
+const FIFO_PRIMED: u9 = 128;
+
 struct Gpu {
-    // Free-running counter for the heartbeat and the pattern inversion.
-    #[domain(core)]
-    count: u29 = 0,
+    // Free-running counter for the heartbeat.
+    count: u27 = 0,
+    sdram: SdramController,
+    // High until the test pattern is in the framebuffer.
+    filling: u1 = 1,
+    // Address of the next run to request, writing or reading.
+    run_addr: u19 = 0,
+    // The pixel the fill writes next.
+    fill_x: u10 = 0,
+    fill_y: u10 = 0,
+    // The framebuffer, a word per pixel in raster order, from the SDRAM to
+    // the display: 256 words of block RAM.
+    pixels: fifo<u16, 256>,
 
-    // The pixel domain's half: timing, and one encoder per DVI channel.
-    #[domain(pixel)]
+    // Core cycle within the pixel: the display moves on when it is 3.
+    pixel_phase: u2 = 0,
     timing: VideoTiming,
-    #[domain(pixel)]
     enc_blue: TmdsEncoder,
-    #[domain(pixel)]
     enc_green: TmdsEncoder,
-    #[domain(pixel)]
     enc_red: TmdsEncoder,
+    // High from the first frame start after the fill: one word is taken from
+    // `pixels` per active pixel.
+    scanning: u1 = 0,
+    // Sticky: an active pixel found `pixels` empty.
+    underflow: u1 = 0,
 
-    // The 10-bit TMDS symbols for board/top.sv to serialise.
-    #[domain(pixel)]
+    // The 10-bit TMDS symbols for board/top.sv, one per pixel: each holds
+    // for four core cycles (the encoders change them once per pixel).
     pub tmds_blue: u10 = 0,
-    #[domain(pixel)]
     pub tmds_green: u10 = 0,
-    #[domain(pixel)]
     pub tmds_red: u10 = 0,
-
-    // Core to pixel: high while the test pattern is inverted.
-    invert: sync<core, pixel>,
 }
 
-// The core domain's outputs to the board.
-struct CoreOut {
-    // The user LEDs, active high: led[0] is the heartbeat (about 0.75 Hz),
-    // led[1] is lit while the pattern is inverted.
+// The core's outputs to the board.
+struct Out {
+    // The user LEDs, active high: led[0] the heartbeat (about 0.75 Hz),
+    // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] scan-out
+    // underflow.
     led: u5,
+    sdram: SdramPins,
 }
 
 impl Gpu {
     #[clock(domain = core, period = 1)]
-    fn tick_core(self) -> (Gpu, CoreOut) {
-        let heartbeat = self.count[26:26];
-        let inverted = self.count[28:28];
-        (
-            Gpu {
-                count: (self.count + 1) as u29 wrap,
-                invert: self.invert.send(inverted),
-                ..self
-            },
-            CoreOut { led: 0_u3 @ inverted @ heartbeat },
-        )
-    }
+    fn tick(self, sdram_dq: u16) -> (Gpu, Out) {
+        // The SDRAM side: fill the framebuffer, then keep the FIFO topped up.
+        let tx = self.pixels.sender();
+        let want = self.filling == 1 | tx.len() <= FIFO_ROOM;
+        let req: Option<SdramReq> = if want {
+            Some(SdramReq { write: self.filling, addr: 0_u5 @ self.run_addr, len: RUN })
+        } else {
+            None
+        };
+        let (sdram, mem) = self.sdram.step(req, pattern(self.fill_x, self.fill_y), sdram_dq);
 
-    #[clock(domain = pixel, period = 4)]
-    fn tick_pixel(self) -> Gpu {
-        let (timing, beam) = self.timing.step(vga_640x480());
-        let bars = colour_bars(beam.x, beam.y);
-        let rgb = if self.invert.value() == 1 { ~bars } else { bars };
+        let last_run = mem.accepted & self.run_addr == LAST_RUN;
+        let run_addr: u19 = if mem.accepted == 0 {
+            self.run_addr
+        } else if last_run == 1 {
+            0
+        } else {
+            (self.run_addr + RUN) as u19 wrap
+        };
+        let line_end = self.fill_x == 639;
+        let fill_x: u10 = if mem.wtake == 0 { self.fill_x } else if line_end { 0 } else { (self.fill_x + 1) as u10 wrap };
+        let fill_y = if mem.wtake & line_end { (self.fill_y + 1) as u10 wrap } else { self.fill_y };
+
+        // The display side, one pixel per four cycles.
+        let en = self.pixel_phase == 3;
+        let (timing, beam) = self.timing.step(vga_640x480(), en);
+        let primed = !self.filling & self.pixels.len() >= FIFO_PRIMED;
+        let scanning = self.scanning | (primed & beam.x == 0 & beam.y == 0);
+        let take = en & scanning & beam.de;
+        // An empty FIFO shows red (and is latched as an underflow).
+        let (word, empty) = match self.pixels.front() {
+            Some(w) => (w, 0_u1),
+            None => (0xF800_u16, 1_u1),
+        };
+        let rgb: u16 = if scanning == 1 { word } else { 0 };
         // DVI carries HSYNC and VSYNC as C0 and C1 of the blue channel.
         let sync = beam.vsync_n @ beam.hsync_n;
-        let (enc_blue, blue) = self.enc_blue.step(level(rgb[0:0]), sync, beam.de);
-        let (enc_green, green) = self.enc_green.step(level(rgb[1:1]), 0, beam.de);
-        let (enc_red, red) = self.enc_red.step(level(rgb[2:2]), 0, beam.de);
-        Gpu {
-            timing: timing,
-            enc_blue: enc_blue,
-            enc_green: enc_green,
-            enc_red: enc_red,
-            tmds_blue: blue.symbol,
-            tmds_green: green.symbol,
-            tmds_red: red.symbol,
-            invert: self.invert.recv(),
-            ..self
-        }
+        let (enc_blue, blue) = self.enc_blue.step(rgb[4:0] @ rgb[4:2], sync, beam.de, en);
+        let (enc_green, green) = self.enc_green.step(rgb[10:5] @ rgb[10:9], 0, beam.de, en);
+        let (enc_red, red) = self.enc_red.step(rgb[15:11] @ rgb[15:13], 0, beam.de, en);
+
+        (
+            Gpu {
+                count: (self.count + 1) as u27 wrap,
+                sdram: sdram,
+                filling: self.filling & !last_run,
+                run_addr: run_addr,
+                fill_x: fill_x,
+                fill_y: fill_y,
+                pixels: self.pixels.next(tx.offer(mem.rdata), take),
+                pixel_phase: (self.pixel_phase + 1) as u2 wrap,
+                timing: timing,
+                enc_blue: enc_blue,
+                enc_green: enc_green,
+                enc_red: enc_red,
+                scanning: scanning,
+                underflow: self.underflow | (take & empty),
+                tmds_blue: blue.symbol,
+                tmds_green: green.symbol,
+                tmds_red: red.symbol,
+            },
+            Out {
+                led: 0_u1 @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
+                sdram: mem.pins,
+            },
+        )
     }
 }
 
-// Eight vertical bars, 80 pixels wide: white, yellow, cyan, green, magenta,
-// red, blue, black, left to right. The bottom quarter of the screen (from
-// line 360) shows them in reverse order. The result is (R, G, B) as bits 2,
-// 1, 0.
-fn colour_bars(x: u10, y: u10) -> u3 {
-    let bar: u3 = if x < 80 {
-        0
-    } else if x < 160 {
-        1
-    } else if x < 240 {
-        2
-    } else if x < 320 {
-        3
-    } else if x < 400 {
-        4
-    } else if x < 480 {
-        5
-    } else if x < 560 {
-        6
-    } else {
-        7
-    };
-    let shown = if y < 360 { bar } else { ~bar };
-    // Red is on in bars 0, 1, 4, 5; green in 0-3; blue in the even bars.
-    !shown[1:1] @ !shown[2:2] @ !shown[0:0]
-}
-
-// A colour component fully on or off.
-fn level(on: u1) -> u8 {
-    if on == 1 { 255 } else { 0 }
+// The test pattern, RGB565: a white one-pixel border round the frame; inside
+// it red rising left to right, green top to bottom, and blue on alternate
+// 32x32 squares.
+fn pattern(x: u10, y: u10) -> u16 {
+    let border = x == 0 | x == 639 | y == 0 | y == 479;
+    let blue: u5 = if (x[5:5] ^ y[5:5]) == 1 { 31 } else { 0 };
+    if border { 0xFFFF } else { x[9:5] @ y[8:3] @ blue }
 }

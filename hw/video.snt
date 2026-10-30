@@ -44,7 +44,7 @@ pub struct Beam {
 }
 
 // Raster timing generator: walks the beam over the frame, one pixel per
-// cycle, and decodes blanking and sync from its position.
+// cycle with `en` high, and decodes blanking and sync from its position.
 #[module]
 pub struct VideoTiming {
     x: u10 = 0,
@@ -52,17 +52,18 @@ pub struct VideoTiming {
 }
 
 impl VideoTiming {
-    pub fn step(self, t: Timing) -> (Self, Beam) {
+    pub fn step(self, t: Timing, en: u1) -> (Self, Beam) {
         let line_end = self.x == (t.h_total - 1) as u10 wrap;
         let frame_end = self.y == (t.v_total - 1) as u10 wrap;
         let next_y: u10 = if frame_end { 0 } else { (self.y + 1) as u10 wrap };
         let in_hsync = self.x >= t.h_sync_start & self.x < t.h_sync_end;
         let in_vsync = self.y >= t.v_sync_start & self.y < t.v_sync_end;
+        let next = Self {
+            x: if line_end { 0 } else { (self.x + 1) as u10 wrap },
+            y: if line_end { next_y } else { self.y },
+        };
         (
-            Self {
-                x: if line_end { 0 } else { (self.x + 1) as u10 wrap },
-                y: if line_end { next_y } else { self.y },
-            },
+            if en == 1 { next } else { self },
             Beam {
                 x: self.x,
                 y: self.y,
@@ -74,7 +75,7 @@ impl VideoTiming {
     }
 }
 
-// One TMDS channel's 10-bit symbol for this pixel clock.
+// One TMDS channel's 10-bit symbol.
 pub struct TmdsOut {
     pub symbol: u10,
 }
@@ -83,49 +84,99 @@ pub struct TmdsOut {
 // transition minimisation and DC balance while `de` is high, and one of
 // four control tokens, selected by `ctrl`, while it is low. Symbols are sent
 // least significant bit first.
+//
+// It takes a pixel in each cycle with `en` high, at most one every four
+// cycles, and pipelines the encoding over those four so that each stage has
+// a whole core clock cycle: the pixel is registered, then transition
+// minimised, then its ones counted, then DC balanced against the running
+// disparity. `symbol` comes from a register: four cycles after a pixel is
+// taken it changes to that pixel's symbol, and holds until the next.
 #[module]
 pub struct TmdsEncoder {
-    // Running disparity: ones minus zeros sent since the last blanking
-    // period.
+    // Stage 1: the pixel, registered when `en` is high.
+    data1: u8 = 0,
+    ctrl1: u2 = 0,
+    de1: u1 = 0,
+    valid1: u1 = 0,
+    // Stage 2: the transition-minimised byte, q_m[7:0], and q_m[8], which
+    // says whether the chain used XOR (1) or XNOR (0).
+    q_m2: u8 = 0,
+    q_m8_2: u1 = 0,
+    ctrl2: u2 = 0,
+    de2: u1 = 0,
+    valid2: u1 = 0,
+    // Stage 3: q_m with the number of ones in q_m[7:0].
+    q_m3: u8 = 0,
+    q_m8_3: u1 = 0,
+    ones3: u4 = 0,
+    ctrl3: u2 = 0,
+    de3: u1 = 0,
+    valid3: u1 = 0,
+    // Stage 4: running disparity, ones minus zeros sent since the last
+    // blanking period, and the symbol.
     disparity: i5 = 0,
+    symbol: u10 = 0,
 }
 
 impl TmdsEncoder {
-    pub fn step(self, data: u8, ctrl: u2, de: u1) -> (Self, TmdsOut) {
-        // Stage 1: transition minimisation. q_m is 9 bits: q_m8 says
-        // whether the chain used XOR (1) or XNOR (0).
-        let ones_d = popcount8(data);
-        let use_xnor = ones_d > 4 | (ones_d == 4 & data[0:0] == 0);
-        let chain = prefix_xor(data);
+    pub fn step(self, data: u8, ctrl: u2, de: u1, en: u1) -> (Self, TmdsOut) {
+        // Stage 2: transition minimisation.
+        let ones_d = popcount8(self.data1);
+        let use_xnor = ones_d > 4 | (ones_d == 4 & self.data1[0:0] == 0);
+        let chain = prefix_xor(self.data1);
         // An XNOR chain is the XOR chain with every odd bit inverted.
         let q_m = if use_xnor { chain ^ 0xAA } else { chain };
         let q_m8: u1 = if use_xnor { 0 } else { 1 };
 
-        // Stage 2: DC balance. diff is ones minus zeros in q_m[7:0].
-        let ones = popcount8(q_m);
+        // Stage 4: DC balance. diff is ones minus zeros in q_m[7:0].
+        let ones = self.ones3;
         let diff = ((ones as i8 wrap) + (ones as i8 wrap) - 8) as i8 wrap;
         let cnt = self.disparity as i8 wrap;
-        let two_q_m8: i8 = if q_m8 == 1 { 2 } else { 0 };
-        let two_not_q_m8: i8 = if q_m8 == 1 { 0 } else { 2 };
-
+        let two_q_m8: i8 = if self.q_m8_3 == 1 { 2 } else { 0 };
+        let two_not_q_m8: i8 = if self.q_m8_3 == 1 { 0 } else { 2 };
         let balanced = cnt == 0 | ones == 4;
         let invert = (cnt > 0 & ones > 4) | (cnt < 0 & ones < 4);
         let (symbol, next_cnt) = if balanced {
             (
-                !q_m8 @ q_m8 @ (if q_m8 == 1 { q_m } else { ~q_m }),
-                if q_m8 == 1 { (cnt + diff) as i5 wrap } else { (cnt - diff) as i5 wrap },
+                !self.q_m8_3 @ self.q_m8_3 @ (if self.q_m8_3 == 1 { self.q_m3 } else { ~self.q_m3 }),
+                if self.q_m8_3 == 1 { (cnt + diff) as i5 wrap } else { (cnt - diff) as i5 wrap },
             )
         } else if invert {
-            (1_u1 @ q_m8 @ ~q_m, ((cnt + two_q_m8) - diff) as i5 wrap)
+            (1_u1 @ self.q_m8_3 @ ~self.q_m3, ((cnt + two_q_m8) - diff) as i5 wrap)
         } else {
-            (0_u1 @ q_m8 @ q_m, ((cnt - two_not_q_m8) + diff) as i5 wrap)
+            (0_u1 @ self.q_m8_3 @ self.q_m3, ((cnt - two_not_q_m8) + diff) as i5 wrap)
+        };
+        let disparity: i5 = if self.valid3 == 0 { self.disparity } else if self.de3 == 1 { next_cnt } else { 0 };
+        let out: u10 = if self.valid3 == 0 {
+            self.symbol
+        } else if self.de3 == 1 {
+            symbol
+        } else {
+            control_token(self.ctrl3)
         };
 
-        if de == 1 {
-            (Self { disparity: next_cnt }, TmdsOut { symbol: symbol })
-        } else {
-            (Self { disparity: 0 }, TmdsOut { symbol: control_token(ctrl) })
-        }
+        (
+            Self {
+                data1: if en == 1 { data } else { self.data1 },
+                ctrl1: if en == 1 { ctrl } else { self.ctrl1 },
+                de1: if en == 1 { de } else { self.de1 },
+                valid1: en,
+                q_m2: q_m,
+                q_m8_2: q_m8,
+                ctrl2: self.ctrl1,
+                de2: self.de1,
+                valid2: self.valid1,
+                q_m3: self.q_m2,
+                q_m8_3: self.q_m8_2,
+                ones3: popcount8(self.q_m2),
+                ctrl3: self.ctrl2,
+                de3: self.de2,
+                valid3: self.valid2,
+                disparity: disparity,
+                symbol: out,
+            },
+            TmdsOut { symbol: self.symbol },
+        )
     }
 }
 

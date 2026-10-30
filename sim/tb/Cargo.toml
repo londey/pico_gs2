@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 gpu-sim.workspace = true
 tmds-encoder-sim.workspace = true
+sdram-controller-sim.workspace = true
+sdram-model.workspace = true
 
 [dev-dependencies]
 png.workspace = true

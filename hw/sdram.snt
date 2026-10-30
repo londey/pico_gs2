@@ -1,0 +1,276 @@
+// SDRAM controller for the board's W9825G6KH (4 banks x 8192 rows x 512
+// columns x 16 bits), run from the 100 MHz core clock.
+//
+// The chip runs at CAS latency 2 with burst length 1: a run of words in one
+// row is one ACTIVE, then a READ or WRITE every cycle, then a PRECHARGE. The
+// timing is the slowest of all the part's speed grades (datasheet section
+// 9.5) rounded up to whole 10 ns cycles, so any grade works. A requester
+// asks for a run of 1 to 32 words that doesn't cross a row; write data is
+// taken a word per cycle on `wtake`, read data comes back a word per cycle
+// on `rdata`.
+//
+// A word address is bank (bits 23:22), row (21:9), column (8:0).
+//
+// Every pin comes straight from a register. board/top.sv makes the SDRAM
+// clock a phase-shifted copy of the core clock and owns the DQ tristate
+// buffers; `dq_in` is DQ as the pins see it.
+
+// Cycles from reset to the first command: the datasheet's 200 us power-up
+// pause (section 7.1) at 100 MHz, plus margin.
+const INIT_WAIT: u15 = 20100;
+
+// Datasheet timing at 100 MHz, slowest grade, in cycles.
+// tRCD (20 ns): ACTIVE to READ/WRITE.
+const T_RCD: u15 = 2;
+// tRP (20 ns): PRECHARGE to ACTIVE/REFRESH.
+const T_RP: u15 = 2;
+// tRAS (45 ns): ACTIVE to PRECHARGE.
+const T_RAS: u3 = 5;
+// tRC (65 ns): REFRESH to anything, and ACTIVE to ACTIVE.
+const T_RC: u15 = 7;
+// tWR (2 tCK): last write data to PRECHARGE.
+const T_WR: u15 = 2;
+// tRSC (2 tCK): MODE REGISTER SET to the next command.
+const T_RSC: u15 = 2;
+
+// Cycles between REFRESH commands. The datasheet needs 8192 per 64 ms, one
+// per 781 cycles on average; refresh waits for a run in progress (at most
+// about 40 cycles), so ask early.
+const REFRESH_INTERVAL: u10 = 740;
+
+// REFRESH commands in the power-up sequence.
+const INIT_REFRESHES: u4 = 8;
+
+// The mode register: burst length 1, sequential, CAS latency 2, burst write.
+const MODE: u13 = 0x020;
+
+// Cycles from a READ on the pins to the cycle `dq_q` holds its data: CAS
+// latency 2, plus the board round trip (the SDRAM clock lags the core clock
+// by 270 degrees, so the data reaches the FPGA just before the edge one
+// cycle after the CAS latency), plus `dq_q` itself. This is the bit of
+// `rd_pipe` that marks the word arriving.
+const READ_CAPTURE: u3 = 4;
+
+// Commands: CS#, RAS#, CAS#, WE# (datasheet section 8).
+const CMD_NOP: u4 = 0b0111;
+const CMD_ACTIVE: u4 = 0b0011;
+const CMD_READ: u4 = 0b0101;
+const CMD_WRITE: u4 = 0b0100;
+const CMD_PRECHARGE: u4 = 0b0010;
+const CMD_REFRESH: u4 = 0b0001;
+const CMD_MODE: u4 = 0b0000;
+
+// The SDRAM pins, all registered. DQ is split for the tristate buffer in
+// board/top.sv.
+pub struct SdramPins {
+    pub cke: u1,
+    pub cs_n: u1,
+    pub ras_n: u1,
+    pub cas_n: u1,
+    pub we_n: u1,
+    pub ba: u2,
+    pub a: u13,
+    // Data mask, active high: bit 0 masks DQ[7:0], bit 1 DQ[15:8].
+    pub dqm: u2,
+    pub dq_out: u16,
+    // High while the controller drives DQ.
+    pub dq_oe: u1,
+}
+
+// A request for a run of words.
+pub struct SdramReq {
+    // 1 to write the run, 0 to read it.
+    pub write: u1,
+    // Word address of the first word.
+    pub addr: u24,
+    // Words in the run, 1 to 32. The run mustn't cross a row (512 words).
+    pub len: u6,
+}
+
+pub struct SdramOut {
+    pub pins: SdramPins,
+    // High once the power-up sequence is done.
+    pub ready: u1,
+    // High in the cycle a request is taken; the requester moves on to its
+    // next request.
+    pub accepted: u1,
+    // High in each cycle `wdata` is taken for a write run.
+    pub wtake: u1,
+    // A word of a read run, in order.
+    pub rdata: Option<u16>,
+}
+
+enum State {
+    // The power-up pause.
+    Init,
+    // PRECHARGE ALL done: the eight refreshes, then MODE REGISTER SET.
+    InitRefresh,
+    // Waiting for a request or a refresh.
+    Idle,
+    // A row is open: one READ or WRITE per cycle.
+    Access,
+    // The run is done: PRECHARGE once tRAS allows.
+    Close,
+}
+
+#[module]
+pub struct SdramController {
+    state: State = State::Init,
+    // NOP cycles still to go before the next command.
+    delay: u15 = INIT_WAIT,
+    // The registered pins (CKE is always high).
+    cmd: u4 = CMD_NOP,
+    ba: u2 = 0,
+    a: u13 = 0,
+    // DQM is held high until the mode register is set (section 7.1).
+    dqm: u2 = 0b11,
+    dq_out: u16 = 0,
+    dq_oe: u1 = 0,
+    // Refreshes still to do in the power-up sequence.
+    init_refreshes: u4 = INIT_REFRESHES,
+    // Counts down to the next refresh; 0 means one is due.
+    refresh_timer: u10 = REFRESH_INTERVAL,
+    ready: u1 = 0,
+    // The run in progress: direction, bank, next column, words to go.
+    write: u1 = 0,
+    bank: u2 = 0,
+    column: u9 = 0,
+    remaining: u6 = 0,
+    // Cycles since the ACTIVE was on the pins, saturating (for tRAS).
+    since_active: u3 = 0,
+    // Bit i: a READ was on the pins i cycles ago.
+    rd_pipe: u5 = 0,
+    // DQ, registered as it arrives.
+    dq_q: u16 = 0,
+}
+
+impl SdramController {
+    pub fn step(self, req: Option<SdramReq>, wdata: u16, dq_in: u16) -> (Self, SdramOut) {
+        let free = self.delay == 0;
+        let refresh_due = self.refresh_timer == 0;
+        let (valid, r) = match req {
+            Some(r) => (1_u1, r),
+            None => (0_u1, SdramReq { write: 0, addr: 0, len: 0 }),
+        };
+        let idle = free & self.state == State::Idle;
+        let accepted = idle & !refresh_due & valid;
+        let wtake = free & self.state == State::Access & self.write;
+
+        // What every cycle does unless a command is issued: a NOP, the
+        // waits and counters moving on, DQ registered.
+        let base = Self {
+            delay: if free { 0 } else { (self.delay - 1) as u15 wrap },
+            cmd: CMD_NOP,
+            dq_oe: 0,
+            refresh_timer: if refresh_due { 0 } else { (self.refresh_timer - 1) as u10 wrap },
+            since_active: if self.since_active == 7 { 7 } else { (self.since_active + 1) as u3 wrap },
+            dq_q: dq_in,
+            ..self
+        };
+
+        let next = if !free {
+            base
+        } else {
+            match self.state {
+                State::Init => Self {
+                    state: State::InitRefresh,
+                    cmd: CMD_PRECHARGE,
+                    a: 0x400,
+                    delay: (T_RP - 1) as u15 wrap,
+                    ..base
+                },
+                State::InitRefresh => if self.init_refreshes != 0 {
+                    Self {
+                        cmd: CMD_REFRESH,
+                        delay: (T_RC - 1) as u15 wrap,
+                        init_refreshes: (self.init_refreshes - 1) as u4 wrap,
+                        ..base
+                    }
+                } else {
+                    Self {
+                        state: State::Idle,
+                        cmd: CMD_MODE,
+                        a: MODE,
+                        dqm: 0,
+                        delay: (T_RSC - 1) as u15 wrap,
+                        refresh_timer: REFRESH_INTERVAL,
+                        ready: 1,
+                        ..base
+                    }
+                },
+                State::Idle => if refresh_due {
+                    Self {
+                        cmd: CMD_REFRESH,
+                        delay: (T_RC - 1) as u15 wrap,
+                        refresh_timer: REFRESH_INTERVAL,
+                        ..base
+                    }
+                } else if valid == 1 {
+                    Self {
+                        state: State::Access,
+                        cmd: CMD_ACTIVE,
+                        ba: r.addr[23:22],
+                        a: r.addr[21:9],
+                        delay: (T_RCD - 1) as u15 wrap,
+                        write: r.write,
+                        bank: r.addr[23:22],
+                        column: r.addr[8:0],
+                        remaining: r.len,
+                        since_active: 0,
+                        ..base
+                    }
+                } else {
+                    base
+                },
+                State::Access => {
+                    let last = self.remaining == 1;
+                    Self {
+                        state: if last { State::Close } else { State::Access },
+                        cmd: if self.write == 1 { CMD_WRITE } else { CMD_READ },
+                        ba: self.bank,
+                        // A10 low: no auto-precharge.
+                        a: 0_u4 @ self.column,
+                        dq_out: wdata,
+                        dq_oe: self.write,
+                        delay: if last & self.write == 1 { (T_WR - 1) as u15 wrap } else { 0 },
+                        column: (self.column + 1) as u9 wrap,
+                        remaining: (self.remaining - 1) as u6 wrap,
+                        ..base
+                    }
+                },
+                State::Close => if self.since_active >= (T_RAS - 1) as u3 wrap {
+                    Self {
+                        state: State::Idle,
+                        cmd: CMD_PRECHARGE,
+                        ba: self.bank,
+                        a: 0,
+                        delay: (T_RP - 1) as u15 wrap,
+                        ..base
+                    }
+                } else {
+                    base
+                },
+            }
+        };
+
+        let out = SdramOut {
+            pins: SdramPins {
+                cke: 1,
+                cs_n: self.cmd[3:3],
+                ras_n: self.cmd[2:2],
+                cas_n: self.cmd[1:1],
+                we_n: self.cmd[0:0],
+                ba: self.ba,
+                a: self.a,
+                dqm: self.dqm,
+                dq_out: self.dq_out,
+                dq_oe: self.dq_oe,
+            },
+            ready: self.ready,
+            accepted: accepted,
+            wtake: wtake,
+            rdata: if self.rd_pipe[READ_CAPTURE:READ_CAPTURE] == 1 { Some(self.dq_q) } else { None },
+        };
+        (Self { rd_pipe: self.rd_pipe[3:0] @ (next.cmd == CMD_READ), ..next }, out)
+    }
+}
