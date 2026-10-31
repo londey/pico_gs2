@@ -33,6 +33,10 @@ models/                 Rust models of external chips
 external/icepi-zero     board repo (git submodule): pin sites, examples
 scripts/  justfile      task runner; every recipe is a script in scripts/
 docs/setup.md           the setup and bring-up plan
+docs/design/            design notes: triangle-pipeline.md (the rendering plan and
+                        phases), setup-engine-brief.md (the setup engine spec)
+docs/adr/               architecture decision records, NNNN-title.md
+docs/sinter-requirements.md  Sinter gaps pico_gs2 needs closed, with stopgaps
 build/                  (git-ignored) generated Verilog, simulator crates, bitstreams
 ```
 
