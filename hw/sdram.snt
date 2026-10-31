@@ -1,13 +1,15 @@
 // SDRAM controller for the board's W9825G6KH (4 banks x 8192 rows x 512
-// columns x 16 bits), run from the 100 MHz core clock.
+// columns x 16 bits), run from the 75 MHz core clock.
 //
 // The chip runs at CAS latency 2 with burst length 1: a run of words in one
 // row is one ACTIVE, then a READ or WRITE every cycle, then a PRECHARGE. The
 // timing is the slowest of all the part's speed grades (datasheet section
-// 9.5) rounded up to whole 10 ns cycles, so any grade works. A requester
-// asks for a run of 1 to 32 words that doesn't cross a row; write data is
-// taken a word per cycle on `wtake`, read data comes back a word per cycle
-// on `rdata`.
+// 9.5) rounded up to whole 13.3 ns cycles, so any grade works. A requester
+// asks for a run of 1 to 32 words that doesn't cross a row, and holds the
+// request until `accepted`; write data is taken a word per cycle on
+// `wtake`, read data comes back a word per cycle on `rdata`. Every output
+// comes from a register, so a requester can compute its request from them
+// without a combinational loop.
 //
 // A word address is bank (bits 23:22), row (21:9), column (8:0).
 //
@@ -16,27 +18,27 @@
 // buffers; `dq_in` is DQ as the pins see it.
 
 // Cycles from reset to the first command: the datasheet's 200 us power-up
-// pause (section 7.1) at 100 MHz, plus margin.
-const INIT_WAIT: u15 = 20100;
+// pause (section 7.1) at 75 MHz (15,000 cycles), plus margin.
+const INIT_WAIT: u15 = 15100;
 
-// Datasheet timing at 100 MHz, slowest grade, in cycles.
+// Datasheet timing at 75 MHz, slowest grade, in cycles.
 // tRCD (20 ns): ACTIVE to READ/WRITE.
 const T_RCD: u15 = 2;
 // tRP (20 ns): PRECHARGE to ACTIVE/REFRESH.
 const T_RP: u15 = 2;
 // tRAS (45 ns): ACTIVE to PRECHARGE.
-const T_RAS: u3 = 5;
+const T_RAS: u3 = 4;
 // tRC (65 ns): REFRESH to anything, and ACTIVE to ACTIVE.
-const T_RC: u15 = 7;
+const T_RC: u15 = 5;
 // tWR (2 tCK): last write data to PRECHARGE.
 const T_WR: u15 = 2;
 // tRSC (2 tCK): MODE REGISTER SET to the next command.
 const T_RSC: u15 = 2;
 
 // Cycles between REFRESH commands. The datasheet needs 8192 per 64 ms, one
-// per 781 cycles on average; refresh waits for a run in progress (at most
+// per 585 cycles on average; refresh waits for a run in progress (at most
 // about 40 cycles), so ask early.
-const REFRESH_INTERVAL: u10 = 740;
+const REFRESH_INTERVAL: u10 = 545;
 
 // REFRESH commands in the power-up sequence.
 const INIT_REFRESHES: u4 = 8;
@@ -46,8 +48,9 @@ const MODE: u13 = 0x020;
 
 // Cycles from a READ on the pins to the cycle `dq_q` holds its data: CAS
 // latency 2, plus the board round trip (the SDRAM clock lags the core clock
-// by 270 degrees, so the data reaches the FPGA just before the edge one
-// cycle after the CAS latency), plus `dq_q` itself. This is the bit of
+// by 270 degrees, so the data reaches the FPGA before the edge one cycle
+// after the CAS latency: Phase 4 found this right at 100 MHz, and at 75 MHz
+// the longer cycle leaves more margin both ways), plus `dq_q` itself. This is the bit of
 // `rd_pipe` that marks the word arriving.
 const READ_CAPTURE: u3 = 4;
 
@@ -91,8 +94,9 @@ pub struct SdramOut {
     pub pins: SdramPins,
     // High once the power-up sequence is done.
     pub ready: u1,
-    // High in the cycle a request is taken; the requester moves on to its
-    // next request.
+    // High in the cycle after a request is taken; the requester moves on to
+    // its next request. (The controller is busy for many cycles after taking
+    // one, so the request it still sees in this cycle is ignored.)
     pub accepted: u1,
     // High in each cycle `wdata` is taken for a write run.
     pub wtake: u1,
@@ -125,6 +129,8 @@ pub struct SdramController {
     // DQM is held high until the mode register is set (section 7.1).
     dqm: u2 = 0b11,
     dq_out: u16 = 0,
+    // A request was taken last cycle.
+    accepted: u1 = 0,
     dq_oe: u1 = 0,
     // Refreshes still to do in the power-up sequence.
     init_refreshes: u4 = INIT_REFRESHES,
@@ -267,10 +273,10 @@ impl SdramController {
                 dq_oe: self.dq_oe,
             },
             ready: self.ready,
-            accepted: accepted,
+            accepted: self.accepted,
             wtake: wtake,
             rdata: if self.rd_pipe[READ_CAPTURE:READ_CAPTURE] == 1 { Some(self.dq_q) } else { None },
         };
-        (Self { rd_pipe: self.rd_pipe[3:0] @ (next.cmd == CMD_READ), ..next }, out)
+        (Self { rd_pipe: self.rd_pipe[3:0] @ (next.cmd == CMD_READ), accepted: accepted, ..next }, out)
     }
 }

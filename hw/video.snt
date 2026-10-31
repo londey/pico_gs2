@@ -2,20 +2,25 @@
 
 // One video mode's timing. Horizontal values are in pixels, vertical in
 // lines, both counted from 0 at the first active pixel/line. A sync pulse
-// covers [sync_start, sync_end).
+// covers [sync_start, sync_end), at the given level.
 pub struct Timing {
-    pub h_active: u10,
-    pub h_sync_start: u10,
-    pub h_sync_end: u10,
-    pub h_total: u10,
-    pub v_active: u10,
-    pub v_sync_start: u10,
-    pub v_sync_end: u10,
-    pub v_total: u10,
+    pub h_active: u11,
+    pub h_sync_start: u11,
+    pub h_sync_end: u11,
+    pub h_total: u11,
+    pub v_active: u11,
+    pub v_sync_start: u11,
+    pub v_sync_end: u11,
+    pub v_total: u11,
+    // The sync levels during the pulses: 1 for active high, 0 for active
+    // low.
+    pub h_sync_level: u1,
+    pub v_sync_level: u1,
 }
 
-// 640x480 at 60 Hz: 800x525 total, both syncs active low. Run from a
-// 25 MHz pixel clock (the standard is 25.175 MHz; monitors accept both).
+// 640x480 at 60 Hz (VESA DMT): 800x525 total, both syncs active low. Run
+// from a 25 MHz pixel clock (the standard is 25.175 MHz; monitors accept
+// both).
 pub fn vga_640x480() -> Timing {
     Timing {
         h_active: 640,
@@ -26,40 +31,60 @@ pub fn vga_640x480() -> Timing {
         v_sync_start: 490,
         v_sync_end: 492,
         v_total: 525,
+        h_sync_level: 0,
+        v_sync_level: 0,
+    }
+}
+
+// 1280x720 at 60 Hz (CEA-861 VIC 4, 720p): 1650x750 total, both syncs
+// active high. Run from a 75 MHz pixel clock (the standard is 74.25 MHz;
+// displays accept both).
+pub fn cea_1280x720() -> Timing {
+    Timing {
+        h_active: 1280,
+        h_sync_start: 1390,
+        h_sync_end: 1430,
+        h_total: 1650,
+        v_active: 720,
+        v_sync_start: 725,
+        v_sync_end: 730,
+        v_total: 750,
+        h_sync_level: 1,
+        v_sync_level: 1,
     }
 }
 
 // The beam position and the sync and blanking signals for one pixel clock.
 pub struct Beam {
     // Pixel column, 0 at the first active pixel.
-    pub x: u10,
+    pub x: u11,
     // Line, 0 at the first active line.
-    pub y: u10,
+    pub y: u11,
     // Display enable: high while (x, y) is in the active picture.
     pub de: u1,
-    // Horizontal sync, active low.
-    pub hsync_n: u1,
-    // Vertical sync, active low.
-    pub vsync_n: u1,
+    // Horizontal sync, at the level the mode gives it.
+    pub hsync: u1,
+    // Vertical sync, at the level the mode gives it.
+    pub vsync: u1,
 }
 
 // Raster timing generator: walks the beam over the frame, one pixel per
 // cycle with `en` high, and decodes blanking and sync from its position.
 #[module]
 pub struct VideoTiming {
-    x: u10 = 0,
-    y: u10 = 0,
+    x: u11 = 0,
+    y: u11 = 0,
 }
 
 impl VideoTiming {
     pub fn step(self, t: Timing, en: u1) -> (Self, Beam) {
-        let line_end = self.x == (t.h_total - 1) as u10 wrap;
-        let frame_end = self.y == (t.v_total - 1) as u10 wrap;
-        let next_y: u10 = if frame_end { 0 } else { (self.y + 1) as u10 wrap };
+        let line_end = self.x == (t.h_total - 1) as u11 wrap;
+        let frame_end = self.y == (t.v_total - 1) as u11 wrap;
+        let next_y: u11 = if frame_end { 0 } else { (self.y + 1) as u11 wrap };
         let in_hsync = self.x >= t.h_sync_start & self.x < t.h_sync_end;
         let in_vsync = self.y >= t.v_sync_start & self.y < t.v_sync_end;
         let next = Self {
-            x: if line_end { 0 } else { (self.x + 1) as u10 wrap },
+            x: if line_end { 0 } else { (self.x + 1) as u11 wrap },
             y: if line_end { next_y } else { self.y },
         };
         (
@@ -68,8 +93,8 @@ impl VideoTiming {
                 x: self.x,
                 y: self.y,
                 de: self.x < t.h_active & self.y < t.v_active,
-                hsync_n: !in_hsync,
-                vsync_n: !in_vsync,
+                hsync: if in_hsync { t.h_sync_level } else { !t.h_sync_level },
+                vsync: if in_vsync { t.v_sync_level } else { !t.v_sync_level },
             },
         )
     }

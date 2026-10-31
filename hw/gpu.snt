@@ -1,16 +1,15 @@
 // The pico-gs2 GPU core.
 //
-// An SDRAM framebuffer, scanned out to 640x480 DVI, all on the 100 MHz core
-// clock. After the SDRAM's power-up sequence the core writes a test pattern
-// into a 640x480 RGB565 framebuffer at word 0, then reads the frame back for
-// ever, in order, into a FIFO. The display side runs at one pixel every
-// fourth cycle (25 MHz): from the first frame start after the fill it takes
-// a word from the FIFO per active pixel and DVI-encodes it.
+// A 640x360 RGB565 framebuffer in SDRAM, scanned out to 1280x720 DVI with
+// every framebuffer pixel shown as 2x2 screen pixels, all on the 75 MHz core
+// clock, which is also the pixel clock. After the SDRAM's power-up sequence
+// the core writes a test pattern into the framebuffer at word 0. From then
+// on, while the display shows a framebuffer line (two screen lines) from
+// one half of a block-RAM line buffer, the core reads the next line from
+// SDRAM into the other half, so each line is read from SDRAM once.
 //
-// board/top.sv re-times the TMDS symbols to its 25 MHz pixel clock and
-// serialises them, and owns the SDRAM's clock and DQ buffers. (The display
-// side stays on the core clock because Sinter's async FIFO, the way to cross
-// to a 25 MHz domain, doesn't meet timing at 100 MHz on the ECP5.)
+// board/top.sv serialises the TMDS symbols and owns the SDRAM's clock and
+// DQ buffers.
 
 mod sdram;
 mod video;
@@ -20,52 +19,72 @@ use root::sdram::SdramPins;
 use root::sdram::SdramReq;
 use root::video::TmdsEncoder;
 use root::video::VideoTiming;
-use root::video::vga_640x480;
+use root::video::cea_1280x720;
 
-// Start address of the last SDRAM run of the framebuffer: 640 x 480 words,
-// one RGB565 word per pixel, rows packed with no padding, from word 0.
-const LAST_RUN: u19 = 307168;
+// Framebuffer width and height, in pixels. Its lines are packed with no
+// padding, one RGB565 word per pixel, from word 0.
+const FB_WIDTH: u10 = 640;
+const FB_HEIGHT: u10 = 360;
+const FB_LAST_X: u10 = 639;
+const FB_LAST_Y: u10 = 359;
+
+// Start address of the last SDRAM run of the framebuffer.
+const LAST_RUN: u18 = 230368;
 
 // Words per SDRAM run. A row is 512 words and the frame starts at word 0,
 // so runs never cross a row.
 const RUN: u6 = 32;
 
-// The scan-out reads another run only while the FIFO has room for it, and
-// for the words of the previous run still in flight.
-const FIFO_ROOM: u9 = 192;
-
-// The scan-out starts at a frame start once the FIFO holds this many words.
-const FIFO_PRIMED: u9 = 128;
+// The last screen line, in the vertical blanking: the line buffer is
+// loaded with framebuffer line 0 for the next frame.
+const LAST_LINE: u11 = 749;
 
 struct Gpu {
     // Free-running counter for the heartbeat.
     count: u27 = 0,
     sdram: SdramController,
-    // High until the test pattern is in the framebuffer.
+
+    // The fill: high until the test pattern is in the framebuffer, the
+    // address of its next run, and the pixel it writes next.
     filling: u1 = 1,
-    // Address of the next run to request, writing or reading.
-    run_addr: u19 = 0,
-    // The pixel the fill writes next.
+    fill_addr: u18 = 0,
     fill_x: u10 = 0,
     fill_y: u10 = 0,
-    // The framebuffer, a word per pixel in raster order, from the SDRAM to
-    // the display: 256 words of block RAM.
-    pixels: fifo<u16, 256>,
 
-    // Core cycle within the pixel: the display moves on when it is 3.
-    pixel_phase: u2 = 0,
+    // The line load: reading framebuffer line `load_line` (at `load_base`)
+    // into half `load_line % 2` of the line buffer. `load_col` is the
+    // column of the next run to request, `load_count` the words that have
+    // arrived.
+    loading: u1 = 0,
+    load_line: u10 = 0,
+    load_base: u18 = 0,
+    load_col: u10 = 0,
+    load_count: u10 = 0,
+    // Each half of the line buffer holds a whole line.
+    ready0: u1 = 0,
+    ready1: u1 = 0,
+    // Two framebuffer lines: half h at words h * 1024 to h * 1024 + 639.
+    linebuf: mem<u16, 2048> = 0,
+
+    // The display.
     timing: VideoTiming,
+    // High from the first frame start after the fill.
+    scanning: u1 = 0,
+    // Sticky: an active pixel's line wasn't in the line buffer.
+    underflow: u1 = 0,
+    // The beam, one cycle behind `timing`, to meet the line buffer's read.
+    de_1: u1 = 0,
+    hsync_1: u1 = 0,
+    vsync_1: u1 = 0,
+    // The pixel shows the line buffer's word (else black).
+    show_1: u1 = 0,
+    // The pixel's line wasn't in the line buffer (show red).
+    missing_1: u1 = 0,
     enc_blue: TmdsEncoder,
     enc_green: TmdsEncoder,
     enc_red: TmdsEncoder,
-    // High from the first frame start after the fill: one word is taken from
-    // `pixels` per active pixel.
-    scanning: u1 = 0,
-    // Sticky: an active pixel found `pixels` empty.
-    underflow: u1 = 0,
 
-    // The 10-bit TMDS symbols for board/top.sv, one per pixel: each holds
-    // for four core cycles (the encoders change them once per pixel).
+    // The 10-bit TMDS symbols for board/top.sv, one per cycle.
     pub tmds_blue: u10 = 0,
     pub tmds_green: u10 = 0,
     pub tmds_red: u10 = 0,
@@ -73,9 +92,9 @@ struct Gpu {
 
 // The core's outputs to the board.
 struct Out {
-    // The user LEDs, active high: led[0] the heartbeat (about 0.75 Hz),
-    // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] scan-out
-    // underflow.
+    // The user LEDs, active high: led[0] the heartbeat (about 0.56 Hz),
+    // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] a line
+    // wasn't loaded in time.
     led: u5,
     sdram: SdramPins,
 }
@@ -83,62 +102,104 @@ struct Out {
 impl Gpu {
     #[clock(domain = core, period = 1)]
     fn tick(self, sdram_dq: u16) -> (Gpu, Out) {
-        // The SDRAM side: fill the framebuffer, then keep the FIFO topped up.
-        let tx = self.pixels.sender();
-        let want = self.filling == 1 | tx.len() <= FIFO_ROOM;
-        let req: Option<SdramReq> = if want {
-            Some(SdramReq { write: self.filling, addr: 0_u5 @ self.run_addr, len: RUN })
+        let (timing, beam) = self.timing.step(cea_1280x720(), 1);
+
+        // A line load starts at the start of each even screen line, for the
+        // framebuffer line after the one it shows, and on the last line of
+        // the frame, for line 0.
+        let shown_line = beam.y[10:1] as u10 wrap;
+        let next_line: u10 = if beam.y == LAST_LINE { 0 } else { (shown_line + 1) as u10 wrap };
+        let start_load = !self.filling & beam.x == 0
+            & ((beam.y[0:0] == 0 & next_line < FB_HEIGHT) | beam.y == LAST_LINE);
+
+        // SDRAM requests: the fill's writes, then line loads.
+        let reading = self.loading & self.load_col != FB_WIDTH;
+        let load_addr = (self.load_base + (0_u8 @ self.load_col)) as u18 wrap;
+        let req: Option<SdramReq> = if self.filling == 1 {
+            Some(SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN })
+        } else if reading == 1 {
+            Some(SdramReq { write: 0, addr: 0_u6 @ load_addr, len: RUN })
         } else {
             None
         };
         let (sdram, mem) = self.sdram.step(req, pattern(self.fill_x, self.fill_y), sdram_dq);
 
-        let last_run = mem.accepted & self.run_addr == LAST_RUN;
-        let run_addr: u19 = if mem.accepted == 0 {
-            self.run_addr
-        } else if last_run == 1 {
-            0
-        } else {
-            (self.run_addr + RUN) as u19 wrap
-        };
-        let line_end = self.fill_x == 639;
+        // The fill.
+        let last_run = self.filling & mem.accepted & self.fill_addr == LAST_RUN;
+        let fill_addr = if self.filling & mem.accepted { (self.fill_addr + RUN) as u18 wrap } else { self.fill_addr };
+        let line_end = self.fill_x == FB_LAST_X;
         let fill_x: u10 = if mem.wtake == 0 { self.fill_x } else if line_end { 0 } else { (self.fill_x + 1) as u10 wrap };
         let fill_y = if mem.wtake & line_end { (self.fill_y + 1) as u10 wrap } else { self.fill_y };
 
-        // The display side, one pixel per four cycles.
-        let en = self.pixel_phase == 3;
-        let (timing, beam) = self.timing.step(vga_640x480(), en);
-        let primed = !self.filling & self.pixels.len() >= FIFO_PRIMED;
-        let scanning = self.scanning | (primed & beam.x == 0 & beam.y == 0);
-        let take = en & scanning & beam.de;
-        // An empty FIFO shows red (and is latched as an underflow).
-        let (word, empty) = match self.pixels.front() {
-            Some(w) => (w, 0_u1),
-            None => (0xF800_u16, 1_u1),
+        // The line load: requests, then words into the line buffer.
+        let load_half = self.load_line[0:0];
+        let (got, word) = match mem.rdata {
+            Some(w) => (1_u1, w),
+            None => (0_u1, 0_u16),
         };
-        let rgb: u16 = if scanning == 1 { word } else { 0 };
+        let loaded = got & self.load_count == FB_LAST_X;
+        let load_col: u10 = if start_load {
+            0
+        } else if reading & mem.accepted {
+            (self.load_col + RUN) as u10 wrap
+        } else {
+            self.load_col
+        };
+        let load_count: u10 = if start_load { 0 } else if got { (self.load_count + 1) as u10 wrap } else { self.load_count };
+        let load_base: u18 = if !start_load {
+            self.load_base
+        } else if next_line == 0 {
+            0
+        } else {
+            (self.load_base + (0_u8 @ FB_WIDTH)) as u18 wrap
+        };
+        // A load clears its half's ready flag when it starts, and sets it
+        // when the last word arrives.
+        let ready0: u1 = if start_load & next_line[0:0] == 0 { 0 } else if loaded & load_half == 0 { 1 } else { self.ready0 };
+        let ready1: u1 = if start_load & next_line[0:0] == 1 { 0 } else if loaded & load_half == 1 { 1 } else { self.ready1 };
+
+        // The display: framebuffer pixel (x / 2, y / 2) for screen pixel
+        // (x, y), from line-buffer half (y / 2) % 2.
+        let half = shown_line[0:0];
+        let half_ready = if half == 1 { self.ready1 } else { self.ready0 };
+        let scanning = self.scanning | (!self.filling & self.ready0 & beam.x == 0 & beam.y == 0);
+        let show = scanning & beam.de;
+        let raddr = half @ beam.x[10:1];
+        let waddr = load_half @ self.load_count;
+        let rgb: u16 = if self.show_1 == 0 { 0 } else if self.missing_1 == 1 { 0xF800 } else { self.linebuf.value() };
         // DVI carries HSYNC and VSYNC as C0 and C1 of the blue channel.
-        let sync = beam.vsync_n @ beam.hsync_n;
-        let (enc_blue, blue) = self.enc_blue.step(rgb[4:0] @ rgb[4:2], sync, beam.de, en);
-        let (enc_green, green) = self.enc_green.step(rgb[10:5] @ rgb[10:9], 0, beam.de, en);
-        let (enc_red, red) = self.enc_red.step(rgb[15:11] @ rgb[15:13], 0, beam.de, en);
+        let sync = self.vsync_1 @ self.hsync_1;
+        let (enc_blue, blue) = self.enc_blue.step(rgb[4:0] @ rgb[4:2], sync, self.de_1, 1);
+        let (enc_green, green) = self.enc_green.step(rgb[10:5] @ rgb[10:9], 0, self.de_1, 1);
+        let (enc_red, red) = self.enc_red.step(rgb[15:11] @ rgb[15:13], 0, self.de_1, 1);
 
         (
             Gpu {
                 count: (self.count + 1) as u27 wrap,
                 sdram: sdram,
                 filling: self.filling & !last_run,
-                run_addr: run_addr,
+                fill_addr: fill_addr,
                 fill_x: fill_x,
                 fill_y: fill_y,
-                pixels: self.pixels.next(tx.offer(mem.rdata), take),
-                pixel_phase: (self.pixel_phase + 1) as u2 wrap,
+                loading: start_load | (self.loading & !loaded),
+                load_line: if start_load { next_line } else { self.load_line },
+                load_base: load_base,
+                load_col: load_col,
+                load_count: load_count,
+                ready0: ready0,
+                ready1: ready1,
+                linebuf: self.linebuf.next(raddr, got & self.loading, waddr, word),
                 timing: timing,
+                scanning: scanning,
+                underflow: self.underflow | (show & !half_ready),
+                de_1: beam.de,
+                hsync_1: beam.hsync,
+                vsync_1: beam.vsync,
+                show_1: show,
+                missing_1: !half_ready,
                 enc_blue: enc_blue,
                 enc_green: enc_green,
                 enc_red: enc_red,
-                scanning: scanning,
-                underflow: self.underflow | (take & empty),
                 tmds_blue: blue.symbol,
                 tmds_green: green.symbol,
                 tmds_red: red.symbol,
@@ -155,7 +216,7 @@ impl Gpu {
 // it red rising left to right, green top to bottom, and blue on alternate
 // 32x32 squares.
 fn pattern(x: u10, y: u10) -> u16 {
-    let border = x == 0 | x == 639 | y == 0 | y == 479;
+    let border = x == 0 | x == FB_LAST_X | y == 0 | y == FB_LAST_Y;
     let blue: u5 = if (x[5:5] ^ y[5:5]) == 1 { 31 } else { 0 };
     if border { 0xFFFF } else { x[9:5] @ y[8:3] @ blue }
 }

@@ -1,10 +1,11 @@
 //! Twin test of the whole core (`hw/gpu.snt`) with the SDRAM model on its
 //! bus: from reset, through the SDRAM's power-up sequence and the
-//! framebuffer fill, to the first frame scanned out of SDRAM. The test
-//! decodes the TMDS symbols as a DVI monitor would, checks the picture and
-//! the sync timing at every pixel, checks the SDRAM's contents and that the
-//! controller broke none of the datasheet's rules, and writes the picture to
-//! `build/framebuffer.png`.
+//! framebuffer fill, through the first two 1280x720 frames scanned out of
+//! SDRAM (the second reuses the line buffer the first filled). The test
+//! decodes the TMDS symbols as a DVI monitor would, checks the picture
+//! (each framebuffer pixel as 2x2 screen pixels) and the sync timing at every
+//! pixel, checks the SDRAM's contents and that the controller broke none of
+//! the datasheet's rules, and writes the picture to `build/framebuffer.png`.
 
 use std::error::Error;
 use std::fs::File;
@@ -15,44 +16,53 @@ use gpu_sim::{Gpu, Inputs, Outputs};
 use sdram_model::Pins;
 use tb::{decode, SdramBus, Symbol};
 
-/// Active pixels per line (VESA 640x480 at 60 Hz).
-const H_ACTIVE: usize = 640;
+/// Active pixels per line (CEA-861 1280x720 at 60 Hz).
+const H_ACTIVE: usize = 1280;
 
 /// First pixel of the horizontal sync pulse.
-const H_SYNC_START: usize = 656;
+const H_SYNC_START: usize = 1390;
 
 /// First pixel after the horizontal sync pulse.
-const H_SYNC_END: usize = 752;
+const H_SYNC_END: usize = 1430;
 
 /// Pixels per line, including blanking.
-const H_TOTAL: usize = 800;
+const H_TOTAL: usize = 1650;
 
 /// Active lines per frame.
-const V_ACTIVE: usize = 480;
+const V_ACTIVE: usize = 720;
 
 /// First line of the vertical sync pulse.
-const V_SYNC_START: usize = 490;
+const V_SYNC_START: usize = 725;
 
 /// First line after the vertical sync pulse.
-const V_SYNC_END: usize = 492;
+const V_SYNC_END: usize = 730;
 
 /// Lines per frame, including blanking.
-const V_TOTAL: usize = 525;
+const V_TOTAL: usize = 750;
 
-/// Pixel clocks per frame.
+/// Pixel clocks (and core cycles) per frame.
 const FRAME: usize = H_TOTAL * V_TOTAL;
 
-/// Core cycles per pixel.
-const CYCLES_PER_PIXEL: usize = 4;
+/// Framebuffer width, in pixels.
+const FB_WIDTH: usize = 640;
 
-/// Pixels before the symbol outputs show pixel (0, 0): the display takes
-/// its first pixel in core cycle 3, the encoder pipeline takes four cycles,
-/// and the core's symbol registers one more, so it shows from cycle 8.
-const SYMBOL_LATENCY: usize = 2;
+/// Framebuffer height, in pixels.
+const FB_HEIGHT: usize = 360;
 
-/// Frames to wait for the scan-out to start: the SDRAM's power-up and the
-/// fill take about a quarter of a frame, then it starts at the next frame.
-const MAX_FRAMES: usize = 3;
+/// Screen pixels per framebuffer pixel, across and down.
+const SCALE: usize = 2;
+
+/// Core cycles before the symbol outputs show pixel (0, 0): one to read the
+/// line buffer, four in the encoder pipeline, and one in the core's symbol
+/// registers.
+const SYMBOL_LATENCY: usize = 6;
+
+/// Frames to run: the SDRAM's power-up and the fill take about a quarter of
+/// a frame, the scan-out starts at the next frame, and two are checked.
+const MAX_FRAMES: usize = 4;
+
+/// Frames scanned out of SDRAM to check.
+const CHECKED_FRAMES: usize = 2;
 
 /// LED bits: SDRAM initialised, framebuffer filled, scan-out underflow.
 const LED_SDRAM_READY: u8 = 1 << 1;
@@ -63,7 +73,7 @@ const LED_UNDERFLOW: u8 = 1 << 3;
 /// rising to the right, green rising downwards, blue on alternate 32x32
 /// squares.
 fn pattern(x: usize, y: usize) -> u16 {
-    if x == 0 || x == H_ACTIVE - 1 || y == 0 || y == V_ACTIVE - 1 {
+    if x == 0 || x == FB_WIDTH - 1 || y == 0 || y == FB_HEIGHT - 1 {
         return 0xFFFF;
     }
     let red = (x >> 5) & 0x1F;
@@ -104,9 +114,9 @@ struct Run {
     /// The SDRAM and its bus, at the end.
     bus: SdramBus,
 
-    /// The (blue, green, red) TMDS symbols of the first frame whose first
-    /// pixel isn't black, in raster order.
-    frame: Vec<[u16; 3]>,
+    /// The (blue, green, red) TMDS symbols of the first frames whose first
+    /// pixel isn't black, each in raster order.
+    frames: Vec<Vec<[u16; 3]>>,
 
     /// The LEDs at the end.
     led: u8,
@@ -117,40 +127,43 @@ struct Run {
 fn run() -> Run {
     let mut sim = Gpu::new();
     let mut bus = SdramBus::new();
+    let mut frames = Vec::new();
     let mut frame = Vec::with_capacity(FRAME);
     let mut led = 0;
-    for cycle in 0..(MAX_FRAMES * FRAME + SYMBOL_LATENCY) * CYCLES_PER_PIXEL {
+    for cycle in 0..MAX_FRAMES * FRAME + SYMBOL_LATENCY {
         let out = sim.step(&Inputs {
             sdram_dq: bus.dq_in(),
         });
         bus.clock(&pins(&out));
         led = out.out_led;
-        // Each symbol holds for a pixel's four cycles: sample it once.
-        if cycle % CYCLES_PER_PIXEL != 0 || cycle / CYCLES_PER_PIXEL < SYMBOL_LATENCY {
+        if cycle < SYMBOL_LATENCY {
             continue;
         }
         frame.push([out.tmds_blue_q, out.tmds_green_q, out.tmds_red_q]);
         if frame.len() == FRAME {
             // Before the scan-out starts the picture is black; the first
             // frame scanned out starts with its white border.
-            if decode(frame[0][2]) != Symbol::Data(0) {
-                break;
+            if !frames.is_empty() || decode(frame[0][2]) != Symbol::Data(0) {
+                frames.push(std::mem::take(&mut frame));
+                if frames.len() == CHECKED_FRAMES {
+                    break;
+                }
             }
             frame.clear();
         }
     }
-    Run { bus, frame, led }
+    Run { bus, frames, led }
 }
 
 /// The first frame scanned out of SDRAM shows the test pattern, the sync
 /// timing is right at every pixel, and the SDRAM was driven by the book.
 #[test]
 fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
-    let Run { bus, frame, led } = run();
+    let Run { bus, frames, led } = run();
     assert_eq!(
-        frame.len(),
-        FRAME,
-        "no frame scanned out within {MAX_FRAMES} frames"
+        frames.len(),
+        CHECKED_FRAMES,
+        "{CHECKED_FRAMES} frames not scanned out within {MAX_FRAMES}"
     );
     assert!(
         bus.sdram.violations().is_empty(),
@@ -159,37 +172,16 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
         bus.sdram.violations()
     );
 
-    let mut picture = Vec::with_capacity(H_ACTIVE * V_ACTIVE * 3);
-    for (i, symbols) in frame.iter().enumerate() {
-        let (x, y) = (i % H_TOTAL, i / H_TOTAL);
-        let [blue, green, red] = symbols.map(decode);
-        if x < H_ACTIVE && y < V_ACTIVE {
-            let [r, g, b] = rgb888(pattern(x, y));
-            assert_eq!(
-                (red, green, blue),
-                (Symbol::Data(r), Symbol::Data(g), Symbol::Data(b)),
-                "pixel ({x}, {y})"
-            );
-            picture.extend([r, g, b]);
-        } else {
-            let hsync_n = u8::from(!(H_SYNC_START..H_SYNC_END).contains(&x));
-            let vsync_n = u8::from(!(V_SYNC_START..V_SYNC_END).contains(&y));
-            assert_eq!(
-                (blue, green, red),
-                (
-                    Symbol::Control((vsync_n << 1) | hsync_n),
-                    Symbol::Control(0),
-                    Symbol::Control(0)
-                ),
-                "blanking at ({x}, {y})"
-            );
-        }
-    }
+    let pictures: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .map(|(n, frame)| check_frame(n, frame))
+        .collect();
 
     // The framebuffer: word y * 640 + x, in bank 0 from row 0.
-    for y in 0..V_ACTIVE {
-        for x in 0..H_ACTIVE {
-            let addr = y * H_ACTIVE + x;
+    for y in 0..FB_HEIGHT {
+        for x in 0..FB_WIDTH {
+            let addr = y * FB_WIDTH + x;
             assert_eq!(
                 bus.sdram.peek(0, addr >> 9, addr & 0x1FF),
                 pattern(x, y),
@@ -203,7 +195,53 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
         LED_SDRAM_READY | LED_FILLED,
         "LEDs {led:#07b}"
     );
-    write_png(&picture)
+    write_png(&pictures[0])
+}
+
+/// Checks one frame's symbols: the test pattern in the active picture, and
+/// the sync control tokens in the blanking.
+///
+/// # Arguments
+///
+/// * `n` - The frame's number, for messages.
+/// * `frame` - The frame's (blue, green, red) symbols, in raster order.
+///
+/// # Returns
+///
+/// The decoded active picture: `H_ACTIVE * V_ACTIVE` pixels, 3 bytes each.
+///
+/// # Panics
+///
+/// If any symbol isn't the one expected.
+fn check_frame(n: usize, frame: &[[u16; 3]]) -> Vec<u8> {
+    let mut picture = Vec::with_capacity(H_ACTIVE * V_ACTIVE * 3);
+    for (i, symbols) in frame.iter().enumerate() {
+        let (x, y) = (i % H_TOTAL, i / H_TOTAL);
+        let [blue, green, red] = symbols.map(decode);
+        if x < H_ACTIVE && y < V_ACTIVE {
+            let [r, g, b] = rgb888(pattern(x / SCALE, y / SCALE));
+            assert_eq!(
+                (red, green, blue),
+                (Symbol::Data(r), Symbol::Data(g), Symbol::Data(b)),
+                "frame {n}, pixel ({x}, {y})"
+            );
+            picture.extend([r, g, b]);
+        } else {
+            // 720p's syncs are active high.
+            let hsync = u8::from((H_SYNC_START..H_SYNC_END).contains(&x));
+            let vsync = u8::from((V_SYNC_START..V_SYNC_END).contains(&y));
+            assert_eq!(
+                (blue, green, red),
+                (
+                    Symbol::Control((vsync << 1) | hsync),
+                    Symbol::Control(0),
+                    Symbol::Control(0)
+                ),
+                "frame {n}, blanking at ({x}, {y})"
+            );
+        }
+    }
+    picture
 }
 
 /// Writes the decoded active picture as an RGB PNG in `build/`.

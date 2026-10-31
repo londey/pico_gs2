@@ -2,39 +2,36 @@
 
 // Module: top
 // Purpose: ICEpi Zero board top level. Owns everything Sinter can't express
-//          (the PLL, reset, DDR output cells, tristate I/O) and instantiates
-//          the Sinter-generated GPU core.
+//          (the PLL, reset, edge clocks, DDR output gearboxes, tristate I/O)
+//          and instantiates the Sinter-generated GPU core.
 //
-// Clocks, from one EHXPLLL on the 50 MHz oscillator (500 MHz VCO, so all
-// four outputs are phase locked):
-//   clk_core   100 MHz  the Sinter GPU core, SDRAM controller and display
-//   clk_pixel   25 MHz  re-times the TMDS symbols for the serialisers
-//   clk_tmds   125 MHz  TMDS serialisers, two bits per cycle via ODDRX1F
-//   clk_sdram  100 MHz  the SDRAM's clock: clk_core lagging by 270 degrees
+// Clocks, from one EHXPLLL on the 50 MHz oscillator (750 MHz VCO, so all
+// three outputs are phase locked), and an edge-clock divider:
+//   clk_core    75 MHz  the Sinter GPU core, SDRAM controller and display;
+//                       also the 1280x720 pixel clock (CEA-861 is 74.25 MHz)
+//   clk_sdram   75 MHz  the SDRAM's clock: clk_core lagging by 270 degrees
+//   clk_eclk   375 MHz  edge clock for the ODDRX2F gearboxes (two bits per
+//                       cycle: 750 Mbit/s per TMDS channel)
+//   clk_sclk  187.5 MHz clk_eclk / 2 (CLKDIVF): the gearboxes' parallel side,
+//                       four bits per cycle
 //
 // SDRAM: the core's SDRAM outputs all come from registers on clk_core. The
-// SDRAM samples them on clk_sdram, 7.5 ns after the clk_core edge that
+// SDRAM samples them on clk_sdram, 10 ns after the clk_core edge that
 // launched them, which leaves time for the output delay and the chip's
-// set-up time, and plenty of hold. The board's own memtest found 90 degrees
-// unreliable and 150-359 degrees good; 270 is the middle of that window. Read
-// data reaches the FPGA around the clk_core edge one cycle after the CAS
-// latency, where the core registers it (hw/sdram.snt, READ_CAPTURE).
+// set-up time, and plenty of hold. Read data reaches the FPGA around the
+// clk_core edge one cycle after the CAS latency, where the core registers it
+// (hw/sdram.snt, READ_CAPTURE). The board's own memtest found 270 degrees
+// good at 100 MHz, as did Phase 4.
 //
-// DVI out: the core produces one 10-bit TMDS symbol per channel per pixel,
-// from registers that change once every four clk_core cycles (40 ns).
-// clk_pixel samples them once per pixel: the clocks come from one PLL, so
-// whichever clk_core edge the symbols change on, they have settled by the
-// next clk_pixel edge (at least 10 ns later), and each is sampled exactly
-// once. Each symbol is then shifted out least significant bit first, two
-// bits per clk_tmds cycle, so five clk_tmds cycles send one symbol. The TMDS
-// clock channel sends 0b0000011111 the same way. clk_tmds is exactly 5x
-// clk_pixel, so loading the shifters is an ordinary synchronous path.
+// DVI out: the core produces one 10-bit TMDS symbol per channel per clk_core
+// cycle. tmds_gearbox turns them into four bits per clk_sclk cycle, and an
+// ODDRX2F per channel sends those at two bits per clk_eclk cycle.
 module top (
-    input  wire        clk,      // 50 MHz board oscillator
-    output logic [4:0] led,      // User LEDs, active high
-    output logic [3:0] gpdi_dp,  // TMDS to the GPDI connector: blue, green, red, clock
-                                 // (LVCMOS33D: the _n pins are driven inverted)
-    output logic        sdram_clk,   // SDRAM clock, 100 MHz
+    input  wire         clk,         // 50 MHz board oscillator
+    output logic [4:0]  led,         // User LEDs, active high
+    output logic [3:0]  gpdi_dp,     // TMDS to the GPDI connector: blue, green, red, clock
+                                     // (LVCMOS33D: the _n pins are driven inverted)
+    output logic        sdram_clk,   // SDRAM clock, 75 MHz
     output logic        sdram_cke,   // SDRAM clock enable
     output logic        sdram_csn,   // SDRAM chip select, active low
     output logic        sdram_rasn,  // SDRAM row address strobe, active low
@@ -46,34 +43,23 @@ module top (
     inout  wire  [15:0] sdram_dq     // SDRAM data
 );
 
-    // TMDS clock channel pattern: five bit times high, five low.
-    localparam logic [9:0] TMDS_CLOCK_SYMBOL = 10'b0000011111;
-
-    // Last clk_tmds phase of each symbol.
-    localparam logic [2:0] LAST_PHASE = 3'd4;
-
-    logic             clk_core;        // 100 MHz core clock
-    logic             clk_pixel;       // 25 MHz pixel clock
-    logic             clk_tmds;        // 125 MHz serialiser clock
-    logic             clk_sdram;       // 100 MHz SDRAM clock, clk_core lagging 270 degrees
+    logic             clk_core;        // 75 MHz core and pixel clock
+    logic             clk_tmds;        // 375 MHz PLL output for the edge clock
+    logic             clk_sdram;       // 75 MHz SDRAM clock, clk_core lagging 270 degrees
+    logic             clk_eclk;        // 375 MHz gearbox edge clock
+    logic             clk_sclk;        // 187.5 MHz gearbox parallel clock
     logic             pll_locked;      // PLL lock indicator
     logic             rst_n;           // Reset: held until the PLL locks, asynchronous
     logic [1:0]       rst_core_sync;   // clk_core reset synchroniser flip-flops
     logic [1:0]       rst_core_next;   // Next synchroniser value
     logic             rst_core_n;      // Synchronised active-low reset, clk_core domain
-    logic [9:0]       tmds_blue_core;  // Blue channel symbol, clk_core domain
-    logic [9:0]       tmds_green_core; // Green channel symbol, clk_core domain
-    logic [9:0]       tmds_red_core;   // Red channel symbol, clk_core domain
-    logic [9:0]       tmds_blue;       // Blue channel symbol, clk_pixel domain
-    logic [9:0]       tmds_green;      // Green channel symbol, clk_pixel domain
-    logic [9:0]       tmds_red;        // Red channel symbol, clk_pixel domain
-    logic [1:0]       rst_tmds_sync;   // clk_tmds reset synchroniser flip-flops
-    logic [1:0]       rst_tmds_next;   // Next synchroniser value
-    logic             rst_tmds_n;      // Synchronised active-low reset, clk_tmds domain
-    logic [2:0]       phase;           // Bit pair being sent (0-4), UQ3.0
-    logic [2:0]       phase_next;      // Next phase
-    logic [3:0][9:0]  shift;           // Per-channel shift registers: clock, red, green, blue
-    logic [3:0][9:0]  shift_next;      // Next shift register values
+    logic [1:0]       rst_sclk_sync;   // clk_sclk reset synchroniser flip-flops
+    logic [1:0]       rst_sclk_next;   // Next synchroniser value
+    logic             rst_sclk_n;      // Synchronised active-low reset, clk_sclk domain
+    logic [9:0]       tmds_blue;       // Blue channel symbol, clk_core domain
+    logic [9:0]       tmds_green;      // Green channel symbol, clk_core domain
+    logic [9:0]       tmds_red;        // Red channel symbol, clk_core domain
+    logic [15:0]      nibbles;         // Four bits per channel per clk_sclk cycle (tmds_gearbox)
     logic [15:0]      sdram_dq_out;    // SDRAM write data from the core
     logic             sdram_dq_oe;     // High while the core drives sdram_dq
     logic             sdram_dq_t;      // Tristate control for the DQ buffers: high releases
@@ -84,10 +70,9 @@ module top (
     // ------------------------------------------------------------------
 `ifdef SYNTHESIS
     (* FREQUENCY_PIN_CLKI = "50" *)
-    (* FREQUENCY_PIN_CLKOP = "125" *)
-    (* FREQUENCY_PIN_CLKOS = "100" *)
-    (* FREQUENCY_PIN_CLKOS2 = "25" *)
-    (* FREQUENCY_PIN_CLKOS3 = "100" *)
+    (* FREQUENCY_PIN_CLKOP = "375" *)
+    (* FREQUENCY_PIN_CLKOS = "75" *)
+    (* FREQUENCY_PIN_CLKOS2 = "75" *)
     (* ICP_CURRENT = "12" *)
     (* LPF_RESISTOR = "8" *)
     (* MFG_ENABLE_FILTEROPAMP = "1" *)
@@ -102,32 +87,28 @@ module top (
         .OUTDIVIDER_MUXC  ("DIVC"),
         .OUTDIVIDER_MUXD  ("DIVD"),
         .CLKI_DIV         (2),           // 25 MHz phase detector
-        .CLKFB_DIV        (5),           // CLKOP = 5 x 25 MHz
+        .CLKFB_DIV        (15),          // CLKOP = 15 x 25 MHz
         .FEEDBK_PATH      ("CLKOP"),
         .CLKOP_ENABLE     ("ENABLED"),
-        .CLKOP_DIV        (4),           // 500 MHz VCO / 4 = 125 MHz
-        .CLKOP_CPHASE     (1),
+        .CLKOP_DIV        (2),           // 750 MHz VCO / 2 = 375 MHz
+        .CLKOP_CPHASE     (0),
         .CLKOP_FPHASE     (0),
         .CLKOS_ENABLE     ("ENABLED"),
-        .CLKOS_DIV        (5),           // 500 MHz / 5 = 100 MHz
-        .CLKOS_CPHASE     (1),
+        .CLKOS_DIV        (10),          // 750 MHz / 10 = 75 MHz
+        .CLKOS_CPHASE     (0),
         .CLKOS_FPHASE     (0),
         .CLKOS2_ENABLE    ("ENABLED"),
-        .CLKOS2_DIV       (20),          // 500 MHz / 20 = 25 MHz
-        .CLKOS2_CPHASE    (1),
-        .CLKOS2_FPHASE    (0),
-        .CLKOS3_ENABLE    ("ENABLED"),
-        .CLKOS3_DIV       (5),           // 500 MHz / 5 = 100 MHz
-        .CLKOS3_CPHASE    (4),           // CLKOS + 3.75 VCO cycles (7.5 ns,
-        .CLKOS3_FPHASE    (6)            // 270 degrees): 3 whole + 6/8
+        .CLKOS2_DIV       (10),          // 750 MHz / 10 = 75 MHz
+        .CLKOS2_CPHASE    (7),           // CLKOS + 7.5 VCO cycles (10 ns,
+        .CLKOS2_FPHASE    (4)            // 270 degrees): 7 whole + 4/8
     ) u_pll (
         .RST          (1'b0),
         .STDBY        (1'b0),
         .CLKI         (clk),
         .CLKOP        (clk_tmds),
         .CLKOS        (clk_core),
-        .CLKOS2       (clk_pixel),
-        .CLKOS3       (clk_sdram),
+        .CLKOS2       (clk_sdram),
+        .CLKOS3       (),
         .CLKFB        (clk_tmds),
         .CLKINTFB     (),
         .PHASESEL0    (1'b0),
@@ -144,12 +125,28 @@ module top (
         .INTLOCK      (),
         .REFCLK       ()
     );
+
+    ECLKSYNCB u_eclksync (
+        .ECLKI (clk_tmds),
+        .STOP  (1'b0),
+        .ECLKO (clk_eclk)
+    );
+
+    CLKDIVF #(
+        .DIV ("2.0")
+    ) u_clkdiv (
+        .CLKI    (clk_eclk),
+        .RST     (1'b0),
+        .ALIGNWD (1'b0),
+        .CDIVX   (clk_sclk)
+    );
 `else
     // Lint/simulation stand-in: every domain on the board clock.
     assign clk_tmds   = clk;
     assign clk_core   = clk;
-    assign clk_pixel  = clk;
     assign clk_sdram  = clk;
+    assign clk_eclk   = clk_tmds;
+    assign clk_sclk   = clk_tmds;
     assign pll_locked = 1'b1;
 `endif
 
@@ -178,20 +175,20 @@ module top (
 
     assign rst_core_n = rst_core_sync[1];
 
-    // clk_tmds domain: asynchronous assert, synchronous release.
+    // clk_sclk domain: asynchronous assert, synchronous release.
     always_comb begin
-        rst_tmds_next = {rst_tmds_sync[0], 1'b1};
+        rst_sclk_next = {rst_sclk_sync[0], 1'b1};
     end
 
-    always_ff @(posedge clk_tmds or negedge rst_n) begin
+    always_ff @(posedge clk_sclk or negedge rst_n) begin
         if (!rst_n) begin
-            rst_tmds_sync <= 2'b00;
+            rst_sclk_sync <= 2'b00;
         end else begin
-            rst_tmds_sync <= rst_tmds_next;
+            rst_sclk_sync <= rst_sclk_next;
         end
     end
 
-    assign rst_tmds_n = rst_tmds_sync[1];
+    assign rst_sclk_n = rst_sclk_sync[1];
 
     // ------------------------------------------------------------------
     // GPU core
@@ -200,9 +197,9 @@ module top (
         .clk               (clk_core),
         .rst_n             (rst_core_n),
         .sdram_dq          (sdram_dq_in),
-        .tmds_blue_q       (tmds_blue_core),
-        .tmds_green_q      (tmds_green_core),
-        .tmds_red_q        (tmds_red_core),
+        .tmds_blue_q       (tmds_blue),
+        .tmds_green_q      (tmds_green),
+        .tmds_red_q        (tmds_red),
         .out_led           (led),
         .out_sdram_cke     (sdram_cke),
         .out_sdram_cs_n    (sdram_csn),
@@ -238,53 +235,38 @@ module top (
     end
 
     // ------------------------------------------------------------------
-    // TMDS symbols, re-timed to the pixel clock
-    // ------------------------------------------------------------------
-    always_ff @(posedge clk_pixel) begin
-        tmds_blue  <= tmds_blue_core;
-        tmds_green <= tmds_green_core;
-        tmds_red   <= tmds_red_core;
-    end
-
-    // ------------------------------------------------------------------
     // TMDS serialisers
     // ------------------------------------------------------------------
-    always_comb begin
-        if (!rst_tmds_n) begin
-            phase_next = 3'd0;
-            shift_next = '0;
-        end else if (phase == LAST_PHASE) begin
-            phase_next = 3'd0;
-            shift_next = {TMDS_CLOCK_SYMBOL, tmds_red, tmds_green, tmds_blue};
-        end else begin
-            phase_next = phase + 3'd1;
-            shift_next = {
-                {2'b00, shift[3][9:2]},
-                {2'b00, shift[2][9:2]},
-                {2'b00, shift[1][9:2]},
-                {2'b00, shift[0][9:2]}
-            };
-        end
-    end
 
-    always_ff @(posedge clk_tmds) begin
-        phase <= phase_next;
-        shift <= shift_next;
-    end
+    tmds_gearbox u_gearbox (
+        .clk_core   (clk_core),
+        .clk_sclk   (clk_sclk),
+        .rst_sclk_n (rst_sclk_n),
+        .blue       (tmds_blue),
+        .green      (tmds_green),
+        .red        (tmds_red),
+        .nibbles    (nibbles)
+    );
 
-    // Bit 0 goes out on the rising edge, bit 1 on the falling edge.
+    // The gearboxes send D0 first, then D1, D2, D3, two bits per clk_eclk
+    // cycle.
     for (genvar ch = 0; ch < 4; ch++) begin : g_tmds_out
 `ifdef SYNTHESIS
-        ODDRX1F u_oddr (
-            .SCLK (clk_tmds),
+        ODDRX2F u_oddr (
+            .SCLK (clk_sclk),
+            .ECLK (clk_eclk),
             .RST  (1'b0),
-            .D0   (shift[ch][0]),
-            .D1   (shift[ch][1]),
+            .D0   (nibbles[4 * ch]),
+            .D1   (nibbles[4 * ch + 1]),
+            .D2   (nibbles[4 * ch + 2]),
+            .D3   (nibbles[4 * ch + 3]),
             .Q    (gpdi_dp[ch])
         );
 `else
-        // Lint/simulation stand-in for the DDR output cell.
-        assign gpdi_dp[ch] = clk_tmds ? shift[ch][0] : shift[ch][1];
+        // Lint stand-in for the gearbox: not cycle accurate, but uses its
+        // inputs.
+        assign gpdi_dp[ch] = clk_eclk ? (nibbles[4 * ch] ^ nibbles[4 * ch + 1])
+                                      : (nibbles[4 * ch + 2] ^ nibbles[4 * ch + 3]);
 `endif
     end
 

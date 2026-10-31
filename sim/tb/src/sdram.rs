@@ -3,8 +3,8 @@
 
 use sdram_model::{Pins, Sdram, Timing};
 
-/// SDRAM clock period on the board (100 MHz), in picoseconds.
-const TCK_PS: u64 = 10_000;
+/// SDRAM clock period on the board (75 MHz), in picoseconds.
+const TCK_PS: u64 = 13_333;
 
 /// What the FPGA reads on DQ bits nobody drives. Not 0, so that a
 /// controller capturing on the wrong cycle reads something recognisable.
@@ -29,7 +29,7 @@ pub struct SdramBus {
 
 impl SdramBus {
     /// The chip at power-up, with the worst-case timing of all speed grades
-    /// at 100 MHz.
+    /// at 75 MHz.
     ///
     /// # Returns
     ///

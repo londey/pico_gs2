@@ -201,7 +201,7 @@ fn runs_read_back_and_meet_the_datasheet() {
             "SDRAM word {addr:#08x}"
         );
     }
-    let refreshes_due = (sim.time() - 20_100) / 781;
+    let refreshes_due = (sim.time() - 15_100) / 585;
     assert!(
         bus.sdram.refreshes() >= 8 + refreshes_due,
         "{} refreshes in {} cycles",

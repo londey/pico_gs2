@@ -33,14 +33,15 @@ which is lost at power off; add `--write-flash` to keep it.
 
 ## On the board
 
-The design fills a 640x480 RGB565 framebuffer in the SDRAM with a test
-pattern and scans it out to the GPDI (mini HDMI) port at 640x480, 60 Hz:
-red rising left to right, green rising top to bottom, a blue checkerboard
-of 32-pixel squares and a one-pixel white border. The LEDs show:
+The design fills a 640x360 RGB565 framebuffer in the SDRAM with a test
+pattern and scans it out to the GPDI (mini HDMI) port as 1280x720 at 60 Hz
+(720p), each framebuffer pixel shown as 2x2 screen pixels: red rising left
+to right, green rising top to bottom, a blue checkerboard of 32-pixel
+squares and a one-pixel white border. The LEDs show:
 
 | LED | Lit when |
 |---|---|
-| `led[0]` | blinks: the heartbeat, about 0.75 Hz |
+| `led[0]` | blinks: the heartbeat, about 0.56 Hz |
 | `led[1]` | the SDRAM has been initialised |
 | `led[2]` | the framebuffer has been filled |
-| `led[3]` | the scan-out ran out of pixels (it never should) |
+| `led[3]` | a line wasn't loaded from SDRAM in time (it never should be) |

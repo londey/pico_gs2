@@ -26,9 +26,10 @@ nextpnr-ecp5 --25k --package CABGA256 \
 final=$(awk '/Routing complete/ { f = 1 } f && /Max (frequency|delay)/' "$out/nextpnr.log" | sed 's/^Info: */    /')
 echo "$final"
 
-# nextpnr reports paths between clocks but doesn't check them. The board's
-# crossings rely on them being short (board/top.sv): clk_core to clk_pixel
-# edges can be 10 ns apart, clk_pixel to clk_tmds 8 ns. Allow 2 ns for skew.
+# nextpnr reports paths between clocks but doesn't check them. The TMDS
+# serialisers capture each symbol pair at least 6.8 ns after the clk_core
+# edge that changed it (board/top.sv), so clk_core to clk_sclk paths must be
+# shorter than that. Allow 2 ns for skew.
 check_crossing() {
     local from=$1 to=$2 budget=$3
     local delay
@@ -43,8 +44,7 @@ check_crossing() {
         exit 1
     fi
 }
-check_crossing clk_core clk_pixel 8
-check_crossing clk_pixel clk_tmds 6
+check_crossing clk_core clk_sclk 4.5
 
 echo "==> ecppack"
 ecppack --compress "$out/top.config" "$out/top.bit"
