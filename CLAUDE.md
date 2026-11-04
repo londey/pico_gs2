@@ -46,7 +46,8 @@ docs/design/            design notes: triangle-pipeline.md (the rendering plan a
                         phases), setup-engine-brief.md (the setup engine spec),
                         setup-engine.md (its numerics, as built)
 docs/adr/               architecture decision records, NNNN-title.md
-docs/slides/            Typst architecture slides (Touying + Fletcher); `just slides`
+docs/slides/            Typst architecture slides (Touying + Fletcher, the theme in
+                        theme/pico.typ, Inter and JetBrains Mono); `just slides`
 docs/sinter-requirements.md  Sinter gaps pico_gs2 needs closed, with stopgaps
 build/                  (git-ignored) generated Verilog, simulator crates, bitstreams
 ```

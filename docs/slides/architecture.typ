@@ -3,32 +3,29 @@
 // .devcontainer/Dockerfile (which prefetches them); keep the two in step.
 
 #import "@preview/touying:0.8.0": *
-#import themes.metropolis: *
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
+#import "theme/pico.typ": *
 
-#show: metropolis-theme.with(
-  aspect-ratio: "16-9",
-  footer: self => self.info.title,
+#show: pico-theme.with(
   config-info(
     title: [pico-gs2: architecture and status],
+    short-title: [pico-gs2],
     subtitle: [A PS1/N64-era GPU for the ICEpi Zero, written in Sinter],
     date: [November 2026],
   ),
 )
 
-#set text(size: 18pt)
-
 // Status colours: built and running on the board; a Rust model; planned.
-#let built-colour = rgb("#2e7d32")
-#let model-colour = rgb("#1565c0")
-#let planned-colour = luma(130)
+#let built-colour = rgb("#059669")
+#let model-colour = rgb("#2563eb")
+#let planned-colour = rgb("#94a3b8")
 
 // A block that is built in the design.
 #let built(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + built-colour,
-  fill: built-colour.lighten(88%),
-  corner-radius: 3pt,
+  stroke: 1pt + built-colour,
+  fill: rgb("#ecfdf5"),
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -36,9 +33,9 @@
 // A block that exists as a Rust model, not yet in the design.
 #let modelled(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + model-colour,
-  fill: model-colour.lighten(88%),
-  corner-radius: 3pt,
+  stroke: 1pt + model-colour,
+  fill: rgb("#eff6ff"),
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -46,9 +43,9 @@
 // A block that is planned.
 #let planned(pos, body, ..args) = node(
   pos, body,
-  stroke: (paint: planned-colour, thickness: 1.2pt, dash: "dashed"),
-  fill: luma(246),
-  corner-radius: 3pt,
+  stroke: (paint: planned-colour, thickness: 1pt, dash: "dashed"),
+  fill: white,
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -56,21 +53,22 @@
 // An external chip or connector.
 #let chip(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + black,
-  fill: luma(225),
+  stroke: 1pt + rgb("#475569"),
+  fill: rgb("#f1f5f9"),
+  corner-radius: 2pt,
   shape: rect,
   ..args,
 )
 
 // The colour key, for diagrams.
-#let key = text(size: 13pt)[
-  #box(fill: built-colour.lighten(88%), stroke: 1pt + built-colour, inset: 3pt)[built]
+#let key = text(size: 12pt)[
+  #box(fill: rgb("#ecfdf5"), stroke: 1pt + built-colour, radius: 4pt, inset: 4pt)[built]
   #h(0.5em)
-  #box(fill: model-colour.lighten(88%), stroke: 1pt + model-colour, inset: 3pt)[Rust model]
+  #box(fill: rgb("#eff6ff"), stroke: 1pt + model-colour, radius: 4pt, inset: 4pt)[Rust model]
   #h(0.5em)
-  #box(fill: luma(246), stroke: (paint: planned-colour, dash: "dashed"), inset: 3pt)[planned]
+  #box(stroke: (paint: planned-colour, dash: "dashed"), radius: 4pt, inset: 4pt)[planned]
   #h(0.5em)
-  #box(fill: luma(225), stroke: 1pt, inset: 3pt)[off-chip]
+  #box(fill: rgb("#f1f5f9"), stroke: 1pt + rgb("#475569"), radius: 2pt, inset: 4pt)[off-chip]
 ]
 
 #let done = text(fill: built-colour, weight: "bold")[done]
@@ -122,7 +120,6 @@
     #set text(size: 15pt)
     #table(
       columns: (auto, auto, 1fr),
-      stroke: 0.5pt + luma(180),
       [*Clock*], [*MHz*], [*Drives*],
       [`clk_core`], [75], [the whole Sinter core; also the 720p pixel clock],
       [`clk_sdram`], [75], [the SDRAM: `clk_core` lagging 270°],
@@ -198,7 +195,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 - The simulator *is* the model: tests drive it cycle by cycle against Rust
   models of the SDRAM chip, and the setup engine against its microcode
   interpreter.
-- `just check` replays every stimulus file, including the 3.7M cycles the
+- `just check` replays every stimulus file, including the 6.2M cycles the
   frame test records, through Verilator, and fails on any difference.
 - Generated Verilog, crates and bitstreams live in `build/`; never committed.
 
@@ -264,30 +261,29 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
       let top = i < 32
       box(
         width: 9mm, height: 7mm,
-        fill: if top { luma(232) } else { luma(205) },
-        stroke: 0.4pt + luma(120),
-        align(center + horizon, text(size: 9pt)[#i]),
+        fill: if top { rgb("#eef2ff") } else { rgb("#c7d2fe") },
+        stroke: 0.5pt + white,
+        align(center + horizon, text(size: 9pt, fill: rgb("#3730a3"))[#i]),
       )
     }
     stack(
       spacing: 4pt,
       grid(columns: 8, gutter: 0pt, ..range(64).map(cell)),
-      text(size: 12pt)[one 8×8 block, 64 words in raster order:\ light = run 1 (words 0–31), dark = run 2],
+      text(size: 12pt, fill: rgb("#64748b"))[one 8×8 block, 64 words in raster order:\ light = run 1 (words 0–31), dark = run 2],
     )
   },
   [
-    - 80 × 45 blocks; block $(b_x, b_y)$ is the 64 words from
-      $(80 b_y + b_x) dot 64$.
+    - 80 × 45 blocks; block (b#sub[x], b#sub[y]) is the 64 words from
+      (80 b#sub[y] + b#sub[x]) × 64.
     - A block never crosses a 512-word SDRAM row.
     - Each half (8×4) is *one 32-word run*: rendering moves a block in 2
       runs, not 8.
-    - Pixel $(x, y)$ is word `x[9:3] @ y[2:0] @ x[2:0]` of its block row, plus
-      $5120 dot y\[8:3\]$.
+    - Pixel (x, y) is word `x[9:3] @ y[2:0] @ x[2:0]` of its block row, plus
+      5120 × `y[8:3]`.
 
     #set text(size: 14pt)
     #table(
       columns: (auto, 1fr, auto),
-      stroke: 0.5pt + luma(180),
       [*Bank*], [*Contents*], [*Status*],
       [0, 1, 2], [colour buffers (triple buffering)], done,
       [3], [Z buffer, 16-bit], done,
@@ -460,7 +456,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Schedule*], [*Now*], [*Brief*],
       [full program], [99 cycles], [85],
       [untextured], [80 cycles], [—],
@@ -476,7 +471,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto),
-      stroke: 0.5pt + luma(180),
       [*Accuracy* (inside the triangle)], [*Worst error*],
       [ordinary triangles, colour], [0.011 LSB],
       [ordinary, 16-bit attributes], [0.018 LSB],
@@ -529,7 +523,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
       [logic cells], [9512], [3841], [24288],
       [flip-flops], [3391], [974], [24288],
@@ -546,7 +539,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Clock*], [*Reaches*], [*Needs*],
       [`clk_core`], [77.1 MHz], [75],
       [`clk_sclk`], [320 MHz], [187.5],
@@ -562,7 +554,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 
 #text(size: 14pt, table(
   columns: (auto, 1fr, auto),
-  stroke: 0.5pt + luma(180),
   [*Phase*], [*Work*], [*Status*],
   [2–3], [toolchain, CI; 640×480 colour bars], done,
   [4–5], [SDRAM controller and framebuffer; 720p], done,

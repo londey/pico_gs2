@@ -8,7 +8,7 @@
 #   * Rust (stable) for the testbenches and chip models in sim/ and models/.
 #   * just, the task runner (see justfile + scripts/).
 #   * Typst, with the Touying and Fletcher packages, for the architecture
-#     slides in docs/slides/.
+#     slides in docs/slides/, and the slides' fonts (Inter, JetBrains Mono).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         curl \
+        fonts-inter \
+        fonts-jetbrains-mono \
         git \
         libtcl8.6 \
         locales \
