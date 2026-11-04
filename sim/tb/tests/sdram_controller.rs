@@ -150,17 +150,18 @@ fn runs_read_back_and_meet_the_datasheet() {
         && sim.time() < MAX_CYCLES
     {
         let req = pending.front().copied();
-        let inputs = Inputs {
+        let mut inputs = Inputs {
             req_is_some: u8::from(req.is_some()),
             req_payload_write: u8::from(req.is_some_and(|r| r.write)),
             req_payload_addr: req.map_or(0, |r| r.addr),
             req_payload_len: req.map_or(0, |r| r.len as u8),
             wdata: to_write.front().map_or(0, |w| w.data),
             wmask: u8::from(to_write.front().is_some_and(|w| w.masked)),
-            dq_in: bus.dq_in(),
+            dq_in: 0,
         };
+        // The pins are registered: the SDRAM answers in the same cycle.
+        inputs.dq_in = bus.clock(&pins(&sim.eval(&inputs)));
         let out = sim.step(&inputs);
-        bus.clock(&pins(&out));
 
         if out.out_accepted == 1 {
             let run = pending.pop_front().expect("accepted without a request");

@@ -12,19 +12,15 @@ pub const FLOATING: u16 = 0xDEAD;
 
 /// The SDRAM and its data bus.
 ///
-/// The board's SDRAM clock lags the core clock by 270 degrees
-/// (`board/top.sv`), so a word the chip drives after its edge in one core
-/// cycle reaches the FPGA's DQ input in time for the core clock edge that
-/// ends the next. The bus models that as one cycle of delay: [`dq_in`] in a
-/// cycle is what the chip drove in the previous one.
-///
-/// [`dq_in`]: SdramBus::dq_in
+/// What the chip drives after its clock edge in a core cycle is on the
+/// FPGA's DQ input in time for the core clock edge that ends that same
+/// cycle. The board showed this: with a cycle of delay modelled here (and
+/// the controller capturing a cycle later to match), every word read back
+/// on the board was the one after it, which until Phase 8's tiled
+/// framebuffer looked like a display losing its left column.
 pub struct SdramBus {
     /// The chip.
     pub sdram: Sdram,
-
-    /// DQ at the FPGA this cycle.
-    dq_in: u16,
 }
 
 impl SdramBus {
@@ -37,29 +33,27 @@ impl SdramBus {
     pub fn new() -> Self {
         Self {
             sdram: Sdram::new(Timing::any_grade(TCK_PS)),
-            dq_in: FLOATING,
         }
     }
 
-    /// DQ as the FPGA samples it this cycle.
-    ///
-    /// # Returns
-    ///
-    /// The word on the FPGA's DQ input.
-    pub fn dq_in(&self) -> u16 {
-        self.dq_in
-    }
-
     /// The chip's clock edge in this cycle: it samples the controller's
-    /// pins, and what it drives reaches the FPGA next cycle.
+    /// pins, and what it drives is on the FPGA's DQ input this cycle.
+    ///
+    /// The controller's pins are all registered, so a testbench gets them
+    /// for this cycle with the simulator's `eval` before it `step`s with
+    /// the DQ this returns.
     ///
     /// # Arguments
     ///
     /// * `pins` - The controller's pins this cycle.
-    pub fn clock(&mut self, pins: &Pins) {
+    ///
+    /// # Returns
+    ///
+    /// The word on the FPGA's DQ input this cycle.
+    pub fn clock(&mut self, pins: &Pins) -> u16 {
         let chip = self.sdram.clock(pins);
         let other = pins.dq.unwrap_or(FLOATING);
-        self.dq_in = (chip.value & chip.driven) | (other & !chip.driven);
+        (chip.value & chip.driven) | (other & !chip.driven)
     }
 }
 

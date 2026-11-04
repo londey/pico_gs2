@@ -179,12 +179,13 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
     )?;
     writeln!(stimulus, "sdram_dq")?;
     for cycle in 0..MAX_FRAMES * FRAME + SYMBOL_LATENCY {
+        // The pins are registered: the SDRAM answers in the same cycle.
+        let pins_now = pins(&sim.eval(&Inputs { sdram_dq: 0 }));
         let inputs = Inputs {
-            sdram_dq: bus.dq_in(),
+            sdram_dq: bus.clock(&pins_now),
         };
         writeln!(stimulus, "{}", inputs.sdram_dq)?;
         let out = sim.step(&inputs);
-        bus.clock(&pins(&out));
         led = out.out_led;
         if cycle < SYMBOL_LATENCY {
             continue;

@@ -49,12 +49,13 @@ const INIT_REFRESHES: u4 = 8;
 const MODE: u13 = 0x020;
 
 // Cycles from a READ on the pins to the cycle `dq_q` holds its data: CAS
-// latency 2, plus the board round trip (the SDRAM clock lags the core clock
-// by 270 degrees, so the data reaches the FPGA before the edge one cycle
-// after the CAS latency: Phase 4 found this right at 100 MHz, and at 75 MHz
-// the longer cycle leaves more margin both ways), plus `dq_q` itself. This is the bit of
-// `rd_pipe` that marks the word arriving.
-const READ_CAPTURE: u3 = 4;
+// latency 2, plus `dq_q` itself; the data reaches the FPGA in time for the
+// core clock edge that ends the CAS latency's last cycle. This is the bit of
+// `rd_pipe` that marks the word arriving. (Phases 4 to 8 captured a cycle
+// later, assuming a cycle of board delay, and on the board every word read
+// was the one after it; the read words come back to back, so capturing a
+// cycle earlier keeps the same timing margin.)
+const READ_CAPTURE: u3 = 3;
 
 // Commands: CS#, RAS#, CAS#, WE# (datasheet section 8).
 const CMD_NOP: u4 = 0b0111;
