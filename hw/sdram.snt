@@ -71,13 +71,10 @@ pub struct SdramPins {
     pub ras_n: u1,
     pub cas_n: u1,
     pub we_n: u1,
-    #[no_reset]
     pub ba: u2,
-    #[no_reset]
     pub a: u13,
     // Data mask, active high: bit 0 masks DQ[7:0], bit 1 DQ[15:8].
     pub dqm: u2,
-    #[no_reset]
     pub dq_out: u16,
     // High while the controller drives DQ.
     pub dq_oe: u1,
@@ -131,10 +128,13 @@ pub struct SdramController {
     delay: u15 = INIT_WAIT,
     // The registered pins (CKE is always high).
     cmd: u4 = CMD_NOP,
+    #[no_reset]
     ba: u2 = 0,
+    #[no_reset]
     a: u13 = 0,
     // DQM is held high until the mode register is set (section 7.1).
     dqm: u2 = 0b11,
+    #[no_reset]
     dq_out: u16 = 0,
     // A request was taken last cycle.
     accepted: u1 = 0,
