@@ -7,4 +7,5 @@ scripts/build.sh
 scripts/check.sh
 scripts/lint.sh
 scripts/bitstream.sh
+scripts/setup_report.sh
 scripts/slides.sh
