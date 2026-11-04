@@ -18,8 +18,8 @@
 
 #set text(size: 18pt)
 
-// Status colours: built and running on the board (or in the Rust models),
-// and planned.
+// Status colours: built and running on the board; built and verified but
+// not yet in the GPU; a Rust model; planned.
 #let built-colour = rgb("#2e7d32")
 #let model-colour = rgb("#1565c0")
 #let planned-colour = luma(130)
@@ -29,6 +29,16 @@
   pos, body,
   stroke: 1.2pt + built-colour,
   fill: built-colour.lighten(88%),
+  corner-radius: 3pt,
+  shape: rect,
+  ..args,
+)
+
+// A block that is built in Sinter and verified, but not yet in the GPU.
+#let standalone(pos, body, ..args) = node(
+  pos, body,
+  stroke: (paint: built-colour, thickness: 1.2pt, dash: "dotted"),
+  fill: built-colour.lighten(94%),
   corner-radius: 3pt,
   shape: rect,
   ..args,
@@ -67,6 +77,8 @@
 #let key = text(size: 13pt)[
   #box(fill: built-colour.lighten(88%), stroke: 1pt + built-colour, inset: 3pt)[built]
   #h(0.5em)
+  #box(fill: built-colour.lighten(94%), stroke: (paint: built-colour, dash: "dotted"), inset: 3pt)[built, not yet in the GPU]
+  #h(0.5em)
   #box(fill: model-colour.lighten(88%), stroke: 1pt + model-colour, inset: 3pt)[Rust model]
   #h(0.5em)
   #box(fill: luma(246), stroke: (paint: planned-colour, dash: "dashed"), inset: 3pt)[planned]
@@ -93,8 +105,9 @@
   a cycle-accurate Rust simulator, the design's digital twin. There is no
   separate hand-written model.
 - *Today:* 1280×720 DVI from a tiled 640×360 framebuffer in SDRAM, verified
-  on the board. Triangle setup is fully modelled in Rust; rendering into the
-  framebuffer comes next.
+  on the board. The triangle setup engine is built in Sinter and verified
+  cycle for cycle against its Rust model; it joins the GPU, with traversal,
+  for the first triangles on screen next.
 
 #v(0.5em)
 #key
@@ -141,7 +154,7 @@
   planned((0, 0), [SPI host\ link], name: <spi>),
   planned((1, 0), [command\ parser], name: <cmd>),
   planned((2, 0), [vertex\ ring], name: <ring>),
-  modelled((3, 0), [triangle\ setup], name: <setup>),
+  standalone((3, 0), [triangle\ setup], name: <setup>),
   planned((4, 0), [traversal +\ iterators], name: <trav>),
   planned((5, 0), [tile buffer\ colour + Z], name: <tile>),
   planned((0, 1), [test scene\ ROM], name: <rom>),
@@ -195,7 +208,8 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 )))
 
 - The simulator *is* the model: tests drive it cycle by cycle against Rust
-  models of the SDRAM chip and, soon, the setup engine.
+  models of the SDRAM chip, and the setup engine against its microcode
+  interpreter.
 - `just check` replays every stimulus file, including the 3.7M cycles the
   frame test records, through Verilator, and fails on any difference.
 - Generated Verilog, crates and bitstreams live in `build/`; never committed.
@@ -326,7 +340,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   node-inset: 6pt,
   planned((0, 0), [packets\ (ROM, then SPI)], name: <pk>),
   planned((1, 0), [vertex ring\ 4 slots], name: <vr>),
-  modelled((2, 0), [setup\ \~94 cycles / triangle], name: <su>),
+  standalone((2, 0), [setup\ 99 cycles / triangle], name: <su>),
   planned((3, 0), [traversal\ 8×8 blocks, 1 px/clk], name: <tr>),
   planned((4, 0), [tile buffer\ colour + Z], name: <tb>),
   chip((4, 1), [SDRAM], name: <sd>),
@@ -377,14 +391,14 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 #align(center, text(size: 12pt, diagram(
   spacing: (9mm, 8mm),
   node-inset: 5pt,
-  modelled((0, 0), [micro-ROMs\ MUL 38 b · ALU 33 b], name: <rom>),
-  modelled((0, 1), [sequencer\ NEXT · CHECK · END], name: <seq>),
-  modelled((1, 0), [ALU slot\ ADD SUB MIN MAX SNAP\ LZC RCPLD TST ADDV], name: <alu>),
-  modelled((1, 1), [MUL slot\ 36 × 18 → acc 56 →\ shift (≪8, ≫ c + E)\ round · saturate], name: <mul>),
-  modelled((2, 0), [ALU bank\ 32 × 36], name: <ab>),
-  modelled((2, 1), [MUL bank\ 32 × 36], name: <mb>),
-  modelled((3, 0.5), [output buffer\ 37 slots], name: <out>),
-  modelled((1, -1), [vertex ring\ (by role) · consts\ · seed ROM], name: <vtx>),
+  standalone((0, 0), [micro-ROMs\ MUL 38 b · ALU 33 b], name: <rom>),
+  standalone((0, 1), [sequencer\ NEXT · CHECK · END], name: <seq>),
+  standalone((1, 0), [ALU slot\ ADD SUB MIN MAX SNAP\ LZC RCPLD TST ADDV], name: <alu>),
+  standalone((1, 1), [MUL slot\ 36 × 18 → acc 56 →\ shift (≪8, ≫ c + E)\ round · saturate], name: <mul>),
+  standalone((2, 0), [ALU bank\ 32 × 36], name: <ab>),
+  standalone((2, 1), [MUL bank\ 32 × 36], name: <mb>),
+  standalone((3, 0.5), [output buffer\ 37 slots], name: <out>),
+  standalone((1, -1), [vertex ring\ (by role) · consts\ · seed ROM], name: <vtx>),
   edge(<rom>, <alu>, "-|>"),
   edge(<rom>, <mul>, "-|>"),
   edge(<seq>, <rom>, "-|>"),
@@ -398,11 +412,13 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 )))
 
 - One MUL and one ALU issue per cycle, statically scheduled by a Rust
-  generator. Each bank has one writer. Latencies: ALU 2, seed 3, MUL 6.
-- Not Sinter's `multiplex fn`: that can't pipeline the multiplier or exit
-  early for culled triangles.
+  generator. Each bank has one writer. Latencies: ALU 3, seed and LZC 4,
+  MUL 6, all set by timing closure at 75 MHz.
+- `hw/setup.snt`; its ROMs come from the generator at build time. Not
+  Sinter's `multiplex fn`: that can't pipeline the multiplier or exit early
+  for culled triangles.
 
-== Setup: results from the Rust models
+== Setup: results
 
 #grid(
   columns: (1fr, 1fr),
@@ -413,13 +429,15 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
       columns: (1fr, auto, auto),
       stroke: 0.5pt + luma(180),
       [*Schedule*], [*Now*], [*Brief*],
-      [full program], [94 cycles], [85],
-      [untextured], [74 cycles], [—],
-      [rejected triangle], [14 cycles], [10],
+      [full program], [99 cycles], [85],
+      [untextured], [80 cycles], [—],
+      [rejected triangle], [16 cycles], [10],
       [multiplies / triangle], [62], [66],
+      [engine Fmax, alone], [82.5 MHz], [75],
+      [engine logic cells], [3,841], [1,500],
     )
-    The multiplier is idle for the first \~34 cycles: four 6-cycle multiplies
-    lie on the path to the gradient factors.
+    Timing closure cost 5 cycles. A 5-cycle multiplier saves 4 more but
+    reaches only 53 MHz.
   ],
   [
     #set text(size: 15pt)
@@ -432,8 +450,9 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
       [slivers, 16-bit attributes], [0.5 LSB],
       [reciprocal], [22 bits],
     )
-    The microcode interpreter matches the bit-exact model on 18,000 random
-    triangles; random meshes are covered watertight.
+    The interpreter matches the bit-exact model on 18,000 random triangles,
+    and the Sinter engine matches the interpreter, cycle for cycle, on
+    1,500; random meshes are covered watertight.
   ],
 )
 
@@ -447,12 +466,12 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   modelled((0, 0), [f64 reference], name: <f64>),
   modelled((1, 0), [bit-exact model\ (qfixed types)], name: <q>),
   modelled((2, 0), [microcode\ interpreter], name: <i>),
-  planned((2, 1), [Sinter simulator\ of the engine], name: <s>),
+  standalone((2, 1), [Sinter simulator\ of the engine], name: <s>),
   built((1, 1), [Verilator on\ the Verilog], name: <v>),
   built((0, 1), [the board], name: <b>),
   edge(<f64>, <q>, "<|-|>", [error bounds]),
   edge(<q>, <i>, "<|-|>", [bit for bit]),
-  edge(<i>, <s>, "<|--|>", [cycle for cycle], label-side: left),
+  edge(<i>, <s>, "<|-|>", [cycle for cycle], label-side: left),
   edge(<s>, <v>, "<|-|>", [`--cosim`]),
   edge(<v>, <b>, "<|-|>", [bitstream]),
 )))
@@ -461,7 +480,9 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   frames pixel-exactly; the SDRAM chip model's datasheet checks; the gearbox
   testbench; all through `--cosim`.
 - *Setup today:* reciprocal over every mantissa, accuracy by triangle shape,
-  edge cases, watertightness, and interpreter against the bit-exact model.
+  edge cases, watertightness, interpreter against the bit-exact model, and
+  the Sinter engine against the interpreter, its Verilog through `--cosim`.
+  The setup engine isn't on the board yet.
 - Tests are checked by mutation: break the design on purpose, see them fail.
 
 == Resources and timing today
@@ -472,16 +493,18 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   [
     #set text(size: 15pt)
     #table(
-      columns: (1fr, auto, auto),
+      columns: (1fr, auto, auto, auto),
       stroke: 0.5pt + luma(180),
-      [*Resource*], [*Used*], [*Of*],
-      [LUT4 / logic cells], [1288], [24288],
-      [flip-flops], [609], [24288],
-      [block RAM (DP16KD)], [6], [56],
-      [multipliers (MULT18X18D)], [0], [28],
-      [PLL], [1], [2],
-      [I/O], [49], [197],
+      [*Resource*], [*GPU*], [*Setup*], [*Of*],
+      [logic cells], [1288], [3841], [24288],
+      [flip-flops], [609], [974], [24288],
+      [block RAM (DP16KD)], [6], [5], [56],
+      [multipliers], [0], [2], [28],
+      [PLL], [1], [—], [2],
+      [I/O], [49], [—], [197],
     )
+    _GPU_: today's bitstream. _Setup_: the engine placed and routed alone; it
+    isn't in the GPU yet.
   ],
   [
     #set text(size: 15pt)
@@ -491,6 +514,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
       [*Clock*], [*Reaches*], [*Needs*],
       [`clk_core`], [103 MHz], [75],
       [`clk_sclk`], [315 MHz], [187.5],
+      [setup engine], [82.5 MHz], [75],
     )
     The brief's whole-design budget (estimate): about 11,000 LUTs (45%), 19
     multipliers, 27 block RAMs. Datapath registers are `#[no_reset]`: only
@@ -510,8 +534,8 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   [7], [Sinter rc.2, co-simulation in CI, `#[no_reset]`], done,
   [8], [tiled framebuffer, half-block ring, write masks; read-capture fix], done,
   [9], [setup engine: Rust models, microcode, scheduler, interpreter], done,
-  [10], [setup engine in Sinter, cycle-exact against the interpreter], next,
-  [11], [command parser, traversal, tile buffer: first triangles on screen], later,
+  [10], [setup engine in Sinter, cycle-exact against the interpreter], done,
+  [11], [command parser, traversal, tile buffer: first triangles on screen], next,
   [12], [Z buffer, triple buffering, spinning cube, frame rate], later,
   [—], [SPI host link and RP2350 firmware], later,
   [—], [textures and perspective correction], later,
@@ -519,14 +543,15 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 
 == Open issues
 
-- *Setup speed:* 94 cycles against the brief's 85. Options once real timing
-  is known: a shorter multiplier pipeline, or overlapping triangles.
+- *Setup speed:* 99 cycles against the brief's 85. A 5-cycle multiplier
+  misses 75 MHz; next options are overlapping triangles or a second
+  multiplier, if traversal shows setup is the bottleneck.
+- *Setup size:* 3,841 logic cells against the brief's 1,500, mostly the
+  four-read-port register banks (four copies each in LUT RAM).
 - *Accuracy on slivers:* 16-bit attributes reach 0.5 LSB; the reciprocal's 22
   bits limit it.
 - *No formal overflow proof* for the setup program yet; ports and the
   accumulator are checked at run time over the test corpus.
-- *Build order:* the microcode generator can't run before `sinter build` yet;
-  Phase 10 must break the loop.
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
   `#[no_reset]` accepted on non-registers; power-of-two memory depths.
 - *Off spec but working:* 750 Mb/s DVI pins; a 75 MHz (not 74.25 MHz) pixel
