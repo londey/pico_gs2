@@ -6,10 +6,14 @@
 //! (each framebuffer pixel as 2x2 screen pixels) and the sync timing at every
 //! pixel, checks the SDRAM's contents and that the controller broke none of
 //! the datasheet's rules, and writes the picture to `build/framebuffer.png`.
+//!
+//! The core's input on every cycle is recorded as a `sinter sim` stimulus
+//! file, `build/stimulus/gpu.frame.csv`, which `just check` replays with
+//! `--cosim` to check the generated Verilog over the same run.
 
 use std::error::Error;
-use std::fs::File;
-use std::io::BufWriter;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use gpu_sim::{Gpu, Inputs, Outputs};
@@ -122,18 +126,54 @@ struct Run {
     led: u8,
 }
 
-/// Steps the core and the SDRAM from reset until a frame has been scanned
-/// out of the framebuffer.
-fn run() -> Run {
+/// A path under the repository's `build/` directory.
+///
+/// # Arguments
+///
+/// * `parts` - The path's components below `build/`.
+///
+/// # Returns
+///
+/// The path.
+fn build_path(parts: &[&str]) -> PathBuf {
+    [env!("CARGO_MANIFEST_DIR"), "..", "..", "build"]
+        .iter()
+        .chain(parts)
+        .collect()
+}
+
+/// Steps the core and the SDRAM from reset until the frames have been
+/// scanned out of the framebuffer, recording the core's inputs.
+///
+/// # Arguments
+///
+/// * `stimulus` - Where to write the stimulus file: a header, then the
+///   core's input on each cycle.
+///
+/// # Returns
+///
+/// The run's results.
+///
+/// # Errors
+///
+/// Returns any error from writing the stimulus.
+fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
     let mut sim = Gpu::new();
     let mut bus = SdramBus::new();
     let mut frames = Vec::new();
     let mut frame = Vec::with_capacity(FRAME);
     let mut led = 0;
+    writeln!(
+        stimulus,
+        "# Recorded by sim/tb/tests/frame.rs; replayed by `just check`."
+    )?;
+    writeln!(stimulus, "sdram_dq")?;
     for cycle in 0..MAX_FRAMES * FRAME + SYMBOL_LATENCY {
-        let out = sim.step(&Inputs {
+        let inputs = Inputs {
             sdram_dq: bus.dq_in(),
-        });
+        };
+        writeln!(stimulus, "{}", inputs.sdram_dq)?;
+        let out = sim.step(&inputs);
         bus.clock(&pins(&out));
         led = out.out_led;
         if cycle < SYMBOL_LATENCY {
@@ -152,14 +192,19 @@ fn run() -> Run {
             frame.clear();
         }
     }
-    Run { bus, frames, led }
+    stimulus.flush()?;
+    Ok(Run { bus, frames, led })
 }
 
 /// The first frame scanned out of SDRAM shows the test pattern, the sync
 /// timing is right at every pixel, and the SDRAM was driven by the book.
 #[test]
 fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
-    let Run { bus, frames, led } = run();
+    let path = build_path(&["stimulus", "gpu.frame.csv"]);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let Run { bus, frames, led } = run(&mut BufWriter::new(File::create(path)?))?;
     assert_eq!(
         frames.len(),
         CHECKED_FRAMES,
@@ -254,15 +299,7 @@ fn check_frame(n: usize, frame: &[[u16; 3]]) -> Vec<u8> {
 ///
 /// Returns any error from creating or encoding the file.
 fn write_png(rgb: &[u8]) -> Result<(), Box<dyn Error>> {
-    let path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "..",
-        "..",
-        "build",
-        "framebuffer.png",
-    ]
-    .iter()
-    .collect();
+    let path = build_path(&["framebuffer.png"]);
     let mut encoder = png::Encoder::new(
         BufWriter::new(File::create(path)?),
         H_ACTIVE as u32,

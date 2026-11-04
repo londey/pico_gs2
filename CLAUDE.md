@@ -49,7 +49,7 @@ bitstreams all live in `build/`.
 |---|---|
 | `just gen` | `sinter build hw/gpu.snt --out build/sinter` (Verilog + simulator crates) |
 | `just build` | `gen`, then `cargo build` in `sim/` |
-| `just check` | `build`, then `sinter check`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` |
+| `just check` | `build`, then `sinter check`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, then the stimulus the Rust tests recorded in `build/stimulus/`; every stimulus file runs with `--cosim` (simulator vs Verilator) |
 | `just lint` | Verilator `--lint-only -Wall` over `board/*.sv` and the generated `.sv` |
 | `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
 | `just flash` | `openFPGALoader -b icepi-zero build/fpga/top.bit` (the user runs this) |
@@ -63,7 +63,7 @@ bitstreams all live in `build/`.
 
 Sinter is new; don't guess at it. The book (user guide + language
 reference) is at
-`https://github.com/sinter-lang/sinter-lang/tree/v1.0.0-rc.1/docs/book/src`
+`https://github.com/sinter-lang/sinter-lang/tree/v1.0.0-rc.2/docs/book/src`
 (start with `tutorial/`, `reference/state.md`, `reference/hierarchy.md`,
 `reference/expressions.md`, `reference/clock-domains.md`). The generated
 interfaces are in `docs/generated-verilog.md` and `docs/generated-rust.md`,
@@ -74,7 +74,9 @@ The rules that most often trip people up:
 1. **A design is a state struct plus a `#[clock]` method.** One call is one
    clock cycle: it takes `self` (the current registers) and inputs, and
    returns the next state, optionally with outputs: `-> (Self, Out)`.
-   Registers need reset values (`count: u8 = 0`).
+   Registers need reset values (`count: u8 = 0`). `#[no_reset]` on a field
+   makes its registers power-on only: datapath state is `#[no_reset]`, only
+   control state is reset (ADR 0006).
 2. **No implicit conversions, not even widening.** `u8 + u8` is a `u9`;
    storing it in a `u8` needs `as u8 wrap` (or `sat`). Comparison operands
    must have the same type. A bare literal takes its type from context.
@@ -104,9 +106,11 @@ The rules that most often trip people up:
 10. **Unknown attributes and unfinished features are compile errors**, not
     silently ignored. Read the error; it usually says what to write instead.
 
-Known gaps in v1.0.0-rc.1: `sinter build --pins` emits iCE40 PCF, not ECP5
-LPF (so `board/` is hand-written); there is no co-simulation of the
-generated Verilog against the simulator; `--faults` doesn't work with
+v1.0.0-rc.2 added `#[no_reset]`, `#[storage(regs|lutram|bram)]` on memories,
+`-D NAME=VALUE` constant overrides, `#[params(..)]` on `#[verilog]` bindings,
+ECP5 LPF output (unused: `board/top.sv` is the top level) and
+`sinter sim --cosim`, which `just check` runs on every stimulus file (ADR
+0005). Known gaps: `--faults` doesn't work with
 `#[module]`; a `#[module]` in a child source module (`video::TmdsEncoder`)
 gets a simulator crate and type named `video__…`, which rustc warns about
 (harmless, in the generated crate); `async_fifo`'s write side recomputes its

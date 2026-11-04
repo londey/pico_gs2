@@ -277,6 +277,9 @@ Listed so the setup doesn't paint itself into a corner:
 
 ## Known gaps in Sinter v1.0.0-rc.1
 
+v1.0.0-rc.2 (now pinned) closed the LPF and co-simulation gaps below; CLAUDE.md
+has the current list.
+
 Report these to the user rather than working around them silently:
 
 - `sinter build --pins` emits iCE40 PCF constraints, not ECP5 LPF, so use the

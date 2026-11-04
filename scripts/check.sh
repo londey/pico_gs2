@@ -8,11 +8,22 @@ cd "$(dirname "$0")/.."
 echo "==> sinter check hw/gpu.snt"
 sinter check hw/gpu.snt
 
-# Directed tests: hw/tests/<root>.<case>.csv drives hw/<root>.snt.
+# Runs a stimulus file, <root>.<case>.csv, against hw/<root>.snt in the
+# simulator and, with --cosim, in the generated Verilog under Verilator,
+# failing on any expectation or any difference between the two.
+cosim() {
+    local csv=$1
+    local name root
+    name=$(basename "$csv" .csv)
+    root="hw/${name%%.*}.snt"
+    echo "==> sinter sim $root --stimulus $csv --cosim"
+    RUST_LOG=warn sinter sim "$root" --stimulus "$csv" \
+        --cosim --cosim-dir "build/cosim/$name" > /dev/null
+}
+
+# Directed tests: hw/tests/<root>.<case>.csv.
 for csv in hw/tests/*.csv; do
-    root="hw/$(basename "$csv" | cut -d. -f1).snt"
-    echo "==> sinter sim $root --stimulus $csv"
-    RUST_LOG=warn sinter sim "$root" --stimulus "$csv" > /dev/null
+    cosim "$csv"
 done
 
 # Board-level testbenches: the hand-written logic in board/ that the Rust
@@ -45,6 +56,13 @@ echo "==> cargo fmt --check"
 echo "==> cargo clippy"
 cargo clippy "${manifest[@]}" --all-targets -- -D warnings
 echo "==> cargo test"
+rm -rf build/stimulus
 cargo test "${manifest[@]}"
+
+# Stimulus the Rust testbenches recorded (build/stimulus/<root>.<case>.csv),
+# replayed against the Verilog: the same long runs the twin was checked on.
+for csv in build/stimulus/*.csv; do
+    cosim "$csv"
+done
 
 echo "==> check passed"

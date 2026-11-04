@@ -71,10 +71,13 @@ pub struct SdramPins {
     pub ras_n: u1,
     pub cas_n: u1,
     pub we_n: u1,
+    #[no_reset]
     pub ba: u2,
+    #[no_reset]
     pub a: u13,
     // Data mask, active high: bit 0 masks DQ[7:0], bit 1 DQ[15:8].
     pub dqm: u2,
+    #[no_reset]
     pub dq_out: u16,
     // High while the controller drives DQ.
     pub dq_oe: u1,
@@ -117,6 +120,10 @@ enum State {
     Close,
 }
 
+// Registers that only matter while the state, the command and the valid
+// bits say so (address, write data, run position, captured read data) are
+// #[no_reset] (ADR 0006); CS#, the command, DQM and the DQ enable reset to
+// NOP, masked and released.
 #[module]
 pub struct SdramController {
     state: State = State::Init,
@@ -139,7 +146,9 @@ pub struct SdramController {
     ready: u1 = 0,
     // The run in progress: direction, bank, next column, words to go.
     write: u1 = 0,
+    #[no_reset]
     bank: u2 = 0,
+    #[no_reset]
     column: u9 = 0,
     remaining: u6 = 0,
     // Cycles since the ACTIVE was on the pins, saturating (for tRAS).
@@ -147,6 +156,7 @@ pub struct SdramController {
     // Bit i: a READ was on the pins i cycles ago.
     rd_pipe: u5 = 0,
     // DQ, registered as it arrives.
+    #[no_reset]
     dq_q: u16 = 0,
 }
 

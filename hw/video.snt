@@ -102,6 +102,7 @@ impl VideoTiming {
 
 // One TMDS channel's 10-bit symbol.
 pub struct TmdsOut {
+    #[no_reset]
     pub symbol: u10,
 }
 
@@ -116,25 +117,40 @@ pub struct TmdsOut {
 // minimised, then its ones counted, then DC balanced against the running
 // disparity. `symbol` comes from a register: four cycles after a pixel is
 // taken it changes to that pixel's symbol, and holds until the next.
+//
+// The pipeline's data registers are #[no_reset] (ADR 0006): the valid bits
+// and the disparity are the control state.
 #[module]
 pub struct TmdsEncoder {
     // Stage 1: the pixel, registered when `en` is high.
+    #[no_reset]
     data1: u8 = 0,
+    #[no_reset]
     ctrl1: u2 = 0,
+    #[no_reset]
     de1: u1 = 0,
     valid1: u1 = 0,
     // Stage 2: the transition-minimised byte, q_m[7:0], and q_m[8], which
     // says whether the chain used XOR (1) or XNOR (0).
+    #[no_reset]
     q_m2: u8 = 0,
+    #[no_reset]
     q_m8_2: u1 = 0,
+    #[no_reset]
     ctrl2: u2 = 0,
+    #[no_reset]
     de2: u1 = 0,
     valid2: u1 = 0,
     // Stage 3: q_m with the number of ones in q_m[7:0].
+    #[no_reset]
     q_m3: u8 = 0,
+    #[no_reset]
     q_m8_3: u1 = 0,
+    #[no_reset]
     ones3: u4 = 0,
+    #[no_reset]
     ctrl3: u2 = 0,
+    #[no_reset]
     de3: u1 = 0,
     valid3: u1 = 0,
     // Stage 4: running disparity, ones minus zeros sent since the last

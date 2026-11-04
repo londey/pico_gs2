@@ -39,6 +39,8 @@ const RUN: u6 = 32;
 // loaded with framebuffer line 0 for the next frame.
 const LAST_LINE: u11 = 749;
 
+// The line buffer and the display's pipeline registers are #[no_reset]
+// (ADR 0006): the fill, load and scan-out state decide when they matter.
 struct Gpu {
     // Free-running counter for the heartbeat.
     count: u27 = 0,
@@ -64,6 +66,7 @@ struct Gpu {
     ready0: u1 = 0,
     ready1: u1 = 0,
     // Two framebuffer lines: half h at words h * 1024 to h * 1024 + 639.
+    #[no_reset]
     linebuf: mem<u16, 2048> = 0,
 
     // The display.
@@ -73,20 +76,28 @@ struct Gpu {
     // Sticky: an active pixel's line wasn't in the line buffer.
     underflow: u1 = 0,
     // The beam, one cycle behind `timing`, to meet the line buffer's read.
+    #[no_reset]
     de_1: u1 = 0,
+    #[no_reset]
     hsync_1: u1 = 0,
+    #[no_reset]
     vsync_1: u1 = 0,
     // The pixel shows the line buffer's word (else black).
+    #[no_reset]
     show_1: u1 = 0,
     // The pixel's line wasn't in the line buffer (show red).
+    #[no_reset]
     missing_1: u1 = 0,
     enc_blue: TmdsEncoder,
     enc_green: TmdsEncoder,
     enc_red: TmdsEncoder,
 
     // The 10-bit TMDS symbols for board/top.sv, one per cycle.
+    #[no_reset]
     pub tmds_blue: u10 = 0,
+    #[no_reset]
     pub tmds_green: u10 = 0,
+    #[no_reset]
     pub tmds_red: u10 = 0,
 }
 
