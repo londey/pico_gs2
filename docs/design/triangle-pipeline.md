@@ -20,7 +20,7 @@ between the new blocks, and the phases.
 | D3 | LUT RAM for the vertex ring, register banks and output buffers. | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D5 | Setup computes all 8 attributes (R, G, B, A, Z, S′, T′, Q). Traversal uses R, G, B and Z for now. | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D8 | BACK culls area < 0 in y-down screen space. Strips alternate winding through the role-map flip. | [0001](../adr/0001-microcoded-setup-engine.md) |
-| D9 | 8×8 blocks at 1 pixel per clock through an on-chip tile buffer. Colour and Z buffers are tiled, so a block is one 64-word SDRAM run. | [0003](../adr/0003-pixel-path-and-buffers.md) |
+| D9 | 8×8 blocks at 1 pixel per clock through an on-chip tile buffer. Colour and Z buffers are tiled, so a block is two 32-word SDRAM runs in one row. | [0003](../adr/0003-pixel-path-and-buffers.md) |
 | D10 | Immediate mode. Revisit after the bandwidth is measured on the board. | [0003](../adr/0003-pixel-path-and-buffers.md) |
 | D11 | Round half up everywhere (Sinter's `round` does this). | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D12 | One clock: setup, traversal, SDRAM and scan-out all on the 75 MHz core clock. The host link crossing comes with the host link. | — |
@@ -73,13 +73,14 @@ ROM scene ─▶ command parser ─▶ vertex ring ─▶ SETUP ─▶ output bu
 (later: SPI)  (packets)        (4 slots)      (µcode)   (2 × 64 slots)    (8×8 blocks,  (colour + Z, │
                                                                          iterators)    8×8)        │
                                                                                                    ▼
-      DVI ◀─ encoders ◀─ block-row buffer ◀──────── SDRAM arbiter ◀── clears, block reads/writes ───┘
-                         (2 × 8 lines)             (scan-out first)
+      DVI ◀─ encoders ◀─ half-block ring ◀───────── SDRAM arbiter ◀── clears, block reads/writes ───┘
+                         (192 × 8×4)               (scan-out first)
 ```
 
 Everything runs on the core clock. Scan-out's line buffer becomes a
-block-row buffer (§6.4) and gains a buffer select (the front buffer). The
-SDRAM controller takes runs of up to 64 words with a write mask per word;
+ring of half blocks (§6.4) and gains a buffer select (the front buffer).
+The SDRAM controller keeps its runs of up to 32 words and gains a write mask
+per word;
 an arbiter in front of it gives scan-out priority.
 
 ## 5. Number formats (brief §4.3 in Sinter notation)
@@ -145,15 +146,24 @@ loaded by `include_hex!`.
 **Tiling.** Each buffer is 80 × 45 blocks of 8×8 pixels. Block `(bx, by)`
 is the 64 words from `(by * 80 + bx) * 64`, its pixels in raster order, so
 pixel `(x, y)` is at word `x[9:3] @ y[2:0] @ x[2:0]` within its block row,
-plus `y[8:3] * 5120`. A block never crosses an SDRAM row (512 words), so
-reading or writing one is a single run of 64 words. A block row (8 lines)
-is 5,120 contiguous words.
+plus `y[8:3] * 5120`. A block never crosses an SDRAM row (512 words). Its
+top half (lines 0–3) is words 0–31 and its bottom half words 32–63, so a
+**half block** (8×4) is one 32-word run, and a whole block is two runs in the
+same row.
 
-**Scan-out** loads a whole block row at a time into a double-buffered
-block-row buffer (2 × 5,120 words, about 10 DP16KD). While the display
-shows one block row (16 screen lines, 26,400 cycles) the other half loads
-the next as 80 runs of 64 words (about 5,600 cycles, est.): about 21% of the
-bus, against 23% for today's line loads.
+**Scan-out** reads half blocks into a ring of 192 half-block slots (6,144
+words, 6 DP16KD). A *half-block row* is 4 framebuffer lines (8 screen
+lines), 80 half blocks, read as 80 runs of 32 words at a stride of 64. The
+loader fills slots in order as long as fewer than 192 are in use; the
+display frees a half-block row's 80 slots when it has shown that row's last
+line. Two rows fit with 32 slots to spare, so loads can run ahead of the
+display by more than a row. Slot `s` holds its half block's pixels at words
+`s @ py @ px`, so a screen pixel's word is a concatenation once the row's
+first slot is known. Loading a half-block row takes about 3,000 cycles
+(est.) out of the 13,200 the display spends on it: about 23% of the bus, as
+for today's line loads. The ring restarts at slot 0 at the end of each
+frame's active area, so a buffer swap at vertical blank (triple buffering)
+never mixes two buffers in the ring.
 
 **Triple buffering.** One buffer is displayed, at most one is complete and
 waiting, and the renderer draws into the third. At each vertical blank the
@@ -166,22 +176,24 @@ For each 8×8 block the bounding box touches:
 
 1. Test the block's corners against the three edges; skip the block if it's
    wholly outside one.
-2. Read the block's Z: one run of 64 words.
+2. Read the block's Z: two runs of 32 words.
 3. Step the edge functions and R, G, B, Z one pixel per clock; on coverage
    (top-left rule) and Z less-than, write colour and Z into the tile buffer
    and set the pixel's mask bit.
-4. Write back colour and Z: one run of 64 words each, with the per-word
-   mask (DQM) leaving untouched pixels as they were.
+4. Write back colour and Z: two runs of 32 words each, with the per-word
+   mask (DQM) leaving uncovered and Z-rejected pixels as they were, so the
+   colour buffer is never read.
 
-That's about 210 cycles of SDRAM time per block (est.), about 3.3 per pixel,
-against about 310 for 8-word runs. Overlapping step 3 of one block with the
+That's about 230 cycles of SDRAM time per block (est.), about 3.6 per pixel,
+against about 310 for 8-word runs. Raising the run limit to 64 would save
+about 20 cycles a block; it can wait for measurements. Overlapping step 3 of one block with the
 SDRAM traffic of others, and skipping the Z read for a block the clear
 hasn't touched since, are optimisations for later, once frames are
 measured.
 
-**SDRAM controller changes:** runs of up to 64 words (`len` widens to `u7`),
-a write mask per word, and a refresh interval that still meets the
-datasheet when a 64-word run delays a refresh.
+**SDRAM controller change:** a write mask per word, taken with the word on
+`wtake` and driven on DQM. Runs stay at up to 32 words, so the refresh
+timing doesn't change.
 
 ## 7. Verification
 
@@ -204,7 +216,7 @@ I stop and report.
 |---|---|---|---|
 | 6 | `phase-6-raster-plan` | This note, the ADRs, the Sinter requirements list, the brief committed | Plan approved (done) |
 | 7 | `phase-7-oracle` | Sinter v1.0.0-rc.2. `--cosim` on every directed test and on stimulus recorded from the Rust frame test, in `just check`. `#[no_reset]` on the current datapath registers; reset fanout before and after. | The oracle passes in `just check`; reset fanout reported |
-| 8 | `phase-8-tiled-framebuffer` | SDRAM controller: 64-word runs, per-word write mask. Tiled colour buffer; the test pattern written block by block; scan-out through the block-row buffer. | Twin frame test pixel-exact; the test pattern on the board, as now |
+| 8 | `phase-8-tiled-framebuffer` | SDRAM controller: per-word write mask. Tiled colour buffer; the test pattern written block by block; scan-out through the 192-slot half-block ring. | Twin frame test pixel-exact; the test pattern on the board, as now |
 | 9 | `phase-9-setup-model` | Generator crate (brief §7): op-list DSL with formats and ranges, register allocator, list scheduler, micro-ROM and seed emitters, bit-exact interpreter, f64 reference, reference traversal. All brief §8 reference-level tests: exhaustive reciprocal, random-triangle error, edge cases, watertightness, overflow, schedule determinism. | Tests pass; error and schedule reports reviewed |
 | 10 | `phase-10-setup-engine` | The setup engine in Sinter: datapath, sequencer, vertex ring, output buffers. Bit- and cycle-exact against the interpreter on the corpus; oracle; synthesis report. | Exact on the corpus; resources and Fmax against brief §9 |
 | 11 | `phase-11-first-triangles` | Command parser and a static ROM scene; traversal, iterators and tile buffer; SDRAM arbiter; Gouraud colour into one framebuffer, no Z. | Frames pixel-exact against the reference renderer; triangles on the board |
@@ -216,12 +228,12 @@ SPI host link is a phase of its own, to be scheduled.
 
 ## 9. Risks
 
-- **SDRAM bandwidth.** Per-run overhead is about 6 cycles in 70 with 64-word
+- **SDRAM bandwidth.** Per-run overhead is about 6 cycles in 38 with 32-word
   runs. Clearing colour and Z is about 7,200 runs, roughly 0.5M cycles
   (6.7 ms) a frame. Measured in phase 12 before anything is optimised.
-- **Block RAM.** The block-row buffer takes about 10 DP16KD, against 2 for
-  the line buffer; with the scene ROM (8) and setup (3) that's about 21 of
-  56 before textures.
+- **Block RAM.** The half-block ring takes 6 DP16KD, against 2 for the
+  line buffer; with the scene ROM (8) and setup (3) that's about 17 of 56
+  before textures.
 - **Scene ROM size.** Precomputed cube frames take block RAM: about 120 words
   per frame, so 32 frames is about 4K words, or 8 DP16KD (est.). The
   rotation is about the vertical axis, so a quarter turn loops seamlessly.
