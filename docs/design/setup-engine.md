@@ -1,8 +1,9 @@
 # Setup engine: numerics
 
-**Status:** Phase 9 (`models/setup`): the bit-exact model, the microcode,
-its scheduler and the cycle-level interpreter, done; the Sinter engine is
-Phase 10.
+**Status:** Phase 10. The bit-exact model, the microcode, its scheduler and
+the cycle-level interpreter (`models/setup`, Phase 9), and the engine in
+Sinter (`hw/setup.snt`, Phase 10), cycle-exact against the interpreter and
+meeting 75 MHz on its own. It joins the GPU in Phase 11.
 **Spec:** [setup-engine-brief.md](setup-engine-brief.md) §4, with the
 changes below, each found by measuring the model against its `f64`
 reference.
@@ -66,19 +67,30 @@ runs the encoded words, `src/emit.rs` and `setup-gen` write the ROMs.
   sequencer (33 bits: op, a, b, temporary, output slot, NEXT/CHECK/END).
   The brief's single 64-bit word has no room for a result to go to both a
   temporary and an output, which gradients, edge coefficients and the
-  bounding box need; without it the ALU would need about 24 more MOVs.
+  bounding box need; without it the ALU would need about 24 more MOVs. In
+  the ROM, each ALU word's sequencer field holds the *next* word's action,
+  so the engine acts on it from a register rather than straight off the
+  block RAM (whose 5.6 ns clock-to-out otherwise sets the clock).
 - **Address spaces:** reads: vertex fields by role (0x00–0x2F), constants
   (0x30), ALU bank (0x40, 32 registers), MUL bank (0x60, 32). Each bank has
   one writer. Outputs: 0x00–0x12 written by the MUL slot (edge values,
   gradients), 0x20–0x31 by the ALU slot (A, B, box, starts).
 - **Pipeline** (Sinter memories read first: a read in the cycle of a write
-  sees the old word):
+  sees the old word), as set by timing closure in Phase 10:
 
   | Operation | Operands | Result written | Latency |
   |---|---|---|---|
-  | ALU | issue + 1 | end of issue + 1 | 2 |
-  | RCPLD | issue + 1 | end of issue + 2 (seed ROM) | 3 |
-  | MUL term | issue + 1 | accumulates at issue + 4; shifted (with E) and written at the end of issue + 5 | 6 |
+  | ALU | arrive at t+1, registered | end of t+2 | 3 |
+  | TST | as ALU | flags at the end of t+2 | 3 |
+  | RCPLD | as ALU | end of t+3 (through the seed ROM) | 4 |
+  | LZC | as ALU | leading one found at t+2; mantissa and E written at the end of t+3 | 4 |
+  | MUL term | t+1 | product t+2; accumulates t+3, when the shift amount is fixed with E; shifted t+4; rounded, saturated and written at the end of t+5 | 6 |
+
+- **Write ports:** each bank and output buffer has one. An RCPLD or LZC
+  writes a cycle later than other ALU operations, so the scheduler keeps
+  the ALU slot free in the cycle after one, and the interpreter asserts one
+  write per memory per cycle. (Phase 9's schedule broke this at cycle 30;
+  hardware would have lost a write.)
 
 - **Check and restart:** CHECK aborts on zero area or a culled winding, or
   swaps roles 1 and 2 and restarts on a negative area; the restarted pass
@@ -89,17 +101,46 @@ runs the encoded words, `src/emit.rs` and `setup-gen` write the ROMs.
 
 | Program | Cycles | Critical path | Check | MUL issues | ALU issues | Temporaries (ALU, MUL) |
 |---|---|---|---|---|---|---|
-| full | 94 | 50 | 13 | 62 (66%) | 54 (57%) | 28, 14 |
-| untextured | 74 | 50 | 13 | 44 (59%) | 45 (61%) | 22, 8 |
+| full | 99 | 56 | 15 | 62 (63%) | 54 (55%) | 27, 14 |
+| untextured | 80 | 56 | 15 | 44 (55%) | 45 (56%) | 22, 8 |
 
-A rejected triangle takes 14 cycles, a flipped one 14 more than a kept
-one. The brief targets 85 and 10. The gap is the chain to the gradient
-factors: area, LZC, seed, `t`, `2 − t`, `r`, `k` pass through the
-6-cycle multiplier four times, so `k` is ready about cycle 34 while 48 of
-the 62 multiplies depend on it. Options, to weigh once Phase 10 has real
-timing: a shorter multiplier pipeline (the latencies are generator
-constants), or overlapping one triangle's start with the last one's
-gradients (more registers).
+A rejected triangle takes 16 cycles, a flipped one 16 more than a kept
+one. The brief targets 85 and 10. Phase 9's schedule was 94 / 74 / 14;
+registering the ALU's operands and splitting LZC, which timing needed,
+cost 5. The rest of the gap is the chain to the gradient factors: area,
+LZC, seed, `t`, `2 − t`, `r`, `k` pass through the 6-cycle multiplier four
+times, while 48 of the 62 multiplies depend on `k`.
+
+A multiplier latency of 5 (shift, round, saturate and write in one stage)
+gives 95 / 76 cycles but only 53 MHz, so it stays at 6. What's left to
+try: overlapping one triangle's start with the last one's gradients (more
+registers), or a second multiplier.
+
+### The engine (`hw/setup.snt`)
+
+`just setup-report` places and routes it alone, driven by an LFSR
+(`hw/setup_synth.snt`), at 75 MHz:
+
+| | Engine | Brief §9 target |
+|---|---|---|
+| Fmax | 82.5 MHz | ≥ 75 MHz |
+| Logic cells (LUT4) | 3,841 (15%) | ≤ 1,500 |
+| Flip-flops | 974 | — |
+| Block RAM (DP16KD) | 5: two micro-ROMs, seeds, two output buffers | ≤ 6 |
+| Multipliers (MULT18X18D) | 2 | 2 |
+
+The logic is over the brief's estimate. The largest parts: the two
+temporary banks in LUT RAM with four read ports each (four copies), the
+vertex ring, the two barrel shifters (post-shifter, LZC), and the operand
+selects. Reading the banks twice per cycle instead of keeping four copies,
+or a narrower post-shifter, are the obvious savings if LUTs get tight.
+
+Timing closure, from 38.8 MHz at first: the multiplier's second product
+register became an accumulate one stage earlier; the ALU's operands are
+registered; LZC takes two cycles; the comparator for MIN, MAX and SNAP
+moved to the operand stage; ALU results are an AND-OR of one-hot selects;
+saturation checks sign copies instead of comparing; the shift amount is
+fixed at accumulate; the sequencer's action comes from a register.
 
 ## Verification
 
@@ -110,15 +151,18 @@ gradients (more registers).
 | `edge_cases` | zero area, culling × winding, flips, exact edges, box, variants, guard band |
 | `microcode` | interpreter = bit-exact model for 18,000 random triangles (2 programs × 3 cull modes), cycle counts as scheduled, encode/decode |
 | `watertight` | the reference traversal (`src/traverse.rs`, top-left rule) covers each pixel of random meshes and fans exactly once |
+| `sim/tb/tests/setup_engine.rs` | the Sinter engine = interpreter for 1,500 random triangles: every bank and output write in the same cycle, results, committed outputs read back; its stimulus replayed through Verilator by `just check` |
 
-Mutations caught: writes landing a cycle late (interpreter), and a fill
-rule without the top-left tie-break (traversal).
+Mutations caught: writes landing a cycle late, two writes to a bank in a
+cycle (interpreter); a fill rule without the top-left tie-break
+(traversal); wrong rounding, no role swap on restart (engine).
 
 Not done yet: a formal range analysis of the op list. Port widths and
 accumulator overflow are asserted at run time over the test corpus
-instead. And `setup-gen` isn't in `just gen` yet: the `sim` workspace
-needs the Sinter crates to exist before any of its members can run, so
-Phase 10 has to break that cycle when the engine first loads the ROMs.
+instead.
+
+`setup-gen` runs first in `just gen`: `models/setup` is a Cargo workspace
+of its own, so it doesn't need the crates `sinter build` generates.
 
 ## Accuracy
 

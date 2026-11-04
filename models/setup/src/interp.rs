@@ -13,7 +13,7 @@
 use crate::formats::{post_shift, wrap, Coord, Delta, Iter, Wide, REG_BITS};
 use crate::isa::{
     out, read, AluOp, AluWord, Constant, Dest, MulOp, MulWord, Seq, ALU_LATENCY, BANK_SIZE,
-    LZC_LATENCY, MUL_ACC_STAGE, RCPLD_LATENCY, TST_LATENCY,
+    LZC_LATENCY, MUL_ACC_STAGE, MUL_LATENCY, RCPLD_LATENCY, TST_LATENCY,
 };
 use crate::reciprocal::SEED_TABLE;
 use crate::setup::{Edge, Plane, Reject, Setup};
@@ -253,8 +253,9 @@ impl Engine<'_> {
         for s in due {
             let w = s.word;
             let value = post_shift(s.value, s.shift, w.round, w.sat);
-            // Rounded and saturated in the next cycle, and written then.
-            self.write(now + 1, 1, w.dest, value);
+            // Rounded, saturated and written in the last stage: this one
+            // (latency 5) or the next (latency 6).
+            self.write(now + MUL_LATENCY - 5, 1, w.dest, value);
         }
         let due: Vec<Stage> = self
             .products
