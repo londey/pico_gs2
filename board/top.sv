@@ -194,24 +194,29 @@ module top (
     // ------------------------------------------------------------------
     // GPU core
     // ------------------------------------------------------------------
+    logic [15:0] debug_frames;         // Frames shown (for the tests; unused here), UQ16.0
+    logic [23:0] debug_render_cycles;  // Core cycles the last frame took to draw (unused), UQ24.0
+
     Gpu u_gpu (
-        .clk               (clk_core),
-        .rst_n             (rst_core_n),
-        .sdram_dq          (sdram_dq_in),
-        .tmds_blue_q       (tmds_blue),
-        .tmds_green_q      (tmds_green),
-        .tmds_red_q        (tmds_red),
-        .out_led           (led),
-        .out_sdram_cke     (sdram_cke),
-        .out_sdram_cs_n    (sdram_csn),
-        .out_sdram_ras_n   (sdram_rasn),
-        .out_sdram_cas_n   (sdram_casn),
-        .out_sdram_we_n    (sdram_wen),
-        .out_sdram_ba      (sdram_ba),
-        .out_sdram_a       (sdram_a),
-        .out_sdram_dqm     (sdram_dqm),
-        .out_sdram_dq_out  (sdram_dq_out),
-        .out_sdram_dq_oe   (sdram_dq_oe)
+        .clk                   (clk_core),
+        .rst_n                 (rst_core_n),
+        .sdram_dq              (sdram_dq_in),
+        .debug_frames_q        (debug_frames),
+        .debug_render_cycles_q (debug_render_cycles),
+        .tmds_blue_q           (tmds_blue),
+        .tmds_green_q          (tmds_green),
+        .tmds_red_q            (tmds_red),
+        .out_led               (led),
+        .out_sdram_cke         (sdram_cke),
+        .out_sdram_cs_n        (sdram_csn),
+        .out_sdram_ras_n       (sdram_rasn),
+        .out_sdram_cas_n       (sdram_casn),
+        .out_sdram_we_n        (sdram_wen),
+        .out_sdram_ba          (sdram_ba),
+        .out_sdram_a           (sdram_a),
+        .out_sdram_dqm         (sdram_dqm),
+        .out_sdram_dq_out      (sdram_dq_out),
+        .out_sdram_dq_oe       (sdram_dq_oe)
     );
 
     // ------------------------------------------------------------------

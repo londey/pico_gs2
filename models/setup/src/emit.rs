@@ -32,7 +32,7 @@ pub struct Generated {
     /// The seed table.
     pub seed_hex: String,
 
-    /// The built-in scene, as command words (ADR 0002).
+    /// The built-in scene, the spinning cube, as command words (ADR 0002).
     pub scene_hex: String,
 
     /// The schedule report.
@@ -112,8 +112,8 @@ pub fn generate() -> Generated {
             5,
         ),
         scene_hex: hex(
-            "the built-in test card, command words (generated)",
-            crate::scene::encode(&crate::scene::test_card())
+            "the built-in scene, the spinning cube: command words (generated)",
+            crate::scene::encode(&crate::scene::cube_scene())
                 .into_iter()
                 .map(u64::from),
             8,

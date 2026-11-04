@@ -24,7 +24,8 @@ hw/                     Sinter sources (the design)
   sdram.snt             SDRAM controller (#[module])
   video.snt             video timing generator and TMDS encoder (#[module]s)
   setup.snt             triangle setup engine (#[module])
-  raster.snt            command parser (scene ROM) and rasteriser (traversal, tile buffer)
+  raster.snt            command parser (scene ROM) and rasteriser (clear, traversal,
+                        depth test, tile buffers)
   setup_tb.snt          the engine's test root (sim/tb drives it); setup_synth.snt its
                         synthesis root
   *_tb.snt              test-harness roots that expose a block's ports to `sinter sim`
@@ -34,8 +35,9 @@ sim/                    Rust workspace: testbenches (members include models/*)
 models/                 Rust models of external chips
   sdram/                W9825G6KH SDRAM: pin-level, checks datasheet timing
   setup/                setup engine models, microcode generator (setup-gen) and
-                        interpreter, the test card (scene.rs) and the reference renderer
-                        (render.rs); a Cargo workspace of its own (just gen runs it first)
+                        interpreter, the scenes (scene.rs: test card, spinning cube),
+                        the reference renderer (render.rs); a Cargo workspace of its
+                        own (just gen runs it first)
   reference/            sources the models were written from (datasheet, old C++)
 external/icepi-zero     board repo (git submodule): pin sites, examples
 scripts/  justfile      task runner; every recipe is a script in scripts/

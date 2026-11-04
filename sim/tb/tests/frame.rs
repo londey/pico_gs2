@@ -1,11 +1,13 @@
 //! Twin test of the whole core (`hw/gpu.snt`) with the SDRAM model on its
 //! bus: from reset, through the SDRAM's power-up sequence and the
-//! framebuffer fill, through the first two 1280x720 frames scanned out of
-//! SDRAM (the second reuses the line buffer the first filled). The test
-//! decodes the TMDS symbols as a DVI monitor would, checks the picture
-//! (each framebuffer pixel as 2x2 screen pixels) and the sync timing at every
-//! pixel, checks the SDRAM's contents and that the controller broke none of
-//! the datasheet's rules, and writes the picture to `build/framebuffer.png`.
+//! framebuffer fill, until the first frames of the spinning cube have been
+//! drawn into the triple-buffered framebuffer and shown. The test decodes
+//! the TMDS symbols as a DVI monitor would, checks the sync timing at every
+//! pixel and that each frame shown is one of the cube's, exactly as the
+//! reference renderer draws it (each framebuffer pixel as 2x2 screen
+//! pixels), and in order; checks the SDRAM's contents and that the
+//! controller broke none of the datasheet's rules; reports how long a frame
+//! takes to draw; and writes the first frame to `build/framebuffer.png`.
 //!
 //! The core's input on every cycle is recorded as a `sinter sim` stimulus
 //! file, `build/stimulus/gpu.frame.csv`, which `just check` replays with
@@ -18,8 +20,8 @@ use std::path::PathBuf;
 
 use gpu_sim::{Gpu, Inputs, Outputs};
 use sdram_model::Pins;
-use setup_model::render::render;
-use setup_model::scene::{encode, test_card};
+use setup_model::render::{run as run_scene, Frame};
+use setup_model::scene::{cube_scene, CUBE_FRAMES};
 use tb::{decode, SdramBus, Symbol};
 
 /// Active pixels per line (CEA-861 1280x720 at 60 Hz).
@@ -64,42 +66,26 @@ const SCALE: usize = 2;
 const SYMBOL_LATENCY: usize = 6;
 
 /// Frames to run at most: the SDRAM's power-up and the fill take about a
-/// quarter of a frame, the scene is drawn after that, and two frames that
-/// start after it is drawn are checked.
-const MAX_FRAMES: usize = 8;
+/// quarter of a frame, the first cube frame is drawn and shown after that,
+/// and the frames shown from then on are checked.
+const MAX_FRAMES: usize = 12;
 
-/// Frames scanned out of SDRAM to check.
-const CHECKED_FRAMES: usize = 2;
+/// Frames shown from SDRAM to check.
+const CHECKED_FRAMES: usize = 4;
 
-/// LED bits: SDRAM initialised, framebuffer filled, scan-out underflow,
-/// scene drawn.
+/// LED bits: SDRAM initialised, framebuffer filled, scan-out underflow.
 const LED_SDRAM_READY: u8 = 1 << 1;
 const LED_FILLED: u8 = 1 << 2;
 const LED_UNDERFLOW: u8 = 1 << 3;
-const LED_DRAWN: u8 = 1 << 4;
 
-/// What the framebuffer should hold once the scene is drawn: the test
-/// pattern, with the built-in test card drawn over it by the reference
-/// renderer.
-fn expected() -> Vec<u16> {
-    let mut fb: Vec<u16> = (0..FB_HEIGHT)
-        .flat_map(|y| (0..FB_WIDTH).map(move |x| pattern(x, y)))
-        .collect();
-    render(&mut fb, &encode(&test_card()));
-    fb
-}
+/// The core clock, in hertz.
+const CLOCK_HZ: f64 = 75e6;
 
-/// The test pattern `hw/gpu.snt` writes, as RGB565: a white border, red
-/// rising to the right, green rising downwards, blue on alternate 32x32
-/// squares.
-fn pattern(x: usize, y: usize) -> u16 {
-    if x == 0 || x == FB_WIDTH - 1 || y == 0 || y == FB_HEIGHT - 1 {
-        return 0xFFFF;
-    }
-    let red = (x >> 5) & 0x1F;
-    let green = (y >> 3) & 0x3F;
-    let blue = if (x ^ y) & 32 != 0 { 0x1F } else { 0 };
-    u16::try_from((red << 11) | (green << 5) | blue).expect("16 bits")
+/// The frames the scene ends, in order, as the reference renderer draws
+/// them: the spinning cube, a frame per step of its turn.
+fn expected() -> Vec<Vec<u16>> {
+    let mut frame = Frame::new(vec![0; FB_WIDTH * FB_HEIGHT]);
+    run_scene(&mut frame, &cube_scene()).0
 }
 
 /// Blocks across the framebuffer.
@@ -144,12 +130,15 @@ struct Run {
     /// The SDRAM and its bus, at the end.
     bus: SdramBus,
 
-    /// The (blue, green, red) TMDS symbols of the first frames that start
-    /// after the scene is drawn, each in raster order.
+    /// The (blue, green, red) TMDS symbols of the first frames shown from
+    /// SDRAM once the first cube frame is, each in raster order.
     frames: Vec<Vec<[u16; 3]>>,
 
-    /// The cycle the scene was drawn by.
-    drawn_at: Option<usize>,
+    /// The bank shown in the last of them.
+    shown_bank: usize,
+
+    /// Core cycles the last finished frame took to draw.
+    render_cycles: u32,
 
     /// The LEDs at the end.
     led: u8,
@@ -172,7 +161,7 @@ fn build_path(parts: &[&str]) -> PathBuf {
 }
 
 /// Steps the core and the SDRAM from reset until the frames have been
-/// scanned out of the framebuffer, recording the core's inputs.
+/// shown, recording the core's inputs.
 ///
 /// # Arguments
 ///
@@ -192,7 +181,11 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
     let mut frames = Vec::new();
     let mut frame = Vec::with_capacity(FRAME);
     let mut led = 0;
-    let mut drawn_at = None;
+    let mut render_cycles = 0;
+    // The frame being captured started after the first cube frame was
+    // presented, so shows a cube frame.
+    let mut capturing = false;
+    let mut shown_bank = 0;
     writeln!(
         stimulus,
         "# Recorded by sim/tb/tests/frame.rs; replayed by `just check`."
@@ -207,17 +200,19 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
         writeln!(stimulus, "{}", inputs.sdram_dq)?;
         let out = sim.step(&inputs);
         led = out.out_led;
-        if drawn_at.is_none() && led & LED_DRAWN != 0 {
-            drawn_at = Some(cycle);
-        }
+        render_cycles = out.debug_render_cycles_q;
         if cycle < SYMBOL_LATENCY {
             continue;
         }
-        // A frame is checked if the scene was drawn before it started.
-        let drawn_before = drawn_at.is_some_and(|c| c + FRAME <= cycle - frame.len());
+        // A frame presented is shown from the next frame start; the symbols
+        // follow the beam by SYMBOL_LATENCY cycles.
+        if frame.is_empty() {
+            capturing = out.debug_frames_q >= 1;
+            shown_bank = usize::try_from(sim.register("disp").unwrap_or(0)).unwrap_or(0);
+        }
         frame.push([out.tmds_blue_q, out.tmds_green_q, out.tmds_red_q]);
         if frame.len() == FRAME {
-            if drawn_before {
+            if capturing {
                 frames.push(std::mem::take(&mut frame));
                 if frames.len() == CHECKED_FRAMES {
                     break;
@@ -230,18 +225,20 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
     Ok(Run {
         bus,
         frames,
-        drawn_at,
+        shown_bank,
+        render_cycles,
         led,
     })
 }
 
-/// Once the scene is drawn, the frames scanned out of SDRAM show the test
-/// pattern with the test card drawn over it exactly as the reference
-/// renderer draws it, the sync timing is right at every pixel, the
-/// framebuffer in SDRAM is exactly the reference's, and the SDRAM was
-/// driven by the book.
+/// The frames shown from SDRAM are the cube's, each exactly as the
+/// reference renderer draws it, and in order (each the one before it again,
+/// or the next, as drawing a frame may take longer than showing one); the
+/// sync timing is right at every pixel; the bank shown holds the last
+/// frame, tiled; the SDRAM was driven by the book; and a frame takes less
+/// than two frame times to draw.
 #[test]
-fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
+fn cube_frames_scan_out_from_sdram() -> Result<(), Box<dyn Error>> {
     let path = build_path(&["stimulus", "gpu.frame.csv"]);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -249,56 +246,109 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
     let Run {
         bus,
         frames,
-        drawn_at,
+        shown_bank,
+        render_cycles,
         led,
     } = run(&mut BufWriter::new(File::create(path)?))?;
-    let drawn_at = drawn_at.ok_or("the scene was never drawn")?;
-    println!(
-        "scene drawn by cycle {drawn_at} ({:.2} frames)",
-        f64::from(u32::try_from(drawn_at).expect("small"))
-            / f64::from(u32::try_from(FRAME).expect("small"))
-    );
-    let fb = expected();
-    assert_eq!(
-        frames.len(),
-        CHECKED_FRAMES,
-        "{CHECKED_FRAMES} frames not scanned out within {MAX_FRAMES}"
-    );
+    let reference = expected();
+    assert_eq!(reference.len(), CUBE_FRAMES);
     assert!(
         bus.sdram.violations().is_empty(),
         "{} SDRAM violations: {:#?}",
         bus.sdram.violation_count(),
         bus.sdram.violations()
     );
+    assert_eq!(
+        frames.len(),
+        CHECKED_FRAMES,
+        "{CHECKED_FRAMES} frames not shown within {MAX_FRAMES}"
+    );
 
-    let pictures: Vec<_> = frames
-        .iter()
-        .enumerate()
-        .map(|(n, frame)| check_frame(n, frame, &fb))
-        .collect();
+    let mut shown: Option<usize> = None;
+    let mut first_picture = None;
+    for (n, symbols) in frames.iter().enumerate() {
+        let picture = screen(n, symbols);
+        let candidates = match shown {
+            None => vec![0],
+            Some(k) => vec![k, (k + 1) % CUBE_FRAMES],
+        };
+        let Some(k) = candidates
+            .iter()
+            .copied()
+            .find(|&k| differing(&picture, &reference[k]) == 0)
+        else {
+            write_png(&picture, "framebuffer.png")?;
+            let diffs: Vec<_> = candidates
+                .iter()
+                .map(|&k| (k, differing(&picture, &reference[k])))
+                .collect();
+            return Err(format!(
+                "frame {n} is none of the cube frames expected: (frame, pixels differing) {diffs:?}"
+            )
+            .into());
+        };
+        println!("frame {n} shows cube frame {k}");
+        shown = Some(k);
+        first_picture.get_or_insert(picture);
+    }
 
-    // The framebuffer, tiled, in bank 0 from row 0.
+    // The bank shown holds the last frame, tiled.
+    let last = &reference[shown.ok_or("no frames checked")?];
     for y in 0..FB_HEIGHT {
         for x in 0..FB_WIDTH {
             let addr = tiled(x, y);
             assert_eq!(
-                bus.sdram.peek(0, addr >> 9, addr & 0x1FF),
-                fb[y * FB_WIDTH + x],
-                "SDRAM word for ({x}, {y})"
+                bus.sdram.peek(shown_bank, addr >> 9, addr & 0x1FF),
+                last[y * FB_WIDTH + x],
+                "SDRAM bank {shown_bank} word for ({x}, {y})"
             );
         }
     }
 
+    println!(
+        "a frame takes {render_cycles} cycles to draw: {:.1} frames per second at 75 MHz",
+        CLOCK_HZ / f64::from(render_cycles)
+    );
+    assert!(render_cycles > 0, "no frame was finished");
+    assert!(
+        usize::try_from(render_cycles)? < 2 * FRAME,
+        "drawing a frame takes {render_cycles} cycles, over two frame times"
+    );
     assert_eq!(
-        led & (LED_SDRAM_READY | LED_FILLED | LED_UNDERFLOW | LED_DRAWN),
-        LED_SDRAM_READY | LED_FILLED | LED_DRAWN,
+        led & (LED_SDRAM_READY | LED_FILLED | LED_UNDERFLOW),
+        LED_SDRAM_READY | LED_FILLED,
         "LEDs {led:#07b}"
     );
-    write_png(&pictures[0])
+    write_png(
+        &first_picture.ok_or("no frames checked")?,
+        "framebuffer.png",
+    )
 }
 
-/// Checks one frame's symbols: the test pattern in the active picture, and
-/// the sync control tokens in the blanking.
+/// How many screen pixels of a decoded picture differ from a framebuffer's
+/// pixels, each shown as 2x2 screen pixels.
+///
+/// # Arguments
+///
+/// * `picture` - The picture, `H_ACTIVE * V_ACTIVE` pixels in raster order.
+/// * `fb` - The framebuffer, RGB565, `FB_WIDTH * FB_HEIGHT` in raster order.
+///
+/// # Returns
+///
+/// The number of screen pixels that differ.
+fn differing(picture: &[[u8; 3]], fb: &[u16]) -> usize {
+    picture
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| {
+            let (x, y) = (i % H_ACTIVE, i / H_ACTIVE);
+            *p != rgb888(fb[(y / SCALE) * FB_WIDTH + x / SCALE])
+        })
+        .count()
+}
+
+/// Decodes one frame's symbols: checks the sync control tokens in the
+/// blanking, and returns the active picture.
 ///
 /// # Arguments
 ///
@@ -307,24 +357,22 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
 ///
 /// # Returns
 ///
-/// The decoded active picture: `H_ACTIVE * V_ACTIVE` pixels, 3 bytes each.
+/// The active picture: `H_ACTIVE * V_ACTIVE` RGB pixels in raster order.
 ///
 /// # Panics
 ///
-/// If any symbol isn't the one expected.
-fn check_frame(n: usize, frame: &[[u16; 3]], fb: &[u16]) -> Vec<u8> {
-    let mut picture = Vec::with_capacity(H_ACTIVE * V_ACTIVE * 3);
+/// If a blanking symbol isn't the one expected, or an active one isn't
+/// data.
+fn screen(n: usize, frame: &[[u16; 3]]) -> Vec<[u8; 3]> {
+    let mut picture = Vec::with_capacity(H_ACTIVE * V_ACTIVE);
     for (i, symbols) in frame.iter().enumerate() {
         let (x, y) = (i % H_TOTAL, i / H_TOTAL);
         let [blue, green, red] = symbols.map(decode);
         if x < H_ACTIVE && y < V_ACTIVE {
-            let [r, g, b] = rgb888(fb[(y / SCALE) * FB_WIDTH + x / SCALE]);
-            assert_eq!(
-                (red, green, blue),
-                (Symbol::Data(r), Symbol::Data(g), Symbol::Data(b)),
-                "frame {n}, pixel ({x}, {y})"
-            );
-            picture.extend([r, g, b]);
+            let (Symbol::Data(r), Symbol::Data(g), Symbol::Data(b)) = (red, green, blue) else {
+                panic!("frame {n}, pixel ({x}, {y}): {red:?} {green:?} {blue:?}");
+            };
+            picture.push([r, g, b]);
         } else {
             // 720p's syncs are active high.
             let hsync = u8::from((H_SYNC_START..H_SYNC_END).contains(&x));
@@ -343,17 +391,18 @@ fn check_frame(n: usize, frame: &[[u16; 3]], fb: &[u16]) -> Vec<u8> {
     picture
 }
 
-/// Writes the decoded active picture as an RGB PNG in `build/`.
+/// Writes a decoded active picture as an RGB PNG in `build/`.
 ///
 /// # Arguments
 ///
-/// * `rgb` - `H_ACTIVE * V_ACTIVE` pixels, 3 bytes each, in raster order.
+/// * `picture` - `H_ACTIVE * V_ACTIVE` pixels in raster order.
+/// * `name` - The file's name.
 ///
 /// # Errors
 ///
 /// Returns any error from creating or encoding the file.
-fn write_png(rgb: &[u8]) -> Result<(), Box<dyn Error>> {
-    let path = build_path(&["framebuffer.png"]);
+fn write_png(picture: &[[u8; 3]], name: &str) -> Result<(), Box<dyn Error>> {
+    let path = build_path(&[name]);
     let mut encoder = png::Encoder::new(
         BufWriter::new(File::create(path)?),
         H_ACTIVE as u32,
@@ -361,6 +410,8 @@ fn write_png(rgb: &[u8]) -> Result<(), Box<dyn Error>> {
     );
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header()?.write_image_data(rgb)?;
+    encoder
+        .write_header()?
+        .write_image_data(picture.as_flattened())?;
     Ok(())
 }

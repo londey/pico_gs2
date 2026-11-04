@@ -115,10 +115,10 @@ header word, then its vertices:
 
 | Header bits | Field |
 |---|---|
-| 31:28 | opcode: 1 strip, 2 fan, 15 end of scene |
+| 31:28 | opcode: 1 strip, 2 fan, 3 clear, 4 end of frame, 15 end of scene (loop) |
 | 27:26 | cull mode: 0 none, 1 back, 2 front |
 | 25 | 1 for the untextured program |
-| 15:0 | vertices that follow (3 or more) |
+| 15:0 | vertices that follow (3 or more); for a clear, the RGB565 colour |
 
 A vertex is four words: `x @ y` (two `Q12.4` counts), `R @ G @ B @ A`,
 `Z @ Q`, `S′ @ T′`. A strip's vertex `i` makes triangle `(i-2, i-1, i)`,
@@ -128,7 +128,10 @@ slot 0 for their first vertex and cycle 1–3, so the next vertex always loads
 into a slot the running triangle isn't using. A new primitive starts again
 from slot 0, so the parser waits for the ring to be free first.
 
-Clear and end-of-frame commands come with Phase 12.
+A clear (Phase 12) sets the frame being drawn to its colour and its depths
+to the farthest, 0xFFFF; it waits for the last frame's triangles to finish.
+An end of frame waits for the frame's last blocks to be written and for
+the display to have taken the frame before, then hands the frame over.
 
 ### 6.2 Setup output record
 
@@ -214,6 +217,25 @@ and clamped. The arbiter registers the request it puts in front of the
 controller (fill, then scan-out first, then the rasteriser). The test card
 (48 triangles, 47 kept, about 94,500 pixels) draws in 579,360 cycles from
 reset, under half a frame after the fill.
+
+**As built in Phase 12:** a 16-bit depth buffer in bank 3 and three colour
+buffers in banks 0 to 2, at the same tiled addresses. The rasteriser also
+copies the Z plane (25 slots). A clear writes every half block's colour and
+then its depth, one unmasked 32-word run each (14,400 runs). Per block not
+rejected, ZREAD reads its 64 depths (two runs) into a second tile buffer;
+each pixel is drawn if covered and its depth (the Z iterator over 2^16,
+rounded and clamped) is less than the buffer's, and its depth goes into the
+tile with its colour; then the colour runs and the depth runs go out, each
+half block with a drawn pixel, masked. Buffers: one shown, one drawn, the
+third finished-and-waiting or spare. At an end of frame the drawn buffer
+becomes the waiting one and the spare the drawn one; at the next frame
+start the waiting one is shown and the shown one becomes the spare. The
+scene is the cube (32 frames a quarter turn, back faces culled) and two
+triangles crossing in depth, over a dark grey clear. A frame takes
+1,103,542 cycles to draw (68 per second at 75 MHz, so the display shows
+every frame at 60 Hz); the clear is about half of it. The GPU places and
+routes at 77.1 MHz in 9,512 logic cells, 3,391 FFs, 26 DP16KD (16 of them
+the 8,192-word scene ROM) and 2 MULT18X18D.
 
 ## 7. Verification
 
