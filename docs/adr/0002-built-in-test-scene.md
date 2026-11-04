@@ -1,6 +1,6 @@
 # 0002: Built-in test scene before the host link
 
-**Status:** Proposed (2026-10-31)
+**Status:** Accepted (2026-11-04)
 
 ## Context
 

@@ -1,27 +1,24 @@
-# 0006: Reset datapath registers for now
+# 0006: Only control state is reset
 
-**Status:** Proposed (2026-10-31)
+**Status:** Accepted (2026-11-04)
 
 ## Context
 
 pico-gs found that high-fanout reset nets caused routing congestion, so the
-brief resets only control state. Sinter needs a reset value on every
-register, and its Verilog resets each one asynchronously (`negedge rst_n`).
-Only `pipeline fn` registers and memory contents have no reset. The ECP5 has
-a global set/reset network (GSR) that might carry the reset without using
-general routing, possibly needing a primitive or attributes in the generated
-Verilog.
+brief resets only control state: sequencer counters, valid bits, buffer
+ownership. Sinter v1.0.0-rc.1 reset every register asynchronously; v1.0.0-rc.2
+added `#[no_reset]`, which gives a field's registers a power-on value only.
 
 ## Decision
 
-Datapath registers get reset values for now. Phase 7 finds out what Yosys and
-nextpnr do with Sinter's reset (local set/reset per slice, or GSR) and
-whether GSR is usable. Each later phase reports the reset net's fanout and
-any timing or congestion it causes. Per-register reset opt-out, or a GSR
-option in Sinter's code generation, is recorded as a sinter-lang requirement,
-to be built if the reports show it matters.
+Datapath registers, register banks, buffers and memories' read registers
+are `#[no_reset]`. Control state keeps its reset. Each phase that adds logic
+reports the reset net's fanout. The ECP5's global set/reset (GSR) isn't
+used; it can be revisited if the reports show the remaining reset net
+matters.
 
 ## Consequences
 
-- The design works on today's Sinter.
-- Reset fanout grows with the datapath; it's measured, not assumed.
+- A `#[no_reset]` register keeps its value through a reset, so a design must
+  not depend on it being cleared: control state decides when it is valid.
+- The stimulus tests can assert `rst_n` mid-run to check that.
