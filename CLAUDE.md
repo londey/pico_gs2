@@ -23,8 +23,10 @@ hw/                     Sinter sources (the design)
   gpu.snt               the root: the #[clock] struct the core module is named after
   sdram.snt             SDRAM controller (#[module])
   video.snt             video timing generator and TMDS encoder (#[module]s)
-  setup.snt             triangle setup engine (#[module]); not in the GPU until Phase 11
-  setup_tb.snt          its test root (sim/tb drives it); setup_synth.snt its synthesis root
+  setup.snt             triangle setup engine (#[module])
+  raster.snt            command parser (scene ROM) and rasteriser (traversal, tile buffer)
+  setup_tb.snt          the engine's test root (sim/tb drives it); setup_synth.snt its
+                        synthesis root
   *_tb.snt              test-harness roots that expose a block's ports to `sinter sim`
   tests/                directed stimulus: <root>.<case>.csv drives hw/<root>.snt
 sim/                    Rust workspace: testbenches (members include models/*)
@@ -32,7 +34,8 @@ sim/                    Rust workspace: testbenches (members include models/*)
 models/                 Rust models of external chips
   sdram/                W9825G6KH SDRAM: pin-level, checks datasheet timing
   setup/                setup engine models, microcode generator (setup-gen) and
-                        interpreter; a Cargo workspace of its own (just gen runs it first)
+                        interpreter, the test card (scene.rs) and the reference renderer
+                        (render.rs); a Cargo workspace of its own (just gen runs it first)
   reference/            sources the models were written from (datasheet, old C++)
 external/icepi-zero     board repo (git submodule): pin sites, examples
 scripts/  justfile      task runner; every recipe is a script in scripts/
@@ -133,7 +136,9 @@ Verilator report a false combinational loop (UNOPTFLAT) when the parent
 computes those inputs from that output in its single `always_comb`; register
 such outputs (as `SdramController` does `accepted`).
 
-The generated Verilog must stay lint-clean under `-Wall`. Verilator flags
+The generated Verilog must stay lint-clean under `-Wall`. `just lint` passes
+`--unused-regexp '*debug*'`: module outputs named `debug_*` exist only for
+tests (the setup engine's write ports) and may go unused in the GPU. Verilator flags
 unused bits of named wires, so don't bind a wide intermediate with `let` and
 narrow it later: cast in the same expression, or build shifted values with
 `@` and slices instead of `<<`.

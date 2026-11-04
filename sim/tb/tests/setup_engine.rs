@@ -149,28 +149,28 @@ fn writes(o: &Outputs, cycle: usize) -> Vec<Traced> {
         }
     };
     add(
-        o.out_alu_bank_we,
+        o.out_debug_alu_bank_we,
         Port::AluBank,
-        o.out_alu_bank_addr,
-        o.out_alu_bank_data,
+        o.out_debug_alu_bank_addr,
+        o.out_debug_alu_bank_data,
     );
     add(
-        o.out_mul_bank_we,
+        o.out_debug_mul_bank_we,
         Port::MulBank,
-        o.out_mul_bank_addr,
-        o.out_mul_bank_data,
+        o.out_debug_mul_bank_addr,
+        o.out_debug_mul_bank_data,
     );
     add(
-        o.out_alu_out_we,
+        o.out_debug_alu_out_we,
         Port::AluOut,
-        o.out_alu_out_addr,
-        o.out_alu_out_data,
+        o.out_debug_alu_out_addr,
+        o.out_debug_alu_out_data,
     );
     add(
-        o.out_mul_out_we,
+        o.out_debug_mul_out_we,
         Port::MulOut,
-        o.out_mul_out_addr,
-        o.out_mul_out_data,
+        o.out_debug_mul_out_addr,
+        o.out_debug_mul_out_data,
     );
     w
 }
@@ -263,7 +263,7 @@ fn check_triangle<W: Write>(
         Err(Reject::Culled) => (2, 0),
     };
     assert_eq!(
-        (done.out_result, done.out_flipped),
+        (done.out_result, done.out_debug_flipped),
         (result, flipped),
         "{tri:?} {cull:?}"
     );

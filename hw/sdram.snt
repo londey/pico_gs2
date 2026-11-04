@@ -86,11 +86,11 @@ pub struct SdramPins {
 // A request for a run of words.
 pub struct SdramReq {
     // 1 to write the run, 0 to read it.
-    pub write: u1,
+    pub write: u1 = 0,
     // Word address of the first word.
-    pub addr: u24,
+    pub addr: u24 = 0,
     // Words in the run, 1 to 32. The run mustn't cross a row (512 words).
-    pub len: u6,
+    pub len: u6 = 0,
 }
 
 pub struct SdramOut {

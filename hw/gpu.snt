@@ -3,7 +3,13 @@
 // A 640x360 RGB565 framebuffer in SDRAM, scanned out to 1280x720 DVI with
 // every framebuffer pixel shown as 2x2 screen pixels, all on the 75 MHz core
 // clock, which is also the pixel clock. After the SDRAM's power-up sequence
-// the core writes a test pattern into the framebuffer at word 0.
+// the core writes a test pattern into the framebuffer at word 0, then draws
+// the built-in scene over it (ADR 0002): the command parser feeds the setup
+// engine, and the rasteriser writes its triangles back block by block.
+//
+// The SDRAM controller has one request port; an arbiter shares it: the
+// fill until it is done, then scan-out loads first and the rasteriser's
+// writes in the gaps.
 //
 // The framebuffer is tiled (ADR 0003): 80 x 45 blocks of 8x8 pixels, block
 // (bx, by) the 64 words from (by * 80 + bx) * 64, its pixels in raster
@@ -16,12 +22,18 @@
 // board/top.sv serialises the TMDS symbols and owns the SDRAM's clock and
 // DQ buffers.
 
+mod raster;
 mod sdram;
+mod setup;
 mod video;
 
+use root::raster::Parser;
+use root::raster::Raster;
 use root::sdram::SdramController;
 use root::sdram::SdramPins;
 use root::sdram::SdramReq;
+use root::setup::RESULT_KEPT;
+use root::setup::SetupEngine;
 use root::video::TmdsEncoder;
 use root::video::VideoTiming;
 use root::video::cea_1280x720;
@@ -51,6 +63,12 @@ const LAST_SLOT: u8 = 191;
 // Half blocks in the frame: 90 half-block rows of 80.
 const FRAME_SLOTS: u13 = 7200;
 
+// Who an SDRAM request, or run, belongs to.
+const OWNER_NONE: u2 = 0;
+const OWNER_FILL: u2 = 1;
+const OWNER_SCAN: u2 = 2;
+const OWNER_RASTER: u2 = 3;
+
 // The screen's active area: the first pixel after it, and its last line.
 const H_ACTIVE: u11 = 1280;
 const V_LAST: u11 = 719;
@@ -61,6 +79,19 @@ struct Gpu {
     // Free-running counter for the heartbeat.
     count: u27 = 0,
     sdram: SdramController,
+    // The arbiter: the request in front of the controller, held in a
+    // register until it is accepted (so that choosing it isn't on the
+    // controller's paths), whose it is, and whose run the controller's
+    // words belong to.
+    granted: u2 = 0,
+    #[no_reset]
+    granted_req: SdramReq,
+    data_owner: u2 = 0,
+
+    // The triangle pipeline.
+    parser: Parser,
+    setup: SetupEngine,
+    raster: Raster,
 
     // The fill: high until the test pattern is in the framebuffer, the
     // address of its next run, and the pixel it writes next: pixel (px, py)
@@ -134,7 +165,7 @@ struct Gpu {
 struct Out {
     // The user LEDs, active high: led[0] the heartbeat (about 0.56 Hz),
     // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] a pixel's
-    // half block wasn't loaded in time.
+    // half block wasn't loaded in time, led[4] the scene is drawn.
     led: u5,
     sdram: SdramPins,
 }
@@ -157,27 +188,68 @@ impl Gpu {
         let in_use = (self.issued - self.freed) as u13 wrap;
         let reading = self.loading & self.issued != FRAME_SLOTS & in_use < RING;
         let load_addr = (self.load_rowbase + (0_u5 @ self.load_bx @ self.load_row[0:0] @ 0_u5)) as u18 wrap;
-        let req: Option<SdramReq> = if self.filling == 1 {
-            Some(SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN })
-        } else if reading == 1 {
-            Some(SdramReq { write: 0, addr: 0_u6 @ load_addr, len: RUN })
-        } else {
-            None
+        // The triangle pipeline's outputs, from its registers.
+        let pout = self.parser.out();
+        let rout = self.raster.out();
+        let (setup, sout) = self.setup.step(pout.load, pout.start, rout.out_raddr);
+        let kept = sout.done & sout.result == RESULT_KEPT;
+        let free = !sout.busy & !sout.done & !rout.pending;
+        let starting = match pout.start {
+            Some(_) => 1_u1,
+            None => 0_u1,
         };
+        let ring_free = !sout.busy & !starting;
+        let scene_done = pout.done & !sout.busy & !rout.busy;
+
+        // The arbiter: a request, once chosen, is in front of the controller
+        // from the next cycle until it is accepted. Requesters hold theirs
+        // until they are accepted, so choosing a cycle early changes nothing
+        // but when it is taken.
+        let (raster_wants, raster_req) = match rout.req {
+            Some(r) => (1_u1, r),
+            None => (0_u1, SdramReq { write: 1, addr: 0, len: 0 }),
+        };
+        let choice: u2 = if self.filling == 1 {
+            OWNER_FILL
+        } else if reading == 1 {
+            OWNER_SCAN
+        } else if raster_wants == 1 {
+            OWNER_RASTER
+        } else {
+            OWNER_NONE
+        };
+        let chosen_req = if choice == OWNER_FILL {
+            SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN }
+        } else if choice == OWNER_SCAN {
+            SdramReq { write: 0, addr: 0_u6 @ load_addr, len: RUN }
+        } else {
+            raster_req
+        };
+        let req: Option<SdramReq> = if self.granted != OWNER_NONE { Some(self.granted_req) } else { None };
         let x = self.fill_bx @ self.fill_px;
         let y = 0_u1 @ self.fill_by @ self.fill_py;
-        let (sdram, mem) = self.sdram.step(req, pattern(x, y), 0, sdram_dq);
+        let fill_run = self.data_owner == OWNER_FILL;
+        let wdata = if fill_run { pattern(x, y) } else { rout.wdata };
+        let wmask: u1 = if fill_run { 0 } else { rout.wmask };
+        let (sdram, mem) = self.sdram.step(req, wdata, wmask, sdram_dq);
+        // `accepted` is for the request granted last cycle; `wtake` for the
+        // run accepted before it.
+        let accepted_fill = mem.accepted & self.granted == OWNER_FILL;
+        let accepted_scan = mem.accepted & self.granted == OWNER_SCAN;
+        let accepted_raster = mem.accepted & self.granted == OWNER_RASTER;
+        let wtake_fill = mem.wtake & self.data_owner == OWNER_FILL;
+        let wtake_raster = mem.wtake & self.data_owner == OWNER_RASTER;
 
         // The fill, in word order: px, then py, then bx, then by.
-        let last_run = self.filling & mem.accepted & self.fill_addr == LAST_RUN;
-        let fill_addr = if self.filling & mem.accepted { (self.fill_addr + RUN) as u18 wrap } else { self.fill_addr };
-        let next_py = mem.wtake & self.fill_px == 7;
+        let last_run = accepted_fill & self.fill_addr == LAST_RUN;
+        let fill_addr = if accepted_fill { (self.fill_addr + RUN) as u18 wrap } else { self.fill_addr };
+        let next_py = wtake_fill & self.fill_px == 7;
         let next_bx = next_py & self.fill_py == 7;
         let next_by = next_bx & self.fill_bx == LAST_BX;
         let fill_bx: u7 = if next_by { 0 } else if next_bx { (self.fill_bx + 1) as u7 wrap } else { self.fill_bx };
 
         // The loads: the next request after each one is taken.
-        let took = self.loading & mem.accepted;
+        let took = accepted_scan;
         let row_done = took & self.load_bx == LAST_BX;
         let load_bx: u7 = if row_done { 0 } else if took { (self.load_bx + 1) as u7 wrap } else { self.load_bx };
         let load_rowbase = if row_done & self.load_row[0:0] == 1 {
@@ -220,9 +292,21 @@ impl Gpu {
             Gpu {
                 count: (self.count + 1) as u27 wrap,
                 sdram: sdram,
+                granted: if mem.accepted == 1 {
+                    OWNER_NONE
+                } else if self.granted != OWNER_NONE {
+                    self.granted
+                } else {
+                    choice
+                },
+                granted_req: if self.granted == OWNER_NONE { chosen_req } else { self.granted_req },
+                data_owner: if mem.accepted == 1 { self.granted } else { self.data_owner },
+                parser: self.parser.next(!self.filling, free, ring_free),
+                setup: setup,
+                raster: self.raster.next(kept, sout.rdata, accepted_raster, wtake_raster),
                 filling: self.filling & !last_run,
                 fill_addr: fill_addr,
-                fill_px: if mem.wtake { (self.fill_px + 1) as u3 wrap } else { self.fill_px },
+                fill_px: if wtake_fill { (self.fill_px + 1) as u3 wrap } else { self.fill_px },
                 fill_py: if next_py { (self.fill_py + 1) as u3 wrap } else { self.fill_py },
                 fill_bx: fill_bx,
                 fill_by: if next_by { (self.fill_by + 1) as u6 wrap } else { self.fill_by },
@@ -264,7 +348,7 @@ impl Gpu {
                 tmds_red: red.symbol,
             },
             Out {
-                led: 0_u1 @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
+                led: scene_done @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
                 sdram: mem.pins,
             },
         )

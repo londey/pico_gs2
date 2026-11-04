@@ -15,6 +15,8 @@
 //!   operations, [`schedule`] turns it into micro-words ([`isa`]), and
 //!   [`interp::run`] executes them cycle by cycle: the golden model of the
 //!   Sinter engine.
+//! - [`scene`] is the host's side of a scene: command packets and the
+//!   built-in test card; [`render::render`] is what the GPU draws for one.
 //!
 //! Number formats use Sinter's (and `qfixed`'s) Q notation: `Q<I, F>` has
 //! `I` integer bits **including** the sign and `F` fraction bits (ADR 0007).
@@ -38,6 +40,8 @@ pub mod interp;
 pub mod isa;
 mod program;
 mod reciprocal;
+pub mod render;
+pub mod scene;
 mod schedule;
 mod setup;
 pub mod traverse;

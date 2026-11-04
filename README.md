@@ -36,10 +36,14 @@ which is lost at power off; add `--write-flash` to keep it.
 ## On the board
 
 The design fills a 640x360 RGB565 framebuffer in the SDRAM, stored as
-tiled 8x8 blocks, with a test pattern and scans it out to the GPDI (mini HDMI) port as 1280x720 at 60 Hz
-(720p), each framebuffer pixel shown as 2x2 screen pixels: red rising left
-to right, green rising top to bottom, a blue checkerboard of 32-pixel
-squares and a one-pixel white border. The LEDs show:
+tiled 8x8 blocks, with a test pattern, then draws a built-in test card of
+Gouraud-shaded triangles over it, and scans it out to the GPDI (mini HDMI)
+port as 1280x720 at 60 Hz (720p), each framebuffer pixel shown as 2x2
+screen pixels. The test pattern: red rising left to right, green rising top
+to bottom, a blue checkerboard of 32-pixel squares and a one-pixel white
+border. The test card: a large triangle, a ribbon, a 16-triangle fan,
+overlapping triangles, slivers and tiny triangles, triangles crossing the
+screen's edges, and black-to-white shading. The LEDs show:
 
 | LED | Lit when |
 |---|---|
@@ -47,3 +51,4 @@ squares and a one-pixel white border. The LEDs show:
 | `led[1]` | the SDRAM has been initialised |
 | `led[2]` | the framebuffer has been filled |
 | `led[3]` | part of the picture wasn't loaded from SDRAM in time (it never should be) |
+| `led[4]` | the test card has been drawn |

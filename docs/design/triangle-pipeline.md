@@ -109,18 +109,26 @@ These are defaults, refined in the phase that builds each block.
 
 ### 6.1 Command packets
 
-32-bit words, from the scene ROM now and the SPI link later:
+32-bit words, from the scene ROM now and the SPI link later. As built in
+Phase 11 (`models/setup/src/scene.rs`, `hw/raster.snt`), a command is a
+header word, then its vertices:
 
-| Word | Meaning |
+| Header bits | Field |
 |---|---|
-| `0x1` header: `kind`, `cull`, `program` | Start a strip (`kind` 0) or fan (`kind` 1); `cull` NONE/BACK/FRONT; `program` full/untextured/flat. Followed by vertices. |
-| vertex, 4 words | `x @ y` (two `i12.4`), `R @ G @ B @ A`, `Z @ Q`, `S′ @ T′` |
-| `0x2` end of primitive | |
-| `0x3` clear | Clear the back buffer's colour (to a given RGB565) and Z (to 0xFFFF). |
-| `0x4` end of frame | Hand the back buffer to the display (§6.4). |
+| 31:28 | opcode: 1 strip, 2 fan, 15 end of scene |
+| 27:26 | cull mode: 0 none, 1 back, 2 front |
+| 25 | 1 for the untextured program |
+| 15:0 | vertices that follow (3 or more) |
 
-The first three vertices of a strip or fan make a triangle; each later
-vertex makes one more, overwriting the ring slot the brief §4.1 names.
+A vertex is four words: `x @ y` (two `Q12.4` counts), `R @ G @ B @ A`,
+`Z @ Q`, `S′ @ T′`. A strip's vertex `i` makes triangle `(i-2, i-1, i)`,
+with roles 1 and 2 swapped on odd triangles so that a strip winds one way;
+a fan's makes `(0, i-1, i)`. Strips cycle through ring slots 0–3, fans keep
+slot 0 for their first vertex and cycle 1–3, so the next vertex always loads
+into a slot the running triangle isn't using. A new primitive starts again
+from slot 0, so the parser waits for the ring to be free first.
+
+Clear and end-of-frame commands come with Phase 12.
 
 ### 6.2 Setup output record
 
@@ -194,6 +202,18 @@ measured.
 **SDRAM controller change:** a write mask per word, taken with the word on
 `wtake` and driven on DQM. Runs stay at up to 32 words, so the refresh
 timing doesn't change.
+
+**As built in Phase 11** (no Z yet, so no Z read): the rasteriser copies 22
+slots (edges, box, R, G, B planes) out of the engine's committed output
+buffer, then releases it, so the next triangle's setup overlaps this one's
+traversal. Per block: TEST (each edge's largest value over the block's
+corners, from a per-triangle corner offset), DECIDE a cycle later, 64 pixel
+cycles into the tile buffer, then one masked 32-word run per half block
+with a covered pixel. Colour is each plane's iterator rounded to 5/6/5 bits
+and clamped. The arbiter registers the request it puts in front of the
+controller (fill, then scan-out first, then the rasteriser). The test card
+(48 triangles, 47 kept, about 94,500 pixels) draws in 579,360 cycles from
+reset, under half a frame after the fill.
 
 ## 7. Verification
 

@@ -60,17 +60,17 @@ pub const RESULT_CULLED: u2 = 2;
 // A write to the vertex ring: field `field` of slot `slot`, as a 36-bit
 // word (coordinates and S', T' sign-extended, the rest zero-extended).
 pub struct VertexWrite {
-    pub slot: u2,
-    pub field: u4,
-    pub value: u36,
+    pub slot: u2 = 0,
+    pub field: u4 = 0,
+    pub value: u36 = 0,
 }
 
 // Start a triangle: the ring slot of each role (role 0 in bits 5:4), the
 // cull mode (0 none, 1 back, 2 front), and the program.
 pub struct Start {
-    pub roles: u6,
-    pub cull: u2,
-    pub untextured: u1,
+    pub roles: u6 = 0b000110,
+    pub cull: u2 = 0,
+    pub untextured: u1 = 0,
 }
 
 // One memory's write port, as the engine drives it this cycle.
@@ -83,18 +83,19 @@ pub struct WritePort {
 pub struct SetupOut {
     // A triangle is in progress: a start is ignored.
     pub busy: u1,
-    // High for one cycle after a triangle finishes, with its result and
-    // whether its roles 1 and 2 were swapped.
+    // High for one cycle after a triangle finishes, with its result.
     pub done: u1,
     pub result: u2,
-    pub flipped: u1,
     // The committed output buffer's slot `out_raddr` of the last cycle.
     pub rdata: u36,
-    // The write ports, for the cycle-exact test against the interpreter.
-    pub alu_bank: WritePort,
-    pub mul_bank: WritePort,
-    pub alu_out: WritePort,
-    pub mul_out: WritePort,
+    // For tests only (`just lint` doesn't require `debug_` outputs to be
+    // used): whether the last triangle's roles 1 and 2 were swapped, and
+    // the write ports, for the cycle-exact test against the interpreter.
+    pub debug_flipped: u1,
+    pub debug_alu_bank: WritePort,
+    pub debug_mul_bank: WritePort,
+    pub debug_alu_out: WritePort,
+    pub debug_mul_out: WritePort,
 }
 
 // An issued ALU word, on its way to its operands.
@@ -537,12 +538,12 @@ impl SetupEngine {
                 busy: self.running,
                 done: self.done,
                 result: self.result,
-                flipped: self.done_flipped,
                 rdata: rdata,
-                alu_bank: alu_bank_w,
-                mul_bank: mul_bank_w,
-                alu_out: alu_out_w,
-                mul_out: mul_out_w,
+                debug_flipped: self.done_flipped,
+                debug_alu_bank: alu_bank_w,
+                debug_mul_bank: mul_bank_w,
+                debug_alu_out: alu_out_w,
+                debug_mul_out: mul_out_w,
             },
         )
     }

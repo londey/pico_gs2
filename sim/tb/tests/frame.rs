@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 use gpu_sim::{Gpu, Inputs, Outputs};
 use sdram_model::Pins;
+use setup_model::render::render;
+use setup_model::scene::{encode, test_card};
 use tb::{decode, SdramBus, Symbol};
 
 /// Active pixels per line (CEA-861 1280x720 at 60 Hz).
@@ -61,17 +63,31 @@ const SCALE: usize = 2;
 /// registers.
 const SYMBOL_LATENCY: usize = 6;
 
-/// Frames to run: the SDRAM's power-up and the fill take about a quarter of
-/// a frame, the scan-out starts at the next frame, and two are checked.
-const MAX_FRAMES: usize = 4;
+/// Frames to run at most: the SDRAM's power-up and the fill take about a
+/// quarter of a frame, the scene is drawn after that, and two frames that
+/// start after it is drawn are checked.
+const MAX_FRAMES: usize = 8;
 
 /// Frames scanned out of SDRAM to check.
 const CHECKED_FRAMES: usize = 2;
 
-/// LED bits: SDRAM initialised, framebuffer filled, scan-out underflow.
+/// LED bits: SDRAM initialised, framebuffer filled, scan-out underflow,
+/// scene drawn.
 const LED_SDRAM_READY: u8 = 1 << 1;
 const LED_FILLED: u8 = 1 << 2;
 const LED_UNDERFLOW: u8 = 1 << 3;
+const LED_DRAWN: u8 = 1 << 4;
+
+/// What the framebuffer should hold once the scene is drawn: the test
+/// pattern, with the built-in test card drawn over it by the reference
+/// renderer.
+fn expected() -> Vec<u16> {
+    let mut fb: Vec<u16> = (0..FB_HEIGHT)
+        .flat_map(|y| (0..FB_WIDTH).map(move |x| pattern(x, y)))
+        .collect();
+    render(&mut fb, &encode(&test_card()));
+    fb
+}
 
 /// The test pattern `hw/gpu.snt` writes, as RGB565: a white border, red
 /// rising to the right, green rising downwards, blue on alternate 32x32
@@ -128,9 +144,12 @@ struct Run {
     /// The SDRAM and its bus, at the end.
     bus: SdramBus,
 
-    /// The (blue, green, red) TMDS symbols of the first frames whose first
-    /// pixel isn't black, each in raster order.
+    /// The (blue, green, red) TMDS symbols of the first frames that start
+    /// after the scene is drawn, each in raster order.
     frames: Vec<Vec<[u16; 3]>>,
+
+    /// The cycle the scene was drawn by.
+    drawn_at: Option<usize>,
 
     /// The LEDs at the end.
     led: u8,
@@ -173,6 +192,7 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
     let mut frames = Vec::new();
     let mut frame = Vec::with_capacity(FRAME);
     let mut led = 0;
+    let mut drawn_at = None;
     writeln!(
         stimulus,
         "# Recorded by sim/tb/tests/frame.rs; replayed by `just check`."
@@ -187,14 +207,17 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
         writeln!(stimulus, "{}", inputs.sdram_dq)?;
         let out = sim.step(&inputs);
         led = out.out_led;
+        if drawn_at.is_none() && led & LED_DRAWN != 0 {
+            drawn_at = Some(cycle);
+        }
         if cycle < SYMBOL_LATENCY {
             continue;
         }
+        // A frame is checked if the scene was drawn before it started.
+        let drawn_before = drawn_at.is_some_and(|c| c + FRAME <= cycle - frame.len());
         frame.push([out.tmds_blue_q, out.tmds_green_q, out.tmds_red_q]);
         if frame.len() == FRAME {
-            // Before the scan-out starts the picture is black; the first
-            // frame scanned out starts with its white border.
-            if !frames.is_empty() || decode(frame[0][2]) != Symbol::Data(0) {
+            if drawn_before {
                 frames.push(std::mem::take(&mut frame));
                 if frames.len() == CHECKED_FRAMES {
                     break;
@@ -204,18 +227,38 @@ fn run(stimulus: &mut impl Write) -> std::io::Result<Run> {
         }
     }
     stimulus.flush()?;
-    Ok(Run { bus, frames, led })
+    Ok(Run {
+        bus,
+        frames,
+        drawn_at,
+        led,
+    })
 }
 
-/// The first frame scanned out of SDRAM shows the test pattern, the sync
-/// timing is right at every pixel, and the SDRAM was driven by the book.
+/// Once the scene is drawn, the frames scanned out of SDRAM show the test
+/// pattern with the test card drawn over it exactly as the reference
+/// renderer draws it, the sync timing is right at every pixel, the
+/// framebuffer in SDRAM is exactly the reference's, and the SDRAM was
+/// driven by the book.
 #[test]
 fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
     let path = build_path(&["stimulus", "gpu.frame.csv"]);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let Run { bus, frames, led } = run(&mut BufWriter::new(File::create(path)?))?;
+    let Run {
+        bus,
+        frames,
+        drawn_at,
+        led,
+    } = run(&mut BufWriter::new(File::create(path)?))?;
+    let drawn_at = drawn_at.ok_or("the scene was never drawn")?;
+    println!(
+        "scene drawn by cycle {drawn_at} ({:.2} frames)",
+        f64::from(u32::try_from(drawn_at).expect("small"))
+            / f64::from(u32::try_from(FRAME).expect("small"))
+    );
+    let fb = expected();
     assert_eq!(
         frames.len(),
         CHECKED_FRAMES,
@@ -231,7 +274,7 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
     let pictures: Vec<_> = frames
         .iter()
         .enumerate()
-        .map(|(n, frame)| check_frame(n, frame))
+        .map(|(n, frame)| check_frame(n, frame, &fb))
         .collect();
 
     // The framebuffer, tiled, in bank 0 from row 0.
@@ -240,15 +283,15 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
             let addr = tiled(x, y);
             assert_eq!(
                 bus.sdram.peek(0, addr >> 9, addr & 0x1FF),
-                pattern(x, y),
+                fb[y * FB_WIDTH + x],
                 "SDRAM word for ({x}, {y})"
             );
         }
     }
 
     assert_eq!(
-        led & (LED_SDRAM_READY | LED_FILLED | LED_UNDERFLOW),
-        LED_SDRAM_READY | LED_FILLED,
+        led & (LED_SDRAM_READY | LED_FILLED | LED_UNDERFLOW | LED_DRAWN),
+        LED_SDRAM_READY | LED_FILLED | LED_DRAWN,
         "LEDs {led:#07b}"
     );
     write_png(&pictures[0])
@@ -269,13 +312,13 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
 /// # Panics
 ///
 /// If any symbol isn't the one expected.
-fn check_frame(n: usize, frame: &[[u16; 3]]) -> Vec<u8> {
+fn check_frame(n: usize, frame: &[[u16; 3]], fb: &[u16]) -> Vec<u8> {
     let mut picture = Vec::with_capacity(H_ACTIVE * V_ACTIVE * 3);
     for (i, symbols) in frame.iter().enumerate() {
         let (x, y) = (i % H_TOTAL, i / H_TOTAL);
         let [blue, green, red] = symbols.map(decode);
         if x < H_ACTIVE && y < V_ACTIVE {
-            let [r, g, b] = rgb888(pattern(x / SCALE, y / SCALE));
+            let [r, g, b] = rgb888(fb[(y / SCALE) * FB_WIDTH + x / SCALE]);
             assert_eq!(
                 (red, green, blue),
                 (Symbol::Data(r), Symbol::Data(g), Symbol::Data(b)),

@@ -36,10 +36,10 @@ impl SetupSynth {
             None
         };
         let (engine, o) = self.engine.step(load, start, l[58:53]);
-        let words = o.rdata ^ o.alu_bank.data ^ o.mul_bank.data ^ o.alu_out.data ^ o.mul_out.data;
-        let flags = o.busy @ o.done @ o.result @ o.flipped @ o.alu_bank.we @ o.mul_bank.we @ o.alu_out.we;
-        let addrs = (o.alu_bank.addr @ o.mul_out.we @ o.mul_bank.addr[0:0])
-            ^ (o.alu_out.addr @ o.mul_out.addr[1:0]);
+        let words = o.rdata ^ o.debug_alu_bank.data ^ o.debug_mul_bank.data ^ o.debug_alu_out.data ^ o.debug_mul_out.data;
+        let flags = o.busy @ o.done @ o.result @ o.debug_flipped @ o.debug_alu_bank.we @ o.debug_mul_bank.we @ o.debug_alu_out.we;
+        let addrs = (o.debug_alu_bank.addr @ o.debug_mul_out.we @ o.debug_mul_bank.addr[0:0])
+            ^ (o.debug_alu_out.addr @ o.debug_mul_out.addr[1:0]);
         let w = self.words;
         let fold = w[7:0] ^ w[15:8] ^ w[23:16] ^ w[31:24] ^ (0_u4 @ w[35:32]) ^ self.flags ^ self.addrs;
         SetupSynth {

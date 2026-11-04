@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(dir.join("setup_mul.hex"), &g.mul_hex)?;
     fs::write(dir.join("setup_alu.hex"), &g.alu_hex)?;
     fs::write(dir.join("setup_seed.hex"), &g.seed_hex)?;
+    fs::write(dir.join("scene.hex"), &g.scene_hex)?;
     fs::write(dir.join("setup_report.txt"), &g.report)?;
     print!("{}", g.report);
     Ok(())

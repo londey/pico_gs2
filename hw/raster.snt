@@ -1,0 +1,680 @@
+// The front and back of the triangle pipeline around the setup engine
+// (docs/design/triangle-pipeline.md §6):
+//
+//   Parser  reads the scene ROM's command packets, writes vertices into the
+//           setup engine's ring and starts its triangles.
+//   Raster  copies a set-up triangle out of the engine's output buffer,
+//           walks its bounding box in 8x8 blocks, steps the edge functions
+//           and the colour planes one pixel per clock into a tile buffer,
+//           and writes each half block with a covered pixel back to the
+//           tiled framebuffer as one masked 32-word SDRAM run.
+//
+// The golden model is models/setup's reference renderer (render.rs); the
+// frame test compares the framebuffer with it pixel for pixel.
+//
+// Both are plain structs inlined into the GPU, not #[module]s: each has
+// `out`, its outputs from its registers alone, and `next`, its next state
+// from its inputs. The GPU needs their outputs before it can step the
+// setup engine and the SDRAM controller, whose outputs are their inputs.
+
+use root::sdram::SdramReq;
+use root::setup::Start;
+use root::setup::VertexWrite;
+
+// Command opcodes (models/setup/src/scene.rs).
+const OP_STRIP: u4 = 1;
+const OP_FAN: u4 = 2;
+
+// Parser states.
+const P_FETCH: u3 = 0;
+const P_DECODE: u3 = 1;
+const P_WRITE: u3 = 2;
+const P_START: u3 = 3;
+const P_DONE: u3 = 4;
+const P_HEAD: u3 = 5;
+
+// Raster states.
+const R_IDLE: u3 = 0;
+const R_COPY: u3 = 1;
+const R_INIT: u3 = 2;
+const R_TEST: u3 = 3;
+const R_PIXELS: u3 = 4;
+const R_WRITE: u3 = 5;
+const R_NEXT: u3 = 6;
+const R_DECIDE: u3 = 7;
+
+// How the edge and plane registers move this cycle.
+const M_INIT: u3 = 0;
+const M_BLOCK: u3 = 1;
+const M_PIXEL: u3 = 2;
+const M_ROW: u3 = 3;
+const M_NEXT_COL: u3 = 4;
+const M_NEXT_ROW: u3 = 5;
+const M_HOLD: u3 = 6;
+
+// Output buffer slots copied, in order (see copy_slot).
+const COPY_SLOTS: u5 = 22;
+
+pub struct ParserOut {
+    pub load: Option<VertexWrite>,
+    pub start: Option<Start>,
+    // Every triangle of the scene has been started.
+    pub done: u1,
+}
+
+pub struct Parser {
+    state: u3 = 0,
+    // The next word to fetch.
+    addr: u10 = 0,
+    // The current primitive: fan (else strip), cull mode, program, its
+    // vertices, and the vertex being loaded.
+    fan: u1 = 0,
+    cull: u2 = 0,
+    untextured: u1 = 0,
+    count: u16 = 0,
+    vertex: u16 = 0,
+    // The next word is a header.
+    header: u1 = 1,
+    // The vertex word being written out (0 to 3), and its next field.
+    word_k: u2 = 0,
+    field_j: u2 = 0,
+    // The ring slots of the vertex two back, one back, and this one.
+    s0: u2 = 0,
+    s1: u2 = 0,
+    s2: u2 = 3,
+    // The registered outputs.
+    load_valid: u1 = 0,
+    start_valid: u1 = 0,
+    #[no_reset]
+    word: u32 = 0,
+    #[no_reset]
+    load: VertexWrite,
+    #[no_reset]
+    start: Start,
+    // The scene (generated: build/gen/scene.hex).
+    #[storage(bram)]
+    #[no_reset]
+    rom: rom<u32, 1024> = include_hex!("../build/gen/scene.hex"),
+}
+
+impl Parser {
+    // The outputs, from the registers.
+    pub fn out(self) -> ParserOut {
+        ParserOut {
+            load: if self.load_valid == 1 { Some(self.load) } else { None },
+            start: if self.start_valid == 1 { Some(self.start) } else { None },
+            done: (self.state == P_DONE),
+        }
+    }
+
+    // `enable`: parse (after the framebuffer fill). `free`: the setup
+    // engine can take a triangle: idle, and its last outputs copied.
+    // `ring_free`: no triangle is using the vertex ring: the engine is idle
+    // and no start is on its way to it.
+    pub fn next(self, enable: u1, free: u1, ring_free: u1) -> Self {
+        let w = self.rom.value();
+        let last_field = if self.word_k == 1 { self.field_j == 3 } else { self.field_j == 1 };
+        let last_word = self.word_k == 3;
+        let first_field = self.state == P_WRITE & self.word_k == 0 & self.field_j == 0;
+        // A vertex's ring slot is one no triangle still needs: a strip
+        // cycles through 0 to 3; a fan keeps 0 for its first vertex and
+        // cycles the rest through 1 to 3.
+        let new_slot: u2 = if self.fan == 1 & self.vertex == 0 {
+            0
+        } else if self.fan == 1 & self.s2 == 3 {
+            1
+        } else {
+            (self.s2 + 1) as u2 wrap
+        };
+        // A strip's odd triangles have roles 1 and 2 swapped.
+        let roles: u6 = if self.fan == 1 {
+            0_u2 @ self.s1 @ self.s2
+        } else if self.vertex[0:0] == 1 {
+            self.s1 @ self.s0 @ self.s2
+        } else {
+            self.s0 @ self.s1 @ self.s2
+        };
+
+        // The field written this cycle, and its 36-bit value (signed fields
+        // sign-extended).
+        let hi = self.word[31:16];
+        let lo = self.word[15:0];
+        let sext_hi = ((hi as i16 wrap) as i36 wrap) as u36 wrap;
+        let sext_lo = ((lo as i16 wrap) as i36 wrap) as u36 wrap;
+        let byte = if self.field_j == 0 {
+            self.word[31:24]
+        } else if self.field_j == 1 {
+            self.word[23:16]
+        } else if self.field_j == 2 {
+            self.word[15:8]
+        } else {
+            self.word[7:0]
+        };
+        let field: u4 = if self.word_k == 0 {
+            0_u3 @ self.field_j[0:0]
+        } else if self.word_k == 1 {
+            (2 + (0_u2 @ self.field_j)) as u4 wrap
+        } else if self.word_k == 2 {
+            if self.field_j == 0 { 6 } else { 9 }
+        } else if self.field_j == 0 {
+            7
+        } else {
+            8
+        };
+        let value: u36 = if self.word_k == 1 {
+            0_u28 @ byte
+        } else if self.word_k == 2 {
+            if self.field_j == 0 { 0_u20 @ hi } else { 0_u20 @ lo }
+        } else if self.field_j == 0 {
+            sext_hi
+        } else {
+            sext_lo
+        };
+
+        let st = self.state;
+        let starting = st == P_START & free == 1;
+        let next_vertex = (self.vertex + 1) as u16 wrap;
+        let next = if st == P_FETCH {
+            Self { state: if enable == 1 { P_DECODE } else { P_FETCH }, ..self }
+        } else if st == P_DECODE {
+            // The word is registered before it is decoded: a header decides
+            // the next address, and the ROM's output is too slow to.
+            if self.header == 0 {
+                Self { state: P_WRITE, word: w, field_j: 0, ..self }
+            } else {
+                Self { state: P_HEAD, word: w, ..self }
+            }
+        } else if st == P_HEAD {
+            let op = self.word[31:28];
+            if ring_free == 0 {
+                // A new primitive's vertices start again from slot 0, which
+                // the last triangle may still be using: wait for it.
+                self
+            } else if op == OP_STRIP | op == OP_FAN {
+                Self {
+                    state: P_FETCH,
+                    addr: (self.addr + 1) as u10 wrap,
+                    fan: (op == OP_FAN),
+                    cull: self.word[27:26],
+                    untextured: self.word[25:25],
+                    count: self.word[15:0],
+                    vertex: 0,
+                    header: 0,
+                    word_k: 0,
+                    s2: 3,
+                    ..self
+                }
+            } else {
+                Self { state: P_DONE, ..self }
+            }
+        } else if st == P_WRITE {
+            if !last_field {
+                Self { field_j: (self.field_j + 1) as u2 wrap, ..self }
+            } else if !last_word {
+                Self {
+                    state: P_FETCH,
+                    addr: (self.addr + 1) as u10 wrap,
+                    word_k: (self.word_k + 1) as u2 wrap,
+                    ..self
+                }
+            } else if self.vertex >= 2 {
+                Self { state: P_START, ..self }
+            } else {
+                Self {
+                    state: P_FETCH,
+                    addr: (self.addr + 1) as u10 wrap,
+                    word_k: 0,
+                    vertex: next_vertex,
+                    header: (next_vertex == self.count),
+                    ..self
+                }
+            }
+        } else if st == P_START {
+            if starting {
+                Self {
+                    state: P_FETCH,
+                    addr: (self.addr + 1) as u10 wrap,
+                    word_k: 0,
+                    vertex: next_vertex,
+                    header: (next_vertex == self.count),
+                    ..self
+                }
+            } else {
+                self
+            }
+        } else {
+            self
+        };
+        Self {
+                // A vertex's slot is fixed as its first field is written.
+                s0: if first_field { self.s1 } else { next.s0 },
+                s1: if first_field { self.s2 } else { next.s1 },
+                s2: if first_field { new_slot } else { next.s2 },
+                load_valid: (st == P_WRITE),
+                start_valid: starting,
+                load: VertexWrite {
+                    slot: if first_field { new_slot } else { self.s2 },
+                    field: field,
+                    value: value,
+                },
+                start: Start { roles: roles, cull: self.cull, untextured: self.untextured },
+                rom: self.rom.next(next.addr),
+                ..next
+        }
+    }
+}
+
+pub struct RasterOut {
+    // The setup engine's output buffer slot to read.
+    pub out_raddr: u6,
+    // A kept triangle's outputs are waiting to be copied: the engine must
+    // not start another.
+    pub pending: u1,
+    // Copying or drawing a triangle.
+    pub busy: u1,
+    // A write run, held until `accepted`.
+    pub req: Option<SdramReq>,
+    // The word, and whether to leave it as it was, taken on `wtake`.
+    pub wdata: u16,
+    pub wmask: u1,
+}
+
+// One edge function: A and B (Q13.4 counts), whether a value of 0 is
+// inside (a top or left edge), and its value (Q26.8 counts, widened) at
+// the current pixel, the current pixel row's start, the current block's
+// start, and the current block row's start.
+struct EdgeState {
+    a: i17 = 0,
+    b: i17 = 0,
+    tie: u1 = 0,
+    // How far the edge's value can rise from a block's first pixel to its
+    // other corners: 112 * max(A, 0) + 112 * max(B, 0).
+    corner: i24 = 0,
+    pix: i40 = 0,
+    row: i40 = 0,
+    blk: i40 = 0,
+    blkrow: i40 = 0,
+}
+
+// One colour plane: d/dx and d/dy, and its value (36-bit iterator counts,
+// wrapping) at the current pixel, pixel row, block and block row.
+struct PlaneState {
+    dx: i36 = 0,
+    dy: i36 = 0,
+    pix: i36 = 0,
+    row: i36 = 0,
+    blk: i36 = 0,
+    blkrow: i36 = 0,
+}
+
+pub struct Raster {
+    state: u3 = 0,
+    pending: u1 = 0,
+    // COPY: the slot being addressed.
+    copy: u5 = 0,
+    // The bounding box (Q12.4 counts), its first and last blocks, and the
+    // current block.
+    #[no_reset]
+    xs: i16 = 0,
+    #[no_reset]
+    ys: i16 = 0,
+    #[no_reset]
+    xmax: i16 = 0,
+    #[no_reset]
+    ymax: i16 = 0,
+    #[no_reset]
+    bx0: i10 = 0,
+    #[no_reset]
+    bx1: i10 = 0,
+    #[no_reset]
+    by1: i10 = 0,
+    #[no_reset]
+    bx: i10 = 0,
+    #[no_reset]
+    by: i10 = 0,
+    #[no_reset]
+    e0: EdgeState,
+    #[no_reset]
+    e1: EdgeState,
+    #[no_reset]
+    e2: EdgeState,
+    #[no_reset]
+    pr: PlaneState,
+    #[no_reset]
+    pg: PlaneState,
+    #[no_reset]
+    pb: PlaneState,
+    // PIXELS: the pixel (py @ px); WRITE: the word being sent.
+    pix: u6 = 0,
+    // Which of the block's pixels are covered.
+    #[no_reset]
+    mask: u64 = 0,
+    // TEST's verdict, acted on in DECIDE.
+    rejected: u1 = 0,
+    // WRITE: the half block, and whether its run has been taken.
+    half: u1 = 0,
+    requested: u1 = 0,
+    // The block's colours, in raster order.
+    #[storage(lutram)]
+    #[no_reset]
+    tile: mem<u16, 64> = 0,
+}
+
+impl Raster {
+    // The half block being written has a covered pixel.
+    fn half_used(self) -> u1 {
+        if self.half == 0 { self.mask[31:0] != 0 } else { self.mask[63:32] != 0 }
+    }
+
+    // A write run is wanted: writing a half block with a covered pixel,
+    // its run not yet taken.
+    fn want(self) -> u1 {
+        self.state == R_WRITE & self.half_used() & self.requested == 0
+    }
+
+    // The outputs, from the registers.
+    pub fn out(self) -> RasterOut {
+        let addr = (block_base(self.bx, self.by) + (0_u13 @ self.half @ 0_u5)) as u19 wrap;
+        RasterOut {
+            out_raddr: copy_slot(self.copy),
+            pending: self.pending,
+            busy: self.state != R_IDLE | self.pending == 1,
+            req: if self.want() { Some(SdramReq { write: 1, addr: 0_u5 @ addr, len: 32 }) } else { None },
+            wdata: self.tile.value(),
+            wmask: !((self.mask >> self.pix)[0:0]),
+        }
+    }
+
+    // `kept`: the setup engine has just finished a triangle it kept.
+    // `rdata`: the output buffer slot addressed last cycle. `accepted`,
+    // `wtake`: the SDRAM controller's, for this unit's runs.
+    pub fn next(self, kept: u1, rdata: u36, accepted: u1, wtake: u1) -> Self {
+        let st = self.state;
+
+        // ---- COPY: each slot arrives a cycle after its address. --------
+        let got = st == R_COPY & self.copy != 0;
+        let k = (self.copy - 1) as u5 wrap;
+        let word = rdata as i36 wrap;
+        let copy_done = st == R_COPY & self.copy == COPY_SLOTS;
+
+        // ---- INIT: the box in blocks. The last pixel whose centre is in
+        // the box is (max - 8) >> 4, and its block that >> 3. ------------
+        let bx0 = (self.xs >> 7) as i10 wrap;
+        let by0 = (self.ys >> 7) as i10 wrap;
+        let bx1 = ((self.xmax - 8) >> 7) as i10 wrap;
+        let by1 = ((self.ymax - 8) >> 7) as i10 wrap;
+        let empty = bx1 < bx0 | by1 < by0;
+
+        // ---- TEST: a block wholly outside an edge is skipped; DECIDE acts
+        // on the verdict a cycle later. ----------------------------------
+        let reject = outside(self.e0) | outside(self.e1) | outside(self.e2);
+
+        // ---- PIXELS -----------------------------------------------------
+        let stepping = st == R_PIXELS;
+        let covered = inside(self.e0) & inside(self.e1) & inside(self.e2);
+        let colour = q5(self.pr.pix) @ q6(self.pg.pix) @ q5(self.pb.pix);
+        let row_end = self.pix[2:0] == 7;
+        let block_end = self.pix == 63;
+
+        // ---- WRITE: each half block with a covered pixel is one run. ----
+        let writing = st == R_WRITE;
+        let half_used = self.half_used();
+        let want = self.want();
+        let sent_last = wtake & self.pix[4:0] == 31;
+        let half_done = writing & (!half_used | sent_last);
+        let read_ptr: u6 = if writing & wtake == 1 { (self.pix + 1) as u6 wrap } else { self.pix };
+
+        // ---- NEXT: the next block in raster order, or done. -------------
+        let last_col = self.bx == self.bx1;
+        let last_row = self.by == self.by1;
+
+        let state: u3 = if st == R_IDLE {
+            if self.pending == 1 { R_COPY } else { R_IDLE }
+        } else if st == R_COPY {
+            if copy_done { R_INIT } else { R_COPY }
+        } else if st == R_INIT {
+            if empty { R_IDLE } else { R_TEST }
+        } else if st == R_TEST {
+            R_DECIDE
+        } else if st == R_DECIDE {
+            if self.rejected == 1 { R_NEXT } else { R_PIXELS }
+        } else if stepping {
+            if block_end { R_WRITE } else { R_PIXELS }
+        } else if writing {
+            if half_done & self.half == 1 { R_NEXT } else { R_WRITE }
+        } else if last_col & last_row {
+            R_IDLE
+        } else {
+            R_TEST
+        };
+        let mode: u3 = if st == R_INIT {
+            M_INIT
+        } else if st == R_DECIDE & self.rejected == 0 {
+            M_BLOCK
+        } else if stepping & !row_end {
+            M_PIXEL
+        } else if stepping & !block_end {
+            M_ROW
+        } else if st == R_NEXT & !last_col {
+            M_NEXT_COL
+        } else if st == R_NEXT & !last_row {
+            M_NEXT_ROW
+        } else {
+            M_HOLD
+        };
+
+        Self {
+                state: state,
+                pending: if kept == 1 { 1 } else if copy_done { 0 } else { self.pending },
+                copy: if st == R_COPY { (self.copy + 1) as u5 wrap } else { 0 },
+                xs: if got & k == 9 { word as i16 wrap } else { self.xs },
+                ys: if got & k == 10 { word as i16 wrap } else { self.ys },
+                xmax: if got & k == 11 { word as i16 wrap } else { self.xmax },
+                ymax: if got & k == 12 { word as i16 wrap } else { self.ymax },
+                bx0: if st == R_INIT { bx0 } else { self.bx0 },
+                bx1: if st == R_INIT { bx1 } else { self.bx1 },
+                by1: if st == R_INIT { by1 } else { self.by1 },
+                bx: if st == R_INIT {
+                    bx0
+                } else if st == R_NEXT & last_col {
+                    self.bx0
+                } else if st == R_NEXT {
+                    (self.bx + 1) as i10 wrap
+                } else {
+                    self.bx
+                },
+                by: if st == R_INIT {
+                    by0
+                } else if st == R_NEXT & last_col {
+                    (self.by + 1) as i10 wrap
+                } else {
+                    self.by
+                },
+                e0: copy_edge(step_edge(self.e0, mode), got, k, word, 0, 3, 4),
+                e1: copy_edge(step_edge(self.e1, mode), got, k, word, 1, 5, 6),
+                e2: copy_edge(step_edge(self.e2, mode), got, k, word, 2, 7, 8),
+                pr: copy_plane(step_plane(self.pr, mode), got, k, word, 13, 16, 17),
+                pg: copy_plane(step_plane(self.pg, mode), got, k, word, 14, 18, 19),
+                pb: copy_plane(step_plane(self.pb, mode), got, k, word, 15, 20, 21),
+                pix: if stepping {
+                    (self.pix + 1) as u6 wrap
+                } else if half_done {
+                    32
+                } else if writing {
+                    read_ptr
+                } else {
+                    0
+                },
+                rejected: reject,
+                mask: if st == R_TEST {
+                    0
+                } else if stepping {
+                    self.mask | ((0_u63 @ covered) << self.pix)
+                } else {
+                    self.mask
+                },
+                half: if half_done { 1 } else if writing { self.half } else { 0 },
+                requested: if writing & !half_done { self.requested | (want & accepted) } else { 0 },
+                tile: self.tile.next(read_ptr, stepping, self.pix, colour),
+        }
+    }
+}
+
+// The output buffer slot copied in COPY cycle c: E01, E12, E20 (0x00-0x02);
+// A01, B01, A12, B12, A20, B20 (0x20-0x25); xs, ys, xmax, ymax (0x26-0x29);
+// the R, G, B starts (0x2A-0x2C); R, G, B d/dx and d/dy (0x03-0x08).
+fn copy_slot(c: u5) -> u6 {
+    if c < 3 {
+        0_u1 @ c
+    } else if c < 16 {
+        (0x1D + (0_u1 @ c)) as u6 wrap
+    } else if c < 22 {
+        ((0_u1 @ c) - 13) as u6 wrap
+    } else {
+        0
+    }
+}
+
+// An edge's registers after a COPY cycle: its value is slot `ei`, A slot
+// `ai`, B slot `bi`.
+fn copy_edge(e: EdgeState, got: u1, k: u5, word: i36, ei: u5, ai: u5, bi: u5) -> EdgeState {
+    EdgeState {
+        a: if got & k == ai { word as i17 wrap } else { e.a },
+        b: if got & k == bi { word as i17 wrap } else { e.b },
+        blk: if got & k == ei { word as i40 wrap } else { e.blk },
+        ..e
+    }
+}
+
+// A plane's registers after a COPY cycle: its start is slot `si`, d/dx
+// `xi`, d/dy `yi`.
+fn copy_plane(p: PlaneState, got: u1, k: u5, word: i36, si: u5, xi: u5, yi: u5) -> PlaneState {
+    PlaneState {
+        dx: if got & k == xi { word } else { p.dx },
+        dy: if got & k == yi { word } else { p.dy },
+        blk: if got & k == si { word } else { p.blk },
+        ..p
+    }
+}
+
+// 16 * x, for a Q13.4 count: the step to the next pixel.
+fn times16(x: i17) -> i21 {
+    ((x as u17 wrap) @ 0_u4) as i21 wrap
+}
+
+// 128 * x: the step to the next block.
+fn times128(x: i17) -> i24 {
+    ((x as u17 wrap) @ 0_u7) as i24 wrap
+}
+
+// An edge's registers, moved by `mode`.
+fn step_edge(e: EdgeState, mode: u3) -> EdgeState {
+    if mode == M_INIT {
+        // The value copied is at the box's first pixel, which is the first
+        // block's. A top or left edge's 0 is inside.
+        EdgeState {
+            tie: e.a > 0 | (e.a == 0 & e.b > 0),
+            corner: corner(e.a, e.b),
+            pix: e.blk,
+            row: e.blk,
+            blkrow: e.blk,
+            ..e
+        }
+    } else if mode == M_BLOCK {
+        EdgeState { pix: e.blk, row: e.blk, ..e }
+    } else if mode == M_PIXEL {
+        EdgeState { pix: (e.pix + times16(e.a)) as i40 wrap, ..e }
+    } else if mode == M_ROW {
+        let row = (e.row + times16(e.b)) as i40 wrap;
+        EdgeState { pix: row, row: row, ..e }
+    } else if mode == M_NEXT_COL {
+        EdgeState { blk: (e.blk + times128(e.a)) as i40 wrap, ..e }
+    } else if mode == M_NEXT_ROW {
+        let blkrow = (e.blkrow + times128(e.b)) as i40 wrap;
+        EdgeState { blk: blkrow, blkrow: blkrow, ..e }
+    } else {
+        e
+    }
+}
+
+// 8 * x, wrapping: a plane's step to the next block.
+fn times8(x: i36) -> i36 {
+    ((x as u36 wrap)[32:0] @ 0_u3) as i36 wrap
+}
+
+// A plane's registers, moved by `mode`.
+fn step_plane(p: PlaneState, mode: u3) -> PlaneState {
+    if mode == M_INIT {
+        PlaneState { pix: p.blk, row: p.blk, blkrow: p.blk, ..p }
+    } else if mode == M_BLOCK {
+        PlaneState { pix: p.blk, row: p.blk, ..p }
+    } else if mode == M_PIXEL {
+        PlaneState { pix: (p.pix + p.dx) as i36 wrap, ..p }
+    } else if mode == M_ROW {
+        let row = (p.row + p.dy) as i36 wrap;
+        PlaneState { pix: row, row: row, ..p }
+    } else if mode == M_NEXT_COL {
+        PlaneState { blk: (p.blk + times8(p.dx)) as i36 wrap, ..p }
+    } else if mode == M_NEXT_ROW {
+        let blkrow = (p.blkrow + times8(p.dy)) as i36 wrap;
+        PlaneState { blk: blkrow, blkrow: blkrow, ..p }
+    } else {
+        p
+    }
+}
+
+// How far an edge's value rises from a block's first pixel to its other
+// corners, seven pixels on: 112 * max(A, 0) + 112 * max(B, 0).
+fn corner(a: i17, b: i17) -> i24 {
+    let pa: u16 = if a > 0 { (a as u17 wrap)[15:0] } else { 0 };
+    let pb: u16 = if b > 0 { (b as u17 wrap)[15:0] } else { 0 };
+    // 112 * x = 128 * x - 16 * x.
+    let ma = ((pa @ 0_u7) - (0_u3 @ pa @ 0_u4)) as u23 wrap;
+    let mb = ((pb @ 0_u7) - (0_u3 @ pb @ 0_u4)) as u23 wrap;
+    ((0_u1 @ ma) + (0_u1 @ mb)) as i24 wrap
+}
+
+// The edge's largest value over the block's four corner pixels is below
+// 0: no pixel of the block is inside it.
+fn outside(e: EdgeState) -> u1 {
+    e.blk + e.corner < 0
+}
+
+// The current pixel is inside the edge: its value is positive, or 0 on a
+// top or left edge.
+fn inside(e: EdgeState) -> u1 {
+    e.pix > 0 | (e.pix == 0 & e.tie == 1)
+}
+
+// An 8-bit channel's iterator count as 5 bits: over 2^19, rounded half
+// up, clamped.
+fn q5(v: i36) -> u5 {
+    let q = (v + 262144) >> 19;
+    if q < 0 {
+        0
+    } else if q > 31 {
+        31
+    } else {
+        (q as u18 wrap)[4:0]
+    }
+}
+
+// As 6 bits: over 2^18, rounded half up, clamped.
+fn q6(v: i36) -> u6 {
+    let q = (v + 131072) >> 18;
+    if q < 0 {
+        0
+    } else if q > 63 {
+        63
+    } else {
+        (q as u19 wrap)[5:0]
+    }
+}
+
+// A block's first word in the tiled framebuffer: (by * 80 + bx) * 64.
+fn block_base(bx: i10, by: i10) -> u19 {
+    let x = (bx as u10 wrap)[6:0];
+    let y = (by as u10 wrap)[5:0];
+    let index = ((0_u1 @ y @ 0_u6) + (0_u3 @ y @ 0_u4) + (0_u6 @ x)) as u13 wrap;
+    index @ 0_u6
+}
