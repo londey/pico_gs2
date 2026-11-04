@@ -9,6 +9,13 @@ use crate::reciprocal::SEED_TABLE;
 use crate::schedule::{schedule, Schedule};
 use crate::triangle::AttrSet;
 
+/// Words in the micro-ROMs.
+pub const ROM_WORDS: usize = 256;
+
+/// Words each program may take: program `i` starts at word
+/// `i * PROGRAM_WORDS`, so the engine selects one with a constant.
+pub const PROGRAM_WORDS: usize = 128;
+
 /// The programs in ROM order, with their names.
 pub const PROGRAMS: [(&str, AttrSet); 2] =
     [("full", AttrSet::FULL), ("untextured", AttrSet::UNTEXTURED)];
@@ -56,7 +63,14 @@ pub fn generate() -> Generated {
     let mut alu = Vec::new();
     let mut report =
         String::from("program      cycles  critical  check  mul  alu  temps(alu,mul)  base\n");
-    for (name, s) in &schedules {
+    for (i, (name, s)) in schedules.iter().enumerate() {
+        assert!(
+            s.cycles() <= PROGRAM_WORDS,
+            "{name} doesn't fit in {PROGRAM_WORDS} words"
+        );
+        // Unused words are NOPs (all zero).
+        mul.resize(i * PROGRAM_WORDS, 0);
+        alu.resize(i * PROGRAM_WORDS, 0);
         bases.push((*name, mul.len()));
         let _ = writeln!(
             report,
@@ -74,6 +88,8 @@ pub fn generate() -> Generated {
         mul.extend(rom.mul);
         alu.extend(rom.alu);
     }
+    mul.resize(ROM_WORDS, 0);
+    alu.resize(ROM_WORDS, 0);
     Generated {
         mul_hex: hex(
             "setup engine MUL-slot micro-ROM (generated)",

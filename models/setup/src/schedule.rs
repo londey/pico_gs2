@@ -76,6 +76,19 @@ fn width(inst: &Inst) -> usize {
     }
 }
 
+/// Cycles an instruction holds its slot: one per term on the multiplier;
+/// two for an RCPLD, whose write, a cycle later than other ALU results,
+/// would otherwise land with the next ALU operation's on the bank's one
+/// write port.
+fn occupancy(inst: &Inst) -> usize {
+    match &inst.kind {
+        Kind::Alu {
+            op: AluOp::Rcpld, ..
+        } => 2,
+        _ => width(inst),
+    }
+}
+
 /// Cycles from an instruction's first issue to the first issue that can
 /// read its value.
 fn latency(inst: &Inst) -> usize {
@@ -171,10 +184,10 @@ pub fn schedule(program: &Program) -> Schedule {
             } else {
                 &mut alu_busy
             };
-            if (0..width(inst)).any(|t| busy(slots, cycle + t)) {
+            if (0..occupancy(inst)).any(|t| busy(slots, cycle + t)) {
                 continue;
             }
-            for t in 0..width(inst) {
+            for t in 0..occupancy(inst) {
                 if slots.len() <= cycle + t {
                     slots.resize(cycle + t + 1, false);
                 }

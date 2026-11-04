@@ -27,6 +27,37 @@ pub struct Rom {
     pub alu: Vec<u64>,
 }
 
+/// A memory the engine writes: each has one write port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Port {
+    /// The ALU's temporary bank.
+    AluBank,
+    /// The multiplier's temporary bank.
+    MulBank,
+    /// The output slots the ALU writes.
+    AluOut,
+    /// The output slots the multiplier writes.
+    MulOut,
+}
+
+/// One write to a bank or output slot, as the engine's write port carries
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Traced {
+    /// The cycle, counted from the program's first issue, in which the
+    /// write port is driven (the word lands at its end).
+    pub cycle: usize,
+
+    /// The memory.
+    pub port: Port,
+
+    /// The register or output slot.
+    pub addr: u8,
+
+    /// The 36-bit word.
+    pub value: i64,
+}
+
 /// The result of running a program on one triangle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
@@ -35,6 +66,10 @@ pub struct Run {
 
     /// The outputs, or why the triangle was discarded.
     pub result: Result<Setup, Reject>,
+
+    /// Every bank and output write, in cycle order, until the END or the
+    /// abort.
+    pub trace: Vec<Traced>,
 }
 
 /// Where a write goes.
@@ -94,6 +129,8 @@ struct Engine<'a> {
     products: Vec<Stage>,
     /// Sums waiting to be shifted.
     sums: Vec<Stage>,
+    /// The bank and output writes that have landed.
+    trace: Vec<Traced>,
 }
 
 impl Engine<'_> {
@@ -238,13 +275,51 @@ impl Engine<'_> {
             .copied()
             .collect();
         self.pending.retain(|w| w.at != now);
+        let first = self.trace.len();
         for w in landing {
-            match w.target {
-                Target::Reg(bank, r) => self.banks[bank][usize::from(r)] = w.value,
-                Target::Out(o) => self.outputs[usize::from(o)] = Some(w.value),
-                Target::E => self.e = w.value,
-                Target::Flags => self.flags = w.value,
-            }
+            let (port, addr) = match w.target {
+                Target::Reg(bank, r) => {
+                    self.banks[bank][usize::from(r)] = w.value;
+                    (
+                        if bank == 0 {
+                            Port::AluBank
+                        } else {
+                            Port::MulBank
+                        },
+                        r,
+                    )
+                }
+                Target::Out(o) => {
+                    self.outputs[usize::from(o)] = Some(w.value);
+                    (
+                        if o < out::AB {
+                            Port::MulOut
+                        } else {
+                            Port::AluOut
+                        },
+                        o,
+                    )
+                }
+                Target::E => {
+                    self.e = w.value;
+                    continue;
+                }
+                Target::Flags => {
+                    self.flags = w.value;
+                    continue;
+                }
+            };
+            // Each memory has one write port.
+            assert!(
+                self.trace[first..].iter().all(|t| t.port != port),
+                "two writes to {port:?} in cycle {now}"
+            );
+            self.trace.push(Traced {
+                cycle: now,
+                port,
+                addr,
+                value: w.value,
+            });
         }
     }
 
@@ -313,6 +388,7 @@ pub fn run(rom: &Rom, tri: &Triangle, cull: CullMode) -> Run {
         pending: Vec::new(),
         products: Vec::new(),
         sums: Vec::new(),
+        trace: Vec::new(),
     };
     let mut pc = 0;
     let mut flipped = false;
@@ -343,12 +419,14 @@ pub fn run(rom: &Rom, tri: &Triangle, cull: CullMode) -> Run {
                     return Run {
                         cycles: now,
                         result: Err(Reject::ZeroArea),
+                        trace: engine.trace,
                     };
                 }
                 if culled {
                     return Run {
                         cycles: now,
                         result: Err(Reject::Culled),
+                        trace: engine.trace,
                     };
                 }
                 if n {
@@ -367,6 +445,7 @@ pub fn run(rom: &Rom, tri: &Triangle, cull: CullMode) -> Run {
                 return Run {
                     cycles: now,
                     result: Ok(engine.result(flipped)),
+                    trace: engine.trace.clone(),
                 };
             }
         }
