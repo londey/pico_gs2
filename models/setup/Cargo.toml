@@ -1,0 +1,10 @@
+[package]
+name = "setup-model"
+version = "0.1.0"
+description = "Reference models of the pico-gs2 triangle setup engine: f64 and bit-exact fixed point"
+edition.workspace = true
+publish.workspace = true
+workspace = "../../sim"
+
+[dependencies]
+qfixed = { workspace = true }
