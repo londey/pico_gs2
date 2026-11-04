@@ -10,7 +10,7 @@ use case and the stopgap in use. Brief references (F*n*) are to
 |---|---|---|---|
 | R6 | Const generics or module parameters (F9) | `N_MUL`, `N_ALU`, latencies, block size | rc.2's `-D` overrides; the generator owns the parameters |
 | R7 | Faster `async_fifo` write side | The host link's SPI clock to core clock crossing | Not needed yet; the display already avoids it |
-| R10 | Memories of any depth, not only powers of two | The 192-slot (6,144-word) scan-out ring, 6 DP16KD | Two memories, 4,096 + 2,048 words, with a read select |
+| R10 | Memories of any depth, not only powers of two (a convenience, low priority) | The 192-slot (6,144-word) scan-out ring; the setup engine's 37-slot output buffer. Yosys already maps a 6,144 × 16 memory onto exactly 6 DP16KD plus about 77 LUTs of read select, the same as the workaround, so this is about simpler source, not hardware. Sinter would need a rule for addresses past the end (as arrays have: the last entry, or undefined, or proved in range) | Two memories, 4,096 + 2,048 words, with a read select |
 | R9 | Reject `#[no_reset]` on a field that never holds a register (a field of an `Out` or request struct) | rc.2 accepted it silently on `SdramPins` and `TmdsOut`, so the attribute missed the registers it was meant for | Review: every `#[no_reset]` is on a state field |
 
 ## Not needed
