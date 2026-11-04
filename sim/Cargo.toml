@@ -5,7 +5,7 @@
 # command here.
 [workspace]
 resolver = "2"
-members = ["tb", "../models/sdram", "../models/setup"]
+members = ["tb", "../models/sdram"]
 
 [workspace.package]
 edition = "2021"
@@ -17,7 +17,6 @@ tmds-encoder-sim = { package = "video__tmds_encoder-sim", path = "../build/sinte
 sdram-controller-sim = { package = "sdram__sdram_controller-sim", path = "../build/sinter/sdram__sdram_controller-sim" }
 sdram-model = { path = "../models/sdram" }
 setup-model = { path = "../models/setup" }
-qfixed = { version = "0.1", default-features = false }
 png = { version = "0.18", default-features = false }
 
 # The generated simulators are hot loops; optimise them even in test builds.

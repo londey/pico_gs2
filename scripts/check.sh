@@ -49,14 +49,20 @@ for offset in 0 1333 2666 4000; do
 done
 
 manifest=(--manifest-path sim/Cargo.toml)
+# The setup models are a workspace of their own (models/setup): see gen.sh.
+setup=(--manifest-path models/setup/Cargo.toml)
+
 echo "==> cargo fmt --check"
 # From inside sim/: with --manifest-path, cargo fmt can't find the targets of
 # members outside the workspace directory (models/).
 (cd sim && cargo fmt --check)
+(cd models/setup && cargo fmt --check)
 echo "==> cargo clippy"
 cargo clippy "${manifest[@]}" --all-targets -- -D warnings
+cargo clippy "${setup[@]}" --all-targets -- -D warnings
 echo "==> cargo test"
 rm -rf build/stimulus
+cargo test "${setup[@]}"
 cargo test "${manifest[@]}"
 
 # Stimulus the Rust testbenches recorded (build/stimulus/<root>.<case>.csv),

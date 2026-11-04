@@ -1,10 +1,18 @@
+# Its own workspace: `just gen` runs its generator (setup-gen) before
+# `sinter build`, before the sim/ workspace, which needs the crates sinter
+# generates, can be built. sim/tb uses it as a path dependency.
+[workspace]
+
 [package]
 name = "setup-model"
 version = "0.1.0"
 description = "Reference models of the pico-gs2 triangle setup engine: f64 and bit-exact fixed point"
-edition.workspace = true
-publish.workspace = true
-workspace = "../../sim"
+edition = "2021"
+publish = false
 
 [dependencies]
-qfixed = { workspace = true }
+qfixed = { version = "0.1", default-features = false }
+
+# The models are hot loops in the tests; optimise them in test builds.
+[profile.dev]
+opt-level = 3
