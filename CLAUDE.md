@@ -29,12 +29,14 @@ sim/                    Rust workspace: testbenches (members include models/*)
   tb/                   integration tests driving the generated simulators
 models/                 Rust models of external chips
   sdram/                W9825G6KH SDRAM: pin-level, checks datasheet timing
+  setup/                triangle setup reference models: f64 and bit-exact (qfixed)
   reference/            sources the models were written from (datasheet, old C++)
 external/icepi-zero     board repo (git submodule): pin sites, examples
 scripts/  justfile      task runner; every recipe is a script in scripts/
 docs/setup.md           the setup and bring-up plan
 docs/design/            design notes: triangle-pipeline.md (the rendering plan and
-                        phases), setup-engine-brief.md (the setup engine spec)
+                        phases), setup-engine-brief.md (the setup engine spec),
+                        setup-engine.md (its numerics, as built)
 docs/adr/               architecture decision records, NNNN-title.md
 docs/sinter-requirements.md  Sinter gaps pico_gs2 needs closed, with stopgaps
 build/                  (git-ignored) generated Verilog, simulator crates, bitstreams
