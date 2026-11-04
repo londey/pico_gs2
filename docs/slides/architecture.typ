@@ -3,32 +3,29 @@
 // .devcontainer/Dockerfile (which prefetches them); keep the two in step.
 
 #import "@preview/touying:0.8.0": *
-#import themes.metropolis: *
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
+#import "theme/pico.typ": *
 
-#show: metropolis-theme.with(
-  aspect-ratio: "16-9",
-  footer: self => self.info.title,
+#show: pico-theme.with(
   config-info(
     title: [pico-gs2: architecture and status],
+    short-title: [pico-gs2],
     subtitle: [A PS1/N64-era GPU for the ICEpi Zero, written in Sinter],
     date: [November 2026],
   ),
 )
 
-#set text(size: 18pt)
-
 // Status colours: built and running on the board; a Rust model; planned.
-#let built-colour = rgb("#2e7d32")
-#let model-colour = rgb("#1565c0")
-#let planned-colour = luma(130)
+#let built-colour = rgb("#059669")
+#let model-colour = rgb("#2563eb")
+#let planned-colour = rgb("#94a3b8")
 
 // A block that is built in the design.
 #let built(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + built-colour,
-  fill: built-colour.lighten(88%),
-  corner-radius: 3pt,
+  stroke: 1pt + built-colour,
+  fill: rgb("#ecfdf5"),
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -36,9 +33,9 @@
 // A block that exists as a Rust model, not yet in the design.
 #let modelled(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + model-colour,
-  fill: model-colour.lighten(88%),
-  corner-radius: 3pt,
+  stroke: 1pt + model-colour,
+  fill: rgb("#eff6ff"),
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -46,9 +43,9 @@
 // A block that is planned.
 #let planned(pos, body, ..args) = node(
   pos, body,
-  stroke: (paint: planned-colour, thickness: 1.2pt, dash: "dashed"),
-  fill: luma(246),
-  corner-radius: 3pt,
+  stroke: (paint: planned-colour, thickness: 1pt, dash: "dashed"),
+  fill: white,
+  corner-radius: 6pt,
   shape: rect,
   ..args,
 )
@@ -56,21 +53,22 @@
 // An external chip or connector.
 #let chip(pos, body, ..args) = node(
   pos, body,
-  stroke: 1.2pt + black,
-  fill: luma(225),
+  stroke: 1pt + rgb("#475569"),
+  fill: rgb("#f1f5f9"),
+  corner-radius: 2pt,
   shape: rect,
   ..args,
 )
 
 // The colour key, for diagrams.
-#let key = text(size: 13pt)[
-  #box(fill: built-colour.lighten(88%), stroke: 1pt + built-colour, inset: 3pt)[built]
+#let key = text(size: 12pt)[
+  #box(fill: rgb("#ecfdf5"), stroke: 1pt + built-colour, radius: 4pt, inset: 4pt)[built]
   #h(0.5em)
-  #box(fill: model-colour.lighten(88%), stroke: 1pt + model-colour, inset: 3pt)[Rust model]
+  #box(fill: rgb("#eff6ff"), stroke: 1pt + model-colour, radius: 4pt, inset: 4pt)[Rust model]
   #h(0.5em)
-  #box(fill: luma(246), stroke: (paint: planned-colour, dash: "dashed"), inset: 3pt)[planned]
+  #box(stroke: (paint: planned-colour, dash: "dashed"), radius: 4pt, inset: 4pt)[planned]
   #h(0.5em)
-  #box(fill: luma(225), stroke: 1pt, inset: 3pt)[off-chip]
+  #box(fill: rgb("#f1f5f9"), stroke: 1pt + rgb("#475569"), radius: 2pt, inset: 4pt)[off-chip]
 ]
 
 #let done = text(fill: built-colour, weight: "bold")[done]
@@ -91,10 +89,11 @@
 - *Language:* Sinter. One source compiles to SystemVerilog for the FPGA *and*
   a cycle-accurate Rust simulator, the design's digital twin. There is no
   separate hand-written model.
-- *Today:* 1280×720 DVI from a tiled 640×360 framebuffer in SDRAM, with a
-  test card of Gouraud-shaded triangles drawn into it by the setup engine
-  and rasteriser: pixel-exact against a reference renderer in simulation,
-  and on the board. Depth buffering and animation are next.
+- *Today:* 1280×720 DVI from a tiled, triple-buffered 640×360 framebuffer
+  in SDRAM: a spinning Gouraud-shaded cube, depth-tested against a 16-bit Z
+  buffer, drawn by the setup engine and rasteriser at 68 frames per second,
+  shown at 60. Pixel-exact against a reference renderer in simulation, and
+  on the board. The SPI host link and textures are next.
 
 #v(0.5em)
 #key
@@ -121,7 +120,6 @@
     #set text(size: 15pt)
     #table(
       columns: (auto, auto, 1fr),
-      stroke: 0.5pt + luma(180),
       [*Clock*], [*MHz*], [*Drives*],
       [`clk_core`], [75], [the whole Sinter core; also the 720p pixel clock],
       [`clk_sdram`], [75], [the SDRAM: `clk_core` lagging 270°],
@@ -143,7 +141,7 @@
   built((2, 0), [vertex\ ring], name: <ring>),
   built((3, 0), [triangle\ setup], name: <setup>),
   built((4, 0), [traversal +\ iterators], name: <trav>),
-  built((5, 0), [tile buffer\ colour (Z: next)], name: <tile>),
+  built((5, 0), [tile buffers\ colour + Z], name: <tile>),
   built((0, 1), [test scene\ ROM], name: <rom>),
   built((2, 1), [test-pattern\ fill], name: <fill>),
   built((4, 1), [SDRAM\ arbiter], name: <arb>),
@@ -197,7 +195,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 - The simulator *is* the model: tests drive it cycle by cycle against Rust
   models of the SDRAM chip, and the setup engine against its microcode
   interpreter.
-- `just check` replays every stimulus file, including the 3.7M cycles the
+- `just check` replays every stimulus file, including the 6.2M cycles the
   frame test records, through Verilator, and fails on any difference.
 - Generated Verilog, crates and bitstreams live in `build/`; never committed.
 
@@ -263,34 +261,32 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
       let top = i < 32
       box(
         width: 9mm, height: 7mm,
-        fill: if top { luma(232) } else { luma(205) },
-        stroke: 0.4pt + luma(120),
-        align(center + horizon, text(size: 9pt)[#i]),
+        fill: if top { rgb("#eef2ff") } else { rgb("#c7d2fe") },
+        stroke: 0.5pt + white,
+        align(center + horizon, text(size: 9pt, fill: rgb("#3730a3"))[#i]),
       )
     }
     stack(
       spacing: 4pt,
       grid(columns: 8, gutter: 0pt, ..range(64).map(cell)),
-      text(size: 12pt)[one 8×8 block, 64 words in raster order:\ light = run 1 (words 0–31), dark = run 2],
+      text(size: 12pt, fill: rgb("#64748b"))[one 8×8 block, 64 words in raster order:\ light = run 1 (words 0–31), dark = run 2],
     )
   },
   [
-    - 80 × 45 blocks; block $(b_x, b_y)$ is the 64 words from
-      $(80 b_y + b_x) dot 64$.
+    - 80 × 45 blocks; block (b#sub[x], b#sub[y]) is the 64 words from
+      (80 b#sub[y] + b#sub[x]) × 64.
     - A block never crosses a 512-word SDRAM row.
     - Each half (8×4) is *one 32-word run*: rendering moves a block in 2
       runs, not 8.
-    - Pixel $(x, y)$ is word `x[9:3] @ y[2:0] @ x[2:0]` of its block row, plus
-      $5120 dot y\[8:3\]$.
+    - Pixel (x, y) is word `x[9:3] @ y[2:0] @ x[2:0]` of its block row, plus
+      5120 × `y[8:3]`.
 
     #set text(size: 14pt)
     #table(
       columns: (auto, 1fr, auto),
-      stroke: 0.5pt + luma(180),
       [*Bank*], [*Contents*], [*Status*],
-      [0], [colour buffer], done,
-      [1, 2], [colour buffers (triple buffering)], later,
-      [3], [Z buffer, 16-bit], later,
+      [0, 1, 2], [colour buffers (triple buffering)], done,
+      [3], [Z buffer, 16-bit], done,
     )
   ],
 )
@@ -329,22 +325,61 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   built((1, 0), [vertex ring\ 4 slots], name: <vr>),
   built((2, 0), [setup\ 99 cycles / triangle], name: <su>),
   built((3, 0), [traversal\ 8×8 blocks, 1 px/clk], name: <tr>),
-  built((4, 0), [tile buffer\ colour (Z: next)], name: <tb>),
+  built((4, 0), [tile buffers\ colour + Z], name: <tb>),
   chip((4, 1), [SDRAM], name: <sd>),
   edge(<pk>, <vr>, "-|>"),
   edge(<vr>, <su>, "-|>"),
   edge(<su>, <tr>, "-|>"),
   edge(<tr>, <tb>, "-|>"),
-  edge(<tb>, <sd>, "-|>", [colour, masked write], label-side: right),
+  edge(<sd>, <tb>, "-|>", [Z read], bend: -40deg, label-side: right),
+  edge(<tb>, <sd>, "-|>", [colour + Z,\ masked], bend: -40deg, label-side: right),
 )))
 
 - *Traversal:* skip blocks wholly outside an edge; step three edge functions
   and R, G, B with adders; top-left fill rule; colour rounded to RGB565.
-- *Per block:* one masked 32-word run per half block with a covered pixel.
-  Setup of the next triangle overlaps traversal of this one.
-- *Test card:* 48 triangles, about 94,500 pixels, drawn in 7.7 ms.
-- *Next (Phase 12):* a Z buffer (read and write per block), clears, triple
-  buffering, a spinning cube.
+- *Per block:* read its 64 depths (two runs); a pixel is drawn if covered and
+  nearer; then one masked 32-word run per half block with a drawn pixel, for
+  colour and for Z. Setup of the next triangle overlaps traversal of this one.
+- *Per frame:* a clear (colour and Z, 14,400 runs), the triangles, an end of
+  frame. The cube frame takes 1.10 M cycles (14.7 ms): 68 fps, about half
+  of it the clear.
+
+== Depth and triple buffering
+
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1.2em,
+  text(size: 13pt, diagram(
+    spacing: (14mm, 14mm),
+    node-inset: 7pt,
+    built((0, 0), [drawn], name: <dr>),
+    built((1, 1), [waiting], name: <wt>),
+    built((2, 0), [shown], name: <sh>),
+    built((1, -1), [spare], name: <sp>),
+    edge(<dr>, <wt>, "-|>", [end of frame], label-side: right),
+    edge(<wt>, <sh>, "-|>", [frame start], label-side: right),
+    edge(<sh>, <sp>, "-|>", [frame start], label-side: right),
+    edge(<sp>, <dr>, "-|>", [end of frame], label-side: right),
+  )),
+  [
+    #set text(size: 15pt)
+    - Three colour buffers (banks 0–2) take turns: one shown, one drawn, one
+      finished and waiting or spare.
+    - A finished frame is shown from the next frame start, so a frame is
+      never torn. If one is already waiting, the parser holds at the end of
+      frame.
+    - *Z:* 16 bits in bank 3, the iterator rounded and clamped; less-than
+      test, cleared to 0xFFFF.
+    - *Cube:* 32 frames a quarter turn, back faces culled, looping
+      seamlessly; two triangles crossing in depth test the Z buffer.
+  ],
+)
+
+== In simulation
+
+#align(center, image("images/cube-sim.png", height: 80%))
+#align(center, text(size: 14pt)[Cube frame 0 as the frame test decodes it from the simulated DVI
+  output: pixel-exact against the reference renderer, as are the three frames after it.])
 
 == On the board
 
@@ -421,7 +456,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Schedule*], [*Now*], [*Brief*],
       [full program], [99 cycles], [85],
       [untextured], [80 cycles], [—],
@@ -437,7 +471,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto),
-      stroke: 0.5pt + luma(180),
       [*Accuracy* (inside the triangle)], [*Worst error*],
       [ordinary triangles, colour], [0.011 LSB],
       [ordinary, 16-bit attributes], [0.018 LSB],
@@ -470,14 +503,15 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   edge(<v>, <b>, "<|-|>", [bitstream]),
 )))
 
-- *Video and SDRAM today:* stimulus CSVs; a frame test decoding two 720p
+- *Video and SDRAM today:* stimulus CSVs; a frame test decoding four 720p
   frames pixel-exactly; the SDRAM chip model's datasheet checks; the gearbox
   testbench; all through `--cosim`.
 - *Setup:* reciprocal over every mantissa, accuracy by triangle shape,
   edge cases, watertightness, interpreter against the bit-exact model, and
   the Sinter engine against the interpreter, its Verilog through `--cosim`.
-- *Drawing:* the frame test checks the scanned-out frames and the SDRAM
-  against a reference renderer built from the same models.
+- *Drawing:* the frame test checks four consecutive cube frames as shown,
+  and the bank on screen in SDRAM, against a reference renderer built from
+  the same models; it reports the time to draw a frame.
 - Tests are checked by mutation: break the design on purpose, see them fail.
 
 == Resources and timing today
@@ -489,31 +523,30 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [8822], [3841], [24288],
-      [flip-flops], [3096], [974], [24288],
-      [block RAM (DP16KD)], [13], [5], [56],
+      [logic cells], [9512], [3841], [24288],
+      [flip-flops], [3391], [974], [24288],
+      [block RAM (DP16KD)], [26], [5], [56],
       [multipliers], [2], [2], [28],
       [PLL], [1], [—], [2],
       [I/O], [49], [—], [197],
     )
-    _GPU_: today's bitstream, setup engine and rasteriser included.
+    _GPU_: today's bitstream, setup engine and rasteriser included; 16 of
+    its block RAMs are the 8,192-word scene ROM.
     _Setup_: the engine placed and routed alone.
   ],
   [
     #set text(size: 15pt)
     #table(
       columns: (1fr, auto, auto),
-      stroke: 0.5pt + luma(180),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [82.4 MHz], [75],
-      [`clk_sclk`], [299 MHz], [187.5],
+      [`clk_core`], [77.1 MHz], [75],
+      [`clk_sclk`], [320 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
     The brief's whole-design budget (estimate): about 11,000 LUTs (45%), 19
     multipliers, 27 block RAMs. Datapath registers are `#[no_reset]`: only
-    191 flip-flops are on the core reset.
+    control state is on the core reset (191 flip-flops at Phase 11).
   ],
 )
 
@@ -521,7 +554,6 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 
 #text(size: 14pt, table(
   columns: (auto, 1fr, auto),
-  stroke: 0.5pt + luma(180),
   [*Phase*], [*Work*], [*Status*],
   [2–3], [toolchain, CI; 640×480 colour bars], done,
   [4–5], [SDRAM controller and framebuffer; 720p], done,
@@ -531,7 +563,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   [9], [setup engine: Rust models, microcode, scheduler, interpreter], done,
   [10], [setup engine in Sinter, cycle-exact against the interpreter], done,
   [11], [command parser, traversal, tile buffer: first triangles on screen], done,
-  [12], [Z buffer, triple buffering, spinning cube, frame rate], next,
+  [12], [Z buffer, clears, triple buffering, spinning cube: 68 fps], done,
   [—], [SPI host link and RP2350 firmware], later,
   [—], [textures and perspective correction], later,
 ))
@@ -547,8 +579,11 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   bits limit it.
 - *No formal overflow proof* for the setup program yet; ports and the
   accumulator are checked at run time over the test corpus.
-- *Frame rate:* unknown until Phase 12 clears and redraws every frame; a
-  block without Z costs about 140 cycles now.
+- *Frame rate:* 68 fps for the cube, but the full clear is about half of
+  it; a fast clear (per-block flags) is the first fix if scenes get busier.
+- *Core timing margin:* 77.1 MHz against 75 after adding Z. The critical
+  path is the depth test: Z iterator → round and clamp → compare → pixel
+  mask; registering the depth a cycle earlier would buy it back.
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
   `#[no_reset]` accepted on non-registers; power-of-two memory depths.
 - *Off spec but working:* 750 Mb/s DVI pins; a 75 MHz (not 74.25 MHz) pixel

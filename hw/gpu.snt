@@ -3,9 +3,16 @@
 // A 640x360 RGB565 framebuffer in SDRAM, scanned out to 1280x720 DVI with
 // every framebuffer pixel shown as 2x2 screen pixels, all on the 75 MHz core
 // clock, which is also the pixel clock. After the SDRAM's power-up sequence
-// the core writes a test pattern into the framebuffer at word 0, then draws
-// the built-in scene over it (ADR 0002): the command parser feeds the setup
-// engine, and the rasteriser writes its triangles back block by block.
+// the core writes a test pattern into the framebuffer in bank 0 and shows
+// it, then draws the built-in scene (ADR 0002), a frame at a time: the
+// command parser feeds the setup engine, and the rasteriser clears the
+// frame and writes its triangles back block by block, depth tested against
+// a 16-bit depth buffer in bank 3.
+//
+// Triple buffering: colour buffers in banks 0, 1 and 2, one shown, one
+// being drawn, and one either finished and waiting to be shown or spare.
+// A finished frame is shown from the next frame start; the parser waits
+// at an end of frame while one is already waiting.
 //
 // The SDRAM controller has one request port; an arbiter shares it: the
 // fill until it is done, then scan-out loads first and the rasteriser's
@@ -93,6 +100,22 @@ struct Gpu {
     setup: SetupEngine,
     raster: Raster,
 
+    // The colour buffers' banks: shown, being drawn, and the third: a
+    // finished frame waiting to be shown (`ready_valid`), else spare.
+    disp: u2 = 0,
+    draw: u2 = 1,
+    third: u2 = 2,
+    ready_valid: u1 = 0,
+    // Toggled at every frame shown (LED 4).
+    frame_led: u1 = 0,
+    // Cycles spent on the frame being drawn, not counting the wait for the
+    // display to take the last one.
+    render_count: u24 = 0,
+
+    // For the tests: frames shown, and the last finished frame's cycles.
+    pub debug_frames: u16 = 0,
+    pub debug_render_cycles: u24 = 0,
+
     // The fill: high until the test pattern is in the framebuffer, the
     // address of its next run, and the pixel it writes next: pixel (px, py)
     // of block (bx, by), in the framebuffer's word order.
@@ -165,7 +188,7 @@ struct Gpu {
 struct Out {
     // The user LEDs, active high: led[0] the heartbeat (about 0.56 Hz),
     // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] a pixel's
-    // half block wasn't loaded in time, led[4] the scene is drawn.
+    // half block wasn't loaded in time, led[4] toggles at every frame shown.
     led: u5,
     sdram: SdramPins,
 }
@@ -190,7 +213,7 @@ impl Gpu {
         let load_addr = (self.load_rowbase + (0_u5 @ self.load_bx @ self.load_row[0:0] @ 0_u5)) as u18 wrap;
         // The triangle pipeline's outputs, from its registers.
         let pout = self.parser.out();
-        let rout = self.raster.out();
+        let rout = self.raster.out(self.draw);
         let (setup, sout) = self.setup.step(pout.load, pout.start, rout.out_raddr);
         let kept = sout.done & sout.result == RESULT_KEPT;
         let free = !sout.busy & !sout.done & !rout.pending;
@@ -199,7 +222,13 @@ impl Gpu {
             None => 0_u1,
         };
         let ring_free = !sout.busy & !starting;
-        let scene_done = pout.done & !sout.busy & !rout.busy;
+        // A clear waits for the last frame's triangles; an end of frame for
+        // its last blocks, and for the display to take the frame before.
+        let idle = !sout.busy & !sout.done & !rout.busy & !starting;
+        let clear_ok = idle;
+        let present_ok = idle & !self.ready_valid;
+        let presenting = frame_end & self.ready_valid;
+        let stalled = pout.ending & self.ready_valid;
 
         // The arbiter: a request, once chosen, is in front of the controller
         // from the next cycle until it is accepted. Requesters hold theirs
@@ -221,7 +250,7 @@ impl Gpu {
         let chosen_req = if choice == OWNER_FILL {
             SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN }
         } else if choice == OWNER_SCAN {
-            SdramReq { write: 0, addr: 0_u6 @ load_addr, len: RUN }
+            SdramReq { write: 0, addr: self.disp @ 0_u4 @ load_addr, len: RUN }
         } else {
             raster_req
         };
@@ -239,6 +268,12 @@ impl Gpu {
         let accepted_raster = mem.accepted & self.granted == OWNER_RASTER;
         let wtake_fill = mem.wtake & self.data_owner == OWNER_FILL;
         let wtake_raster = mem.wtake & self.data_owner == OWNER_RASTER;
+        let no_word: Option<u16> = None;
+        let (rdata_scan, rdata_raster) = if self.data_owner == OWNER_RASTER {
+            (no_word, mem.rdata)
+        } else {
+            (mem.rdata, no_word)
+        };
 
         // The fill, in word order: px, then py, then bx, then by.
         let last_run = accepted_fill & self.fill_addr == LAST_RUN;
@@ -259,7 +294,7 @@ impl Gpu {
         };
 
         // Words arriving go to the ring in order, a slot per 32.
-        let (got, word) = match mem.rdata {
+        let (got, word) = match rdata_scan {
             Some(w) => (1_u1, w),
             None => (0_u1, 0_u16),
         };
@@ -301,9 +336,32 @@ impl Gpu {
                 },
                 granted_req: if self.granted == OWNER_NONE { chosen_req } else { self.granted_req },
                 data_owner: if mem.accepted == 1 { self.granted } else { self.data_owner },
-                parser: self.parser.next(!self.filling, free, ring_free),
+                parser: self.parser.next(!self.filling, free, ring_free, clear_ok, present_ok),
                 setup: setup,
-                raster: self.raster.next(kept, sout.rdata, accepted_raster, wtake_raster),
+                raster: self.raster.next(kept, sout.rdata, pout.clear, accepted_raster, wtake_raster, rdata_raster),
+                // A finished frame becomes the one waiting, and the spare
+                // the one drawn; at a frame start the one waiting is shown,
+                // and the one shown becomes the spare.
+                disp: if presenting { self.third } else { self.disp },
+                draw: if pout.frame_done == 1 { self.third } else { self.draw },
+                third: if pout.frame_done == 1 {
+                    self.draw
+                } else if presenting {
+                    self.disp
+                } else {
+                    self.third
+                },
+                ready_valid: if pout.frame_done == 1 { 1 } else if presenting { 0 } else { self.ready_valid },
+                frame_led: self.frame_led ^ presenting,
+                render_count: if pout.frame_done == 1 {
+                    0
+                } else if self.filling == 1 | stalled {
+                    self.render_count
+                } else {
+                    (self.render_count + 1) as u24 wrap
+                },
+                debug_frames: if presenting { (self.debug_frames + 1) as u16 wrap } else { self.debug_frames },
+                debug_render_cycles: if pout.frame_done == 1 { self.render_count } else { self.debug_render_cycles },
                 filling: self.filling & !last_run,
                 fill_addr: fill_addr,
                 fill_px: if wtake_fill { (self.fill_px + 1) as u3 wrap } else { self.fill_px },
@@ -348,7 +406,7 @@ impl Gpu {
                 tmds_red: red.symbol,
             },
             Out {
-                led: scene_done @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
+                led: self.frame_led @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
                 sdram: mem.pins,
             },
         )
