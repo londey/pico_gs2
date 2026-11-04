@@ -27,6 +27,13 @@ so it can't express the pipelined multiplier Option B needs.
 - **Culling:** BACK culls area < 0 in y-down screen space; strips alternate
   winding by flipping roles 1 and 2.
 - **Rounding:** round half up wherever the program rounds.
+- **Multiplier:** a 3-stage `pipeline fn` (operands registered, multiply,
+  product registered), then accumulate and shift as a fourth stage.
+- **Models:** a typed bit-exact Rust version of the setup math, using the
+  `qfixed` crate's `Q`/`UQ` types (the same Q convention as Sinter), and a
+  cycle-level interpreter of the scheduled microcode with the pipeline
+  registers explicit; the interpreter must match the typed version bit for
+  bit, and the Sinter engine must match the interpreter cycle for cycle.
 
 ## Consequences
 
@@ -34,5 +41,10 @@ so it can't express the pipelined multiplier Option B needs.
 - Changing the program means re-running the generator, not editing Sinter.
 - Micro-word fields are plain bits to Sinter: formats are checked by the
   generator's range analysis, not by Sinter's types.
-- Option B isn't planned; it can be revisited if Sinter gains pipelined
-  results across phases.
+- `multiplex fn` (Option B) is not used and not planned (2026-11-04). It
+  completes each multiply within its phase, so the multiplier can't be
+  pipelined; its latency is fixed, so there's no early exit for culled
+  triangles and no program chosen at run time; and every temporary carried
+  across a `yield` becomes a flip-flop selected by phase, where the
+  microcoded engine keeps temporaries in two small LUT-RAM banks addressed
+  by the micro-word.

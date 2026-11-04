@@ -15,7 +15,7 @@ between the new blocks, and the phases.
 
 | Brief | Decision | ADR |
 |---|---|---|
-| D1 | Microcoded setup (Option A): Rust generator and scheduler, 64-bit micro-ROM, Sinter datapath. Option B (`multiplex fn`) is not planned. | [0001](../adr/0001-microcoded-setup-engine.md) |
+| D1 | Microcoded setup (Option A): Rust generator and scheduler, 64-bit micro-ROM, Sinter datapath. Option B (`multiplex fn`) is dropped. | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D2 | One MUL slot and one ALU slot. | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D3 | LUT RAM for the vertex ring, register banks and output buffers. | [0001](../adr/0001-microcoded-setup-engine.md) |
 | D5 | Setup computes all 8 attributes (R, G, B, A, Z, S′, T′, Q). Traversal uses R, G, B and Z for now. | [0001](../adr/0001-microcoded-setup-engine.md) |
@@ -54,7 +54,7 @@ features marked *rc.2*; `--cosim` was checked on the current design.
 | F3 | Ported memories, ROM init | Available | `mem<T, N, R>`: R read ports, one write port, 1-cycle read. `rom<T, N> = include_hex!(..)`. *rc.2:* `#[storage(regs \| lutram \| bram)]` (LUT RAM up to 256 words). Without a hint the spike's 4-port bank went to LUT RAM, the seed ROM to one DP16KD. |
 | F4 | Primitives | Available | `*` on a 36×18 product infers **2 MULT18X18D**, with the combine in carry-chain logic (no ALU54B). *rc.2:* `#[params(..)]` sets Verilog parameters on a `#[verilog]` binding, if a primitive is ever needed. |
 | F5 | Pipelined unit | Available | `pipeline fn` with fixed latency. The spike's 3-stage multiply ran at **107 MHz** once accumulate and shift were in stages of their own. |
-| F6 | Shared resource check | Partial | `multiplex fn` shares one `*` per phase but completes it inside the phase; not needed for Option A. |
+| F6 | Shared resource check | Not needed | `multiplex fn` shares one `*` per phase but completes it inside the phase; Option B is dropped (ADR 0001). |
 | F7 | Clock domains, CDC | Available | `async_fifo` reaches only about 85 MHz; not needed until the host link. |
 | F8 | Reset opt-out | Available | *rc.2:* `#[no_reset]` on a field gives its registers (and a memory's read registers) a power-on value only. ADR 0006. |
 | F9 | Const generics | Partial | *rc.2:* `-D NAME=VALUE` overrides a `pub const` at build time. No generics; the generator owns `N_MUL`, `N_ALU` and the latencies. |
@@ -222,8 +222,9 @@ I stop and report.
 | 11 | `phase-11-first-triangles` | Command parser and a static ROM scene; traversal, iterators and tile buffer; SDRAM arbiter; Gouraud colour into one framebuffer, no Z. | Frames pixel-exact against the reference renderer; triangles on the board |
 | 12 | `phase-12-depth-and-buffers` | Z buffer, clear, triple buffering, the spinning cube with overlapping triangles (ADR 0002). | Pixel-exact frames; spinning cube on the board; frame rate measured |
 
-Perspective-correct texturing (brief phase 5), the Option B experiment
-(phase 6) and tiling into on-chip tiles (phase 7) aren't in this plan. The
+Perspective-correct texturing (brief phase 5) and tiling into on-chip
+tiles (brief phase 7) aren't in this plan. The Option B experiment (brief
+phase 6) is dropped (ADR 0001). The
 SPI host link is a phase of its own, to be scheduled.
 
 ## 9. Risks
