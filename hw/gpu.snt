@@ -3,10 +3,15 @@
 // A 640x360 RGB565 framebuffer in SDRAM, scanned out to 1280x720 DVI with
 // every framebuffer pixel shown as 2x2 screen pixels, all on the 75 MHz core
 // clock, which is also the pixel clock. After the SDRAM's power-up sequence
-// the core writes a test pattern into the framebuffer at word 0. From then
-// on, while the display shows a framebuffer line (two screen lines) from
-// one half of a block-RAM line buffer, the core reads the next line from
-// SDRAM into the other half, so each line is read from SDRAM once.
+// the core writes a test pattern into the framebuffer at word 0.
+//
+// The framebuffer is tiled (ADR 0003): 80 x 45 blocks of 8x8 pixels, block
+// (bx, by) the 64 words from (by * 80 + bx) * 64, its pixels in raster
+// order. The top and bottom halves of a block (8x4, a "half block") are one
+// 32-word SDRAM run each. Scan-out reads half blocks into a ring of 192
+// half-block slots in block RAM, a half-block row (4 framebuffer lines, 80
+// half blocks) at a time, running ahead of the display while there are free
+// slots, so each pixel is read from SDRAM once.
 //
 // board/top.sv serialises the TMDS symbols and owns the SDRAM's clock and
 // DQ buffers.
@@ -21,71 +26,95 @@ use root::video::TmdsEncoder;
 use root::video::VideoTiming;
 use root::video::cea_1280x720;
 
-// Framebuffer width and height, in pixels. Its lines are packed with no
-// padding, one RGB565 word per pixel, from word 0.
-const FB_WIDTH: u10 = 640;
-const FB_HEIGHT: u10 = 360;
+// The framebuffer's last pixel column and line.
 const FB_LAST_X: u10 = 639;
 const FB_LAST_Y: u10 = 359;
+
+// The last block column of the framebuffer.
+const LAST_BX: u7 = 79;
 
 // Start address of the last SDRAM run of the framebuffer.
 const LAST_RUN: u18 = 230368;
 
-// Words per SDRAM run. A row is 512 words and the frame starts at word 0,
-// so runs never cross a row.
+// Words per SDRAM run: a half block. A row is 512 words and the frame
+// starts at word 0, so runs never cross a row.
 const RUN: u6 = 32;
 
-// The last screen line, in the vertical blanking: the line buffer is
-// loaded with framebuffer line 0 for the next frame.
-const LAST_LINE: u11 = 749;
+// Words between the starts of the two halves of the next block row.
+const BLOCK_ROW: u18 = 5120;
 
-// The line buffer and the display's pipeline registers are #[no_reset]
-// (ADR 0006): the fill, load and scan-out state decide when they matter.
+// Half-block slots in the scan-out ring, and in a half-block row.
+const RING: u13 = 192;
+const ROW_SLOTS: u13 = 80;
+const LAST_SLOT: u8 = 191;
+
+// Half blocks in the frame: 90 half-block rows of 80.
+const FRAME_SLOTS: u13 = 7200;
+
+// The screen's active area: the first pixel after it, and its last line.
+const H_ACTIVE: u11 = 1280;
+const V_LAST: u11 = 719;
+
+// The ring and the display's pipeline registers are #[no_reset] (ADR 0006):
+// the fill, load and scan-out state decide when they matter.
 struct Gpu {
     // Free-running counter for the heartbeat.
     count: u27 = 0,
     sdram: SdramController,
 
     // The fill: high until the test pattern is in the framebuffer, the
-    // address of its next run, and the pixel it writes next.
+    // address of its next run, and the pixel it writes next: pixel (px, py)
+    // of block (bx, by), in the framebuffer's word order.
     filling: u1 = 1,
     fill_addr: u18 = 0,
-    fill_x: u10 = 0,
-    fill_y: u10 = 0,
+    fill_px: u3 = 0,
+    fill_py: u3 = 0,
+    fill_bx: u7 = 0,
+    fill_by: u6 = 0,
 
-    // The line load: reading framebuffer line `load_line` (at `load_base`)
-    // into half `load_line % 2` of the line buffer. `load_col` is the
-    // column of the next run to request, `load_count` the words that have
-    // arrived.
+    // Scan-out loading, from the end of the first frame after the fill.
     loading: u1 = 0,
-    load_line: u10 = 0,
-    load_base: u18 = 0,
-    load_col: u10 = 0,
-    load_count: u10 = 0,
-    // Each half of the line buffer holds a whole line.
-    ready0: u1 = 0,
-    ready1: u1 = 0,
-    // Two framebuffer lines: half h at words h * 1024 to h * 1024 + 639.
+    // The loads of this frame: half blocks requested, the next one's column
+    // (`load_bx`), half-block row and its block row's first word.
+    issued: u13 = 0,
+    load_bx: u7 = 0,
+    load_row: u7 = 0,
+    load_rowbase: u18 = 0,
+    // Arrived: complete half blocks, the next word's place in its half
+    // block, and the ring slot it goes to.
+    received: u13 = 0,
+    recv_word: u5 = 0,
+    recv_slot: u8 = 0,
+    // Half blocks the display has finished with, and the ring slot of the
+    // first half block of the row it is showing.
+    freed: u13 = 0,
+    show_slot: u8 = 0,
+    // 192 half blocks, slot s holding pixel (px, py) at word s @ py @ px:
+    // slots 0 to 127 in `ring_lo`, 128 to 191 in `ring_hi` (a memory's
+    // depth must be a power of two, and 8192 words would take 8 block RAMs,
+    // not 6). `ring_hi_1` says which the last read was from.
     #[no_reset]
-    linebuf: mem<u16, 2048> = 0,
+    ring_lo: mem<u16, 4096> = 0,
+    #[no_reset]
+    ring_hi: mem<u16, 2048> = 0,
+    #[no_reset]
+    ring_hi_1: u1 = 0,
 
     // The display.
     timing: VideoTiming,
-    // High from the first frame start after the fill.
-    scanning: u1 = 0,
-    // Sticky: an active pixel's line wasn't in the line buffer.
+    // Sticky: an active pixel's half-block row wasn't in the ring.
     underflow: u1 = 0,
-    // The beam, one cycle behind `timing`, to meet the line buffer's read.
+    // The beam, one cycle behind `timing`, to meet the ring's read.
     #[no_reset]
     de_1: u1 = 0,
     #[no_reset]
     hsync_1: u1 = 0,
     #[no_reset]
     vsync_1: u1 = 0,
-    // The pixel shows the line buffer's word (else black).
+    // The pixel shows the ring's word (else black).
     #[no_reset]
     show_1: u1 = 0,
-    // The pixel's line wasn't in the line buffer (show red).
+    // The pixel's half-block row wasn't in the ring (show red).
     #[no_reset]
     missing_1: u1 = 0,
     enc_blue: TmdsEncoder,
@@ -104,8 +133,8 @@ struct Gpu {
 // The core's outputs to the board.
 struct Out {
     // The user LEDs, active high: led[0] the heartbeat (about 0.56 Hz),
-    // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] a line
-    // wasn't loaded in time.
+    // led[1] SDRAM initialised, led[2] framebuffer filled, led[3] a pixel's
+    // half block wasn't loaded in time.
     led: u5,
     sdram: SdramPins,
 }
@@ -115,17 +144,19 @@ impl Gpu {
     fn tick(self, sdram_dq: u16) -> (Gpu, Out) {
         let (timing, beam) = self.timing.step(cea_1280x720(), 1);
 
-        // A line load starts at the start of each even screen line, for the
-        // framebuffer line after the one it shows, and on the last line of
-        // the frame, for line 0.
-        let shown_line = beam.y[10:1] as u10 wrap;
-        let next_line: u10 = if beam.y == LAST_LINE { 0 } else { (shown_line + 1) as u10 wrap };
-        let start_load = !self.filling & beam.x == 0
-            & ((beam.y[0:0] == 0 & next_line < FB_HEIGHT) | beam.y == LAST_LINE);
+        // The display finishes a half-block row after the last active pixel
+        // of every eighth screen line, and the frame after its last line.
+        // The ring restarts there, so a frame's loads start at slot 0.
+        let row_end = beam.x == H_ACTIVE & beam.y[2:0] == 7 & beam.y <= V_LAST;
+        let frame_end = row_end & beam.y == V_LAST;
+        let next_row = row_end & !frame_end;
 
-        // SDRAM requests: the fill's writes, then line loads.
-        let reading = self.loading & self.load_col != FB_WIDTH;
-        let load_addr = (self.load_base + (0_u8 @ self.load_col)) as u18 wrap;
+        // SDRAM requests: the fill's writes, then half-block loads while
+        // the ring has a free slot. Half block (bx, row) is the top
+        // (row even) or bottom half of block (bx, row / 2).
+        let in_use = (self.issued - self.freed) as u13 wrap;
+        let reading = self.loading & self.issued != FRAME_SLOTS & in_use < RING;
+        let load_addr = (self.load_rowbase + (0_u5 @ self.load_bx @ self.load_row[0:0] @ 0_u5)) as u18 wrap;
         let req: Option<SdramReq> = if self.filling == 1 {
             Some(SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN })
         } else if reading == 1 {
@@ -133,51 +164,52 @@ impl Gpu {
         } else {
             None
         };
-        let (sdram, mem) = self.sdram.step(req, pattern(self.fill_x, self.fill_y), sdram_dq);
+        let x = self.fill_bx @ self.fill_px;
+        let y = 0_u1 @ self.fill_by @ self.fill_py;
+        let (sdram, mem) = self.sdram.step(req, pattern(x, y), 0, sdram_dq);
 
-        // The fill.
+        // The fill, in word order: px, then py, then bx, then by.
         let last_run = self.filling & mem.accepted & self.fill_addr == LAST_RUN;
         let fill_addr = if self.filling & mem.accepted { (self.fill_addr + RUN) as u18 wrap } else { self.fill_addr };
-        let line_end = self.fill_x == FB_LAST_X;
-        let fill_x: u10 = if mem.wtake == 0 { self.fill_x } else if line_end { 0 } else { (self.fill_x + 1) as u10 wrap };
-        let fill_y = if mem.wtake & line_end { (self.fill_y + 1) as u10 wrap } else { self.fill_y };
+        let next_py = mem.wtake & self.fill_px == 7;
+        let next_bx = next_py & self.fill_py == 7;
+        let next_by = next_bx & self.fill_bx == LAST_BX;
+        let fill_bx: u7 = if next_by { 0 } else if next_bx { (self.fill_bx + 1) as u7 wrap } else { self.fill_bx };
 
-        // The line load: requests, then words into the line buffer.
-        let load_half = self.load_line[0:0];
+        // The loads: the next request after each one is taken.
+        let took = self.loading & mem.accepted;
+        let row_done = took & self.load_bx == LAST_BX;
+        let load_bx: u7 = if row_done { 0 } else if took { (self.load_bx + 1) as u7 wrap } else { self.load_bx };
+        let load_rowbase = if row_done & self.load_row[0:0] == 1 {
+            (self.load_rowbase + BLOCK_ROW) as u18 wrap
+        } else {
+            self.load_rowbase
+        };
+
+        // Words arriving go to the ring in order, a slot per 32.
         let (got, word) = match mem.rdata {
             Some(w) => (1_u1, w),
             None => (0_u1, 0_u16),
         };
-        let loaded = got & self.load_count == FB_LAST_X;
-        let load_col: u10 = if start_load {
-            0
-        } else if reading & mem.accepted {
-            (self.load_col + RUN) as u10 wrap
-        } else {
-            self.load_col
-        };
-        let load_count: u10 = if start_load { 0 } else if got { (self.load_count + 1) as u10 wrap } else { self.load_count };
-        let load_base: u18 = if !start_load {
-            self.load_base
-        } else if next_line == 0 {
+        let slot_done = got & self.recv_word == 31;
+        let recv_slot: u8 = if !slot_done {
+            self.recv_slot
+        } else if self.recv_slot == LAST_SLOT {
             0
         } else {
-            (self.load_base + (0_u8 @ FB_WIDTH)) as u18 wrap
+            (self.recv_slot + 1) as u8 wrap
         };
-        // A load clears its half's ready flag when it starts, and sets it
-        // when the last word arrives.
-        let ready0: u1 = if start_load & next_line[0:0] == 0 { 0 } else if loaded & load_half == 0 { 1 } else { self.ready0 };
-        let ready1: u1 = if start_load & next_line[0:0] == 1 { 0 } else if loaded & load_half == 1 { 1 } else { self.ready1 };
 
         // The display: framebuffer pixel (x / 2, y / 2) for screen pixel
-        // (x, y), from line-buffer half (y / 2) % 2.
-        let half = shown_line[0:0];
-        let half_ready = if half == 1 { self.ready1 } else { self.ready0 };
-        let scanning = self.scanning | (!self.filling & self.ready0 & beam.x == 0 & beam.y == 0);
-        let show = scanning & beam.de;
-        let raddr = half @ beam.x[10:1];
-        let waddr = load_half @ self.load_count;
-        let rgb: u16 = if self.show_1 == 0 { 0 } else if self.missing_1 == 1 { 0xF800 } else { self.linebuf.value() };
+        // (x, y), in half block x / 16 of the row being shown.
+        let slot_sum = (0_u1 @ self.show_slot) + (0_u2 @ beam.x[10:4]);
+        let slot: u8 = if slot_sum >= 192 { (slot_sum - 192) as u8 wrap } else { slot_sum as u8 wrap };
+        let ring_word = if self.ring_hi_1 == 1 { self.ring_hi.value() } else { self.ring_lo.value() };
+        let row_ready = self.received >= (self.freed + ROW_SLOTS) as u13 wrap;
+        let show = self.loading & beam.de;
+        let next_show_sum = (0_u1 @ self.show_slot) + 80;
+        let next_show: u8 = if next_show_sum >= 192 { (next_show_sum - 192) as u8 wrap } else { next_show_sum as u8 wrap };
+        let rgb: u16 = if self.show_1 == 0 { 0 } else if self.missing_1 == 1 { 0xF800 } else { ring_word };
         // DVI carries HSYNC and VSYNC as C0 and C1 of the blue channel.
         let sync = self.vsync_1 @ self.hsync_1;
         let (enc_blue, blue) = self.enc_blue.step(rgb[4:0] @ rgb[4:2], sync, self.de_1, 1);
@@ -190,24 +222,40 @@ impl Gpu {
                 sdram: sdram,
                 filling: self.filling & !last_run,
                 fill_addr: fill_addr,
-                fill_x: fill_x,
-                fill_y: fill_y,
-                loading: start_load | (self.loading & !loaded),
-                load_line: if start_load { next_line } else { self.load_line },
-                load_base: load_base,
-                load_col: load_col,
-                load_count: load_count,
-                ready0: ready0,
-                ready1: ready1,
-                linebuf: self.linebuf.next(raddr, got & self.loading, waddr, word),
+                fill_px: if mem.wtake { (self.fill_px + 1) as u3 wrap } else { self.fill_px },
+                fill_py: if next_py { (self.fill_py + 1) as u3 wrap } else { self.fill_py },
+                fill_bx: fill_bx,
+                fill_by: if next_by { (self.fill_by + 1) as u6 wrap } else { self.fill_by },
+                loading: if frame_end { !self.filling } else { self.loading },
+                issued: if frame_end { 0 } else if took { (self.issued + 1) as u13 wrap } else { self.issued },
+                load_bx: if frame_end { 0 } else { load_bx },
+                load_row: if frame_end { 0 } else if row_done { (self.load_row + 1) as u7 wrap } else { self.load_row },
+                load_rowbase: if frame_end { 0 } else { load_rowbase },
+                received: if frame_end { 0 } else if slot_done { (self.received + 1) as u13 wrap } else { self.received },
+                recv_word: if frame_end { 0 } else if got { (self.recv_word + 1) as u5 wrap } else { self.recv_word },
+                recv_slot: if frame_end { 0 } else { recv_slot },
+                freed: if frame_end { 0 } else if next_row { (self.freed + ROW_SLOTS) as u13 wrap } else { self.freed },
+                show_slot: if frame_end { 0 } else if next_row { next_show } else { self.show_slot },
+                ring_lo: self.ring_lo.next(
+                    slot[6:0] @ beam.y[2:1] @ beam.x[3:1],
+                    got & self.loading & self.recv_slot[7:7] == 0,
+                    self.recv_slot[6:0] @ self.recv_word,
+                    word,
+                ),
+                ring_hi: self.ring_hi.next(
+                    slot[5:0] @ beam.y[2:1] @ beam.x[3:1],
+                    got & self.loading & self.recv_slot[7:7] == 1,
+                    self.recv_slot[5:0] @ self.recv_word,
+                    word,
+                ),
+                ring_hi_1: slot[7:7],
                 timing: timing,
-                scanning: scanning,
-                underflow: self.underflow | (show & !half_ready),
+                underflow: self.underflow | (show & !row_ready),
                 de_1: beam.de,
                 hsync_1: beam.hsync,
                 vsync_1: beam.vsync,
                 show_1: show,
-                missing_1: !half_ready,
+                missing_1: !row_ready,
                 enc_blue: enc_blue,
                 enc_green: enc_green,
                 enc_red: enc_red,

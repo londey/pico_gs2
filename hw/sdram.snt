@@ -7,7 +7,9 @@
 // 9.5) rounded up to whole 13.3 ns cycles, so any grade works. A requester
 // asks for a run of 1 to 32 words that doesn't cross a row, and holds the
 // request until `accepted`; write data is taken a word per cycle on
-// `wtake`, read data comes back a word per cycle on `rdata`. Every output
+// `wtake`, with `wmask` high to leave that word as it was (DQM, which masks
+// a write in the same cycle), and read data comes back a word per cycle on
+// `rdata`. Every output
 // comes from a register, so a requester can compute its request from them
 // without a combinational loop.
 //
@@ -98,7 +100,7 @@ pub struct SdramOut {
     // its next request. (The controller is busy for many cycles after taking
     // one, so the request it still sees in this cycle is ignored.)
     pub accepted: u1,
-    // High in each cycle `wdata` is taken for a write run.
+    // High in each cycle `wdata` and `wmask` are taken for a write run.
     pub wtake: u1,
     // A word of a read run, in order.
     pub rdata: Option<u16>,
@@ -161,7 +163,7 @@ pub struct SdramController {
 }
 
 impl SdramController {
-    pub fn step(self, req: Option<SdramReq>, wdata: u16, dq_in: u16) -> (Self, SdramOut) {
+    pub fn step(self, req: Option<SdramReq>, wdata: u16, wmask: u1, dq_in: u16) -> (Self, SdramOut) {
         let free = self.delay == 0;
         let refresh_due = self.refresh_timer == 0;
         let (valid, r) = match req {
@@ -246,6 +248,9 @@ impl SdramController {
                         ba: self.bank,
                         // A10 low: no auto-precharge.
                         a: 0_u4 @ self.column,
+                        // A write's DQM masks its own word; a read's must
+                        // be low (it masks the data two cycles later).
+                        dqm: if self.write == 1 { wmask @ wmask } else { 0 },
                         dq_out: wdata,
                         dq_oe: self.write,
                         delay: if last & self.write == 1 { (T_WR - 1) as u15 wrap } else { 0 },
@@ -260,6 +265,7 @@ impl SdramController {
                         cmd: CMD_PRECHARGE,
                         ba: self.bank,
                         a: 0,
+                        dqm: 0,
                         delay: (T_RP - 1) as u15 wrap,
                         ..base
                     }

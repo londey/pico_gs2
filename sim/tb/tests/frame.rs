@@ -86,6 +86,16 @@ fn pattern(x: usize, y: usize) -> u16 {
     u16::try_from((red << 11) | (green << 5) | blue).expect("16 bits")
 }
 
+/// Blocks across the framebuffer.
+const BLOCKS_X: usize = FB_WIDTH / 8;
+
+/// The word address of framebuffer pixel `(x, y)`: the framebuffer is tiled
+/// in 8x8 blocks of 64 words, in raster order of blocks and of the pixels
+/// in each (ADR 0003).
+fn tiled(x: usize, y: usize) -> usize {
+    ((y / 8) * BLOCKS_X + x / 8) * 64 + (y % 8) * 8 + x % 8
+}
+
 /// An RGB565 word as the 8-bit components the core sends, each widened by
 /// repeating its top bits.
 fn rgb888(word: u16) -> [u8; 3] {
@@ -223,10 +233,10 @@ fn framebuffer_scans_out_from_sdram() -> Result<(), Box<dyn Error>> {
         .map(|(n, frame)| check_frame(n, frame))
         .collect();
 
-    // The framebuffer: word y * 640 + x, in bank 0 from row 0.
+    // The framebuffer, tiled, in bank 0 from row 0.
     for y in 0..FB_HEIGHT {
         for x in 0..FB_WIDTH {
-            let addr = y * FB_WIDTH + x;
+            let addr = tiled(x, y);
             assert_eq!(
                 bus.sdram.peek(0, addr >> 9, addr & 0x1FF),
                 pattern(x, y),

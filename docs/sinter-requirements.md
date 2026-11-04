@@ -11,6 +11,7 @@ use case and the stopgap in use. Brief references (F*n*) are to
 | R5 | Pipelined results across `multiplex fn` phases, and early exit (F5, F6) | Option B of the setup engine (brief §5) | Option A, the ROM-driven sequencer (ADR 0001) |
 | R6 | Const generics or module parameters (F9) | `N_MUL`, `N_ALU`, latencies, block size | rc.2's `-D` overrides; the generator owns the parameters |
 | R7 | Faster `async_fifo` write side | The host link's SPI clock to core clock crossing | Not needed yet; the display already avoids it |
+| R10 | Memories of any depth, not only powers of two | The 192-slot (6,144-word) scan-out ring, 6 DP16KD | Two memories, 4,096 + 2,048 words, with a read select |
 | R9 | Reject `#[no_reset]` on a field that never holds a register (a field of an `Out` or request struct) | rc.2 accepted it silently on `SdramPins` and `TmdsOut`, so the attribute missed the registers it was meant for | Review: every `#[no_reset]` is on a state field |
 
 ## Closed

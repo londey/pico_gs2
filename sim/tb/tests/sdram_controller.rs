@@ -1,7 +1,7 @@
 //! Test of the SDRAM controller (`hw/sdram.snt`) on its own, against the
-//! W9825G6KH model: pseudo-random write and read runs across all banks, with
-//! every word read back checked and the model reporting no datasheet
-//! violation.
+//! W9825G6KH model: pseudo-random write and read runs across all banks, some
+//! words of the writes masked, with every word read back checked and the
+//! model reporting no datasheet violation.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -65,6 +65,25 @@ fn data(i: u32) -> u16 {
     (i.wrapping_mul(40_503) >> 3) as u16
 }
 
+/// Whether the `i`th word of all writes is masked: about one in four, in
+/// runs and alone.
+fn masked(i: u32) -> bool {
+    (i.wrapping_mul(2_654_435_761) >> 29) < 2
+}
+
+/// A word of an accepted write run, not yet taken.
+#[derive(Clone, Copy, Debug)]
+struct Word {
+    /// Its address.
+    addr: u32,
+
+    /// Its data.
+    data: u16,
+
+    /// Masked: the SDRAM keeps what it had.
+    masked: bool,
+}
+
 /// Write runs over a spread of addresses, each followed (not always at
 /// once) by a read of the same words, plus reads of words not yet written.
 fn runs() -> Vec<Run> {
@@ -118,8 +137,8 @@ fn runs_read_back_and_meet_the_datasheet() {
     let mut sim = SdramController::new();
     let mut bus = SdramBus::new();
     let mut pending: VecDeque<Run> = runs().into();
-    // Words of accepted write runs, not yet taken: (address, data).
-    let mut to_write: VecDeque<(u32, u16)> = VecDeque::new();
+    // Words of accepted write runs, not yet taken.
+    let mut to_write: VecDeque<Word> = VecDeque::new();
     // Words of accepted read runs, not yet returned: (address, expected).
     let mut to_read: VecDeque<(u32, u16)> = VecDeque::new();
     // What the SDRAM should hold.
@@ -136,7 +155,8 @@ fn runs_read_back_and_meet_the_datasheet() {
             req_payload_write: u8::from(req.is_some_and(|r| r.write)),
             req_payload_addr: req.map_or(0, |r| r.addr),
             req_payload_len: req.map_or(0, |r| r.len as u8),
-            wdata: to_write.front().map_or(0, |&(_, d)| d),
+            wdata: to_write.front().map_or(0, |w| w.data),
+            wmask: u8::from(to_write.front().is_some_and(|w| w.masked)),
             dq_in: bus.dq_in(),
         };
         let out = sim.step(&inputs);
@@ -146,7 +166,11 @@ fn runs_read_back_and_meet_the_datasheet() {
             let run = pending.pop_front().expect("accepted without a request");
             for addr in run.addr..run.addr + run.len {
                 if run.write {
-                    to_write.push_back((addr, data(words)));
+                    to_write.push_back(Word {
+                        addr,
+                        data: data(words),
+                        masked: masked(words),
+                    });
                     words += 1;
                 } else {
                     // Runs are done in order, so a read sees every write
@@ -154,8 +178,8 @@ fn runs_read_back_and_meet_the_datasheet() {
                     let pending_write = to_write
                         .iter()
                         .rev()
-                        .find(|(a, _)| *a == addr)
-                        .map(|&(_, d)| d);
+                        .find(|w| w.addr == addr && !w.masked)
+                        .map(|w| w.data);
                     let expected = pending_write
                         .or_else(|| shadow.get(&addr).copied())
                         .unwrap_or(0);
@@ -164,8 +188,10 @@ fn runs_read_back_and_meet_the_datasheet() {
             }
         }
         if out.out_wtake == 1 {
-            let (addr, d) = to_write.pop_front().expect("wtake with nothing to write");
-            shadow.insert(addr, d);
+            let w = to_write.pop_front().expect("wtake with nothing to write");
+            if !w.masked {
+                shadow.insert(w.addr, w.data);
+            }
         }
         if out.out_rdata_is_some == 1 {
             let (addr, expected) = to_read.pop_front().expect("read data nobody asked for");
