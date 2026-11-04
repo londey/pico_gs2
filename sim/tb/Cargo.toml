@@ -13,3 +13,5 @@ sdram-model.workspace = true
 
 [dev-dependencies]
 png.workspace = true
+setup-model.workspace = true
+setup-tb-sim.workspace = true

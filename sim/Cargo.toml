@@ -17,6 +17,7 @@ tmds-encoder-sim = { package = "video__tmds_encoder-sim", path = "../build/sinte
 sdram-controller-sim = { package = "sdram__sdram_controller-sim", path = "../build/sinter/sdram__sdram_controller-sim" }
 sdram-model = { path = "../models/sdram" }
 setup-model = { path = "../models/setup" }
+setup-tb-sim = { package = "setup_tb-sim", path = "../build/sinter-setup/setup_tb-sim" }
 png = { version = "0.18", default-features = false }
 
 # The generated simulators are hot loops; optimise them even in test builds.
@@ -33,4 +34,7 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.setup-model]
+opt-level = 3
+
+[profile.dev.package."setup_tb-sim"]
 opt-level = 3

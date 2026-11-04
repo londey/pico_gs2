@@ -127,7 +127,8 @@ pub enum AluOp {
     /// The start coordinate: `min(a, b)` clipped to 0 and snapped down to
     /// the 8-pixel grid.
     Snap = 7,
-    /// Normalise a positive area `a`: the `Q2.33` mantissa, and `E`.
+    /// Normalise a positive area `a`: the `Q2.33` mantissa, and `E`, both
+    /// written a cycle later than other ALU results.
     Lzc = 8,
     /// The reciprocal seed for mantissa `a`, from the seed ROM.
     Rcpld = 9,
@@ -204,7 +205,8 @@ pub struct AluWord {
     /// Where the result goes.
     pub dest: Dest,
 
-    /// What the sequencer does next.
+    /// What the sequencer does at the end of this word's cycle. (Encoded
+    /// in the ROM in the word before: see [`Schedule::rom`](crate::Schedule::rom).)
     pub seq: Seq,
 }
 
@@ -219,23 +221,37 @@ pub struct MicroWord {
 }
 
 /// Cycles from an ALU operation's issue to the first issue that can read
-/// its result: operands one cycle after issue, the write the cycle after.
-pub const ALU_LATENCY: usize = 2;
+/// its result: operands arrive and are registered one cycle after issue,
+/// the result is computed and written the cycle after (registering the
+/// operands is what lets the ALU meet 75 MHz).
+pub const ALU_LATENCY: usize = 3;
 
 /// Cycles from an RCPLD's issue to the first issue that can read its
 /// result: one more cycle, through the seed ROM.
-pub const RCPLD_LATENCY: usize = 3;
+pub const RCPLD_LATENCY: usize = 4;
+
+/// Cycles from an LZC's issue to the first issue that can read its
+/// mantissa, or a multiplier shift stage that can use its `E`: the leading
+/// one is found in one cycle, the area shifted and written in the next.
+pub const LZC_LATENCY: usize = 4;
 
 /// Cycles from a MUL-slot issue to the first issue that can read its sum:
-/// operands, multiply, product register, accumulate, shift and write.
+/// operands, multiply, accumulate, shift, round and write.
 pub const MUL_LATENCY: usize = 6;
 
-/// Cycles from a TST's issue to a CHECK that can see its flags.
-pub const TST_LATENCY: usize = 2;
+/// Cycles from a TST's issue to a CHECK that can see its flags: the flags
+/// are written when an ALU result would be.
+pub const TST_LATENCY: usize = 3;
 
-/// The multiplier pipeline stage, counted from issue, in which the
-/// post-shifter uses `E`.
-pub const MUL_SHIFT_STAGE: usize = 5;
+/// The multiplier pipeline stage, counted from issue, in which a term
+/// accumulates: operands at 1, product at 2, accumulate at 3.
+pub const MUL_ACC_STAGE: usize = 3;
+
+/// The multiplier pipeline stage, counted from issue, in which a sum's
+/// shift amount is fixed, with `E` as it is then (it is the accumulate
+/// stage: the shift is in the next, and rounding, saturation and the write
+/// in the one after).
+pub const MUL_SHIFT_STAGE: usize = 3;
 
 /// Packs a destination: temp valid and index (6 bits), out valid and slot
 /// (7 bits).

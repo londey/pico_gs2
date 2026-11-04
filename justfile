@@ -28,6 +28,10 @@ lint: gen
 bitstream: gen
     scripts/bitstream.sh
 
+# Place and route the setup engine on its own; report resources and Fmax.
+setup-report: gen
+    scripts/setup_report.sh
+
 # Compile the architecture slides into build/slides/.
 slides:
     scripts/slides.sh

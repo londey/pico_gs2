@@ -13,11 +13,13 @@ use setup_model::{
 const TRIANGLES: usize = 3_000;
 
 /// Longest the full program may be, in cycles: what it schedules to now, as
-/// a regression limit (ADR 0004). The brief's target is 85.
-const FULL_MAX: usize = 94;
+/// a regression limit (ADR 0004). The brief's target is 85; Phase 10's
+/// timing closure (registered ALU operands, a two-cycle LZC) took it from
+/// 94 to 99.
+const FULL_MAX: usize = 99;
 
-/// Longest the untextured program may be, likewise.
-const UNTEXTURED_MAX: usize = 74;
+/// Longest the untextured program may be, likewise (74 before Phase 10).
+const UNTEXTURED_MAX: usize = 80;
 
 /// A small linear congruential generator, so the test is repeatable.
 struct Lcg(u64);

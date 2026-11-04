@@ -5,13 +5,15 @@
 //! of `isa`. An operation's operands are the banks' contents at the start
 //! of its issue cycle (a read in the same cycle as a write sees the old
 //! word). An ALU result lands at the end of the cycle after issue, an
-//! RCPLD's a cycle later. A multiplier term accumulates four cycles after
-//! issue, and its sum is shifted (with `E` as it is in that cycle) and
-//! lands at the end of the cycle after.
+//! RCPLD's a cycle later. A multiplier term accumulates three cycles after
+//! issue, when its shift amount is fixed with `E` as it is then; it is
+//! shifted the cycle after, and rounded, saturated and written the cycle
+//! after that.
 
 use crate::formats::{post_shift, wrap, Coord, Delta, Iter, Wide, REG_BITS};
 use crate::isa::{
-    out, read, AluOp, AluWord, Constant, Dest, MulOp, MulWord, Seq, BANK_SIZE, MUL_SHIFT_STAGE,
+    out, read, AluOp, AluWord, Constant, Dest, MulOp, MulWord, Seq, ALU_LATENCY, BANK_SIZE,
+    LZC_LATENCY, MUL_ACC_STAGE, RCPLD_LATENCY, TST_LATENCY,
 };
 use crate::reciprocal::SEED_TABLE;
 use crate::setup::{Edge, Plane, Reject, Setup};
@@ -105,6 +107,8 @@ struct Stage {
     word: MulWord,
     /// The product (before accumulating) or the sum (after).
     value: i64,
+    /// The sum's shift amount, fixed as it accumulates.
+    shift: u32,
 }
 
 /// The engine's state while it runs one triangle.
@@ -198,20 +202,21 @@ impl Engine<'_> {
                     (0, 0)
                 };
                 self.pending.push(Write {
-                    at: now + 1,
+                    at: now + LZC_LATENCY - 1,
                     target: Target::E,
                     value: e,
                 });
-                m
+                self.write(now + LZC_LATENCY - 1, 0, w.dest, m);
+                return;
             }
             AluOp::Rcpld => {
                 let index = usize::try_from((a >> 23) & 0x3FF).expect("10 bits");
-                self.write(now + 2, 0, w.dest, SEED_TABLE[index]);
+                self.write(now + RCPLD_LATENCY - 1, 0, w.dest, SEED_TABLE[index]);
                 return;
             }
             AluOp::Tst => {
                 self.pending.push(Write {
-                    at: now + 1,
+                    at: now + TST_LATENCY - 1,
                     target: Target::Flags,
                     value: i64::from(a < 0) << 1 | i64::from(a == 0),
                 });
@@ -219,7 +224,7 @@ impl Engine<'_> {
             }
             AluOp::Addv => r36(a + (b << 16)),
         };
-        self.write(now + 1, 0, w.dest, value);
+        self.write(now + ALU_LATENCY - 1, 0, w.dest, value);
     }
 
     /// Issues a MUL word in cycle `now`.
@@ -231,23 +236,25 @@ impl Engine<'_> {
         let b = self.read(w.b);
         assert_eq!(wrap(b, 18), b, "18-bit operand out of range: {b}");
         self.products.push(Stage {
-            at: now + MUL_SHIFT_STAGE - 1,
+            at: now + MUL_ACC_STAGE,
             word: w,
             value: a * b,
+            shift: 0,
         });
     }
 
-    /// The end of cycle `now`: shift the sums due, accumulate the terms
-    /// due, land the writes due.
+    /// The end of cycle `now`: shift the sums due, accumulate the terms due
+    /// (fixing their shift amounts with `E` as it is in this cycle), land
+    /// the writes due.
     fn end_of_cycle(&mut self, now: usize) {
         let e = u32::try_from(self.e).expect("E is 0 to 32");
         let due: Vec<Stage> = self.sums.iter().filter(|s| s.at == now).copied().collect();
         self.sums.retain(|s| s.at != now);
         for s in due {
             let w = s.word;
-            let shift = u32::from(w.shift) + if w.by_e { e } else { 0 };
-            let value = post_shift(s.value, shift, w.round, w.sat);
-            self.write(now, 1, w.dest, value);
+            let value = post_shift(s.value, s.shift, w.round, w.sat);
+            // Rounded and saturated in the next cycle, and written then.
+            self.write(now + 1, 1, w.dest, value);
         }
         let due: Vec<Stage> = self
             .products
@@ -266,6 +273,7 @@ impl Engine<'_> {
                 at: now + 1,
                 word: p.word,
                 value: self.acc,
+                shift: u32::from(p.word.shift) + if p.word.by_e { e } else { 0 },
             });
         }
         let landing: Vec<Write> = self
@@ -393,14 +401,18 @@ pub fn run(rom: &Rom, tri: &Triangle, cull: CullMode) -> Run {
     let mut pc = 0;
     let mut flipped = false;
     let mut now = 0;
+    // The ROM gives each word's sequencer action with the word before, so
+    // the engine has it in a register; a program's first word is NEXT.
+    let mut seq_reg = Seq::Next;
     loop {
         let mul = MulWord::decode(rom.mul[pc]);
         let alu = AluWord::decode(rom.alu[pc]);
         engine.mul(now, mul);
         engine.alu(now, alu);
-        // The sequencer acts on this cycle's word, with the flags as they
-        // are at its start.
-        let seq = alu.seq;
+        // The sequencer acts with the flags as they are at the cycle's
+        // start, and picks up the next word's action.
+        let seq = seq_reg;
+        seq_reg = alu.seq;
         let (n, z) = (engine.flags & 2 != 0, engine.flags & 1 != 0);
         engine.end_of_cycle(now);
         now += 1;
@@ -436,6 +448,7 @@ pub fn run(rom: &Rom, tri: &Triangle, cull: CullMode) -> Run {
                     engine.roles.swap(1, 2);
                     flipped = true;
                     pc = 0;
+                    seq_reg = Seq::Next;
                 } else {
                     pc += 1;
                 }

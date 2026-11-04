@@ -1,0 +1,22 @@
+// Test-harness root for the setup engine: its ports, unchanged, so that
+// sim/tb can drive it cycle by cycle and `just check` can replay the
+// stimulus it records against the Verilog (--cosim).
+
+mod setup;
+
+use root::setup::SetupEngine;
+use root::setup::SetupOut;
+use root::setup::Start;
+use root::setup::VertexWrite;
+
+struct SetupTb {
+    engine: SetupEngine,
+}
+
+impl SetupTb {
+    #[clock(domain = core, period = 1)]
+    fn tick(self, load: Option<VertexWrite>, start: Option<Start>, out_raddr: u6) -> (SetupTb, SetupOut) {
+        let (engine, out) = self.engine.step(load, start, out_raddr);
+        (SetupTb { engine: engine }, out)
+    }
+}

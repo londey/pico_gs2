@@ -13,8 +13,8 @@ use std::collections::HashMap;
 
 use crate::interp::Rom;
 use crate::isa::{
-    read, AluOp, AluWord, Dest, MicroWord, MulWord, Seq, ALU_LATENCY, BANK_SIZE, MUL_LATENCY,
-    MUL_SHIFT_STAGE, RCPLD_LATENCY, TST_LATENCY,
+    read, AluOp, AluWord, Dest, MicroWord, MulWord, Seq, ALU_LATENCY, BANK_SIZE, LZC_LATENCY,
+    MUL_LATENCY, MUL_SHIFT_STAGE, RCPLD_LATENCY, TST_LATENCY,
 };
 use crate::program::{Inst, Kind, Program, Src, ValueId};
 
@@ -55,10 +55,31 @@ impl Schedule {
     /// # Returns
     ///
     /// Each cycle's encoded MUL and ALU words.
+    ///
+    /// In the ROM, each ALU word's sequencer field holds the action of the
+    /// word *after* it, so that the engine can register it and act on it
+    /// from a register: a program's first word is always [`Seq::Next`].
     pub fn rom(&self) -> Rom {
+        let next_seq = |i: usize| self.words.get(i + 1).map_or(Seq::Next, |w| w.alu.seq);
+        assert_eq!(
+            self.words[0].alu.seq,
+            Seq::Next,
+            "the first word must be NEXT"
+        );
         Rom {
             mul: self.words.iter().map(|w| w.mul.encode()).collect(),
-            alu: self.words.iter().map(|w| w.alu.encode()).collect(),
+            alu: self
+                .words
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    AluWord {
+                        seq: next_seq(i),
+                        ..w.alu
+                    }
+                    .encode()
+                })
+                .collect(),
         }
     }
 }
@@ -77,13 +98,14 @@ fn width(inst: &Inst) -> usize {
 }
 
 /// Cycles an instruction holds its slot: one per term on the multiplier;
-/// two for an RCPLD, whose write, a cycle later than other ALU results,
-/// would otherwise land with the next ALU operation's on the bank's one
-/// write port.
+/// two for an RCPLD or LZC, whose write, a cycle later than other ALU
+/// results, would otherwise land with the next ALU operation's on the
+/// bank's one write port.
 fn occupancy(inst: &Inst) -> usize {
     match &inst.kind {
         Kind::Alu {
-            op: AluOp::Rcpld, ..
+            op: AluOp::Rcpld | AluOp::Lzc,
+            ..
         } => 2,
         _ => width(inst),
     }
@@ -97,6 +119,7 @@ fn latency(inst: &Inst) -> usize {
         Kind::Alu {
             op: AluOp::Rcpld, ..
         } => RCPLD_LATENCY,
+        Kind::Alu { op: AluOp::Lzc, .. } => LZC_LATENCY,
         Kind::Alu { .. } => ALU_LATENCY,
     }
 }
@@ -221,7 +244,7 @@ pub fn schedule(program: &Program) -> Schedule {
                 if post.by_e {
                     let stage = issue[i] + terms.len() - 1 + MUL_SHIFT_STAGE;
                     assert!(
-                        stage > issue[lzc] + 1,
+                        stage >= issue[lzc] + LZC_LATENCY,
                         "{} shifts by E before it is written",
                         inst.name
                     );

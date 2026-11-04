@@ -12,3 +12,9 @@ cargo run --quiet --release --manifest-path models/setup/Cargo.toml --bin setup-
 echo "==> sinter build hw/gpu.snt"
 rm -rf build/sinter
 sinter build hw/gpu.snt --out build/sinter
+
+# The setup engine on its own, for its cycle-exact tests (sim/tb) until it
+# joins the GPU.
+echo "==> sinter build hw/setup_tb.snt"
+rm -rf build/sinter-setup
+sinter build hw/setup_tb.snt --out build/sinter-setup
