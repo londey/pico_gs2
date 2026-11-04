@@ -12,6 +12,8 @@ env:
   OSS_CAD_SUITE_VERSION: "20260127"
   JUST_VERSION: "1.54.0"
   SINTER_VERSION: "v1.0.0-rc.2"
+  TYPST_VERSION: "v0.15.1"
+  TYPST_SHA256: "a6d077d0a95eed5a2eba715b2dae06be954f624ccbf85758a03f389ded33118c"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -33,6 +35,16 @@ jobs:
           curl -fsSL \
             "https://github.com/YosysHQ/oss-cad-suite-build/releases/download/${OSS_CAD_SUITE_DATE}/oss-cad-suite-linux-x64-${OSS_CAD_SUITE_VERSION}.tgz" \
             | tar -xz -C ~
+
+      - name: Install typst
+        run: |
+          mkdir -p ~/bin
+          cd "$RUNNER_TEMP"
+          asset="typst-x86_64-unknown-linux-musl.tar.xz"
+          curl -fsSLO "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/${asset}"
+          echo "${TYPST_SHA256}  ${asset}" | sha256sum -c -
+          tar -xJf "${asset}"
+          install -m 0755 typst-x86_64-unknown-linux-musl/typst ~/bin/typst
 
       - name: Install just and sinter
         run: |
@@ -67,6 +79,7 @@ jobs:
           yosys -V
           nextpnr-ecp5 --version
           verilator --version
+          typst --version
           rustc --version
 
       - name: just ci
@@ -80,3 +93,9 @@ jobs:
             build/fpga/top.bit
             build/fpga/nextpnr.log
             build/fpga/report.json
+
+      - name: Upload slides
+        uses: actions/upload-artifact@v4
+        with:
+          name: slides
+          path: build/slides/*.pdf

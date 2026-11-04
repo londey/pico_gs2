@@ -28,6 +28,10 @@ lint: gen
 bitstream: gen
     scripts/bitstream.sh
 
+# Compile the architecture slides into build/slides/.
+slides:
+    scripts/slides.sh
+
 # Load build/fpga/top.bit onto a connected ICEpi Zero.
 flash:
     scripts/flash.sh

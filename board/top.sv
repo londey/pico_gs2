@@ -18,10 +18,11 @@
 // SDRAM: the core's SDRAM outputs all come from registers on clk_core. The
 // SDRAM samples them on clk_sdram, 10 ns after the clk_core edge that
 // launched them, which leaves time for the output delay and the chip's
-// set-up time, and plenty of hold. Read data reaches the FPGA around the
-// clk_core edge one cycle after the CAS latency, where the core registers it
-// (hw/sdram.snt, READ_CAPTURE). The board's own memtest found 270 degrees
-// good at 100 MHz, as did Phase 4.
+// set-up time, and plenty of hold. Read data reaches the FPGA in time for the
+// clk_core edge that ends the CAS latency, where the core registers it
+// (hw/sdram.snt, READ_CAPTURE; found on the board in Phase 8, after Phases 4
+// to 8 captured a cycle late). The board's own memtest found 270 degrees
+// good at 100 MHz.
 //
 // DVI out: the core produces one 10-bit TMDS symbol per channel per clk_core
 // cycle. tmds_gearbox turns them into four bits per clk_sclk cycle, and an

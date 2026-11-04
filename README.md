@@ -24,7 +24,9 @@ just flash       # load it onto a connected ICEpi Zero
 just ci          # everything CI runs
 ```
 
-`just` on its own lists every recipe.
+`just` on its own lists every recipe. `just slides` builds the architecture
+slides (`docs/slides/architecture.typ`) into `build/slides/architecture.pdf`;
+CI uploads them as an artifact too.
 
 The devcontainer has no USB access, so flash from the host instead:
 `openFPGALoader -b icepi-zero build/fpga/top.bit` (the workspace is shared,

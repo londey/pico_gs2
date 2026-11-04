@@ -38,6 +38,7 @@ docs/design/            design notes: triangle-pipeline.md (the rendering plan a
                         phases), setup-engine-brief.md (the setup engine spec),
                         setup-engine.md (its numerics, as built)
 docs/adr/               architecture decision records, NNNN-title.md
+docs/slides/            Typst architecture slides (Touying + Fletcher); `just slides`
 docs/sinter-requirements.md  Sinter gaps pico_gs2 needs closed, with stopgaps
 build/                  (git-ignored) generated Verilog, simulator crates, bitstreams
 ```
@@ -54,6 +55,7 @@ bitstreams all live in `build/`.
 | `just check` | `build`, then `sinter check`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, then the stimulus the Rust tests recorded in `build/stimulus/`; every stimulus file runs with `--cosim` (simulator vs Verilator) |
 | `just lint` | Verilator `--lint-only -Wall` over `board/*.sv` and the generated `.sv` |
 | `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
+| `just slides` | `typst compile` each `docs/slides/*.typ` into `build/slides/*.pdf` |
 | `just flash` | `openFPGALoader -b icepi-zero build/fpga/top.bit` (the user runs this) |
 | `just ci` | everything CI runs, in order |
 | `just clean` | remove `build/` and `sim/target/` |

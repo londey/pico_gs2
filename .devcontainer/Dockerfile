@@ -7,6 +7,8 @@
 #     openFPGALoader. The same release Sinter's own CI tests against.
 #   * Rust (stable) for the testbenches and chip models in sim/ and models/.
 #   * just, the task runner (see justfile + scripts/).
+#   * Typst, with the Touying and Fletcher packages, for the architecture
+#     slides in docs/slides/.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -55,6 +57,20 @@ RUN cd /tmp \
     && rm "${asset}" "${asset}.sha256" \
     && sinter --version
 
+# --- typst (pinned static binary, checksum-verified) -------------------------
+# Typst's releases don't publish checksums; this one is the asset's SHA-256,
+# taken when the version was pinned.
+ARG TYPST_VERSION=v0.15.1
+ARG TYPST_SHA256=a6d077d0a95eed5a2eba715b2dae06be954f624ccbf85758a03f389ded33118c
+RUN cd /tmp \
+    && asset="typst-x86_64-unknown-linux-musl.tar.xz" \
+    && curl -fsSLO "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/${asset}" \
+    && echo "${TYPST_SHA256}  ${asset}" | sha256sum -c - \
+    && tar -xJf "${asset}" \
+    && install -m 0755 typst-x86_64-unknown-linux-musl/typst /usr/local/bin/typst \
+    && rm -rf "${asset}" typst-x86_64-unknown-linux-musl \
+    && typst --version
+
 # --- Non-root user -----------------------------------------------------------
 # Ubuntu 24.04 ships a uid-1000 "ubuntu" user; replace it so vscode gets uid
 # 1000 and bind-mounted files keep the host owner.
@@ -86,6 +102,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH=$HOME/.local/bin:$PATH
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && claude --version
+
+# --- Typst packages for the slides (keep in step with docs/slides/*.typ) -----
+# Compiling a file that imports them fetches them, and their dependencies,
+# into the user's package cache, so the slides build offline.
+ARG TOUYING_VERSION=0.8.0
+ARG FLETCHER_VERSION=0.5.8
+RUN printf '#import "@preview/touying:%s": *\n#import "@preview/fletcher:%s"\n' \
+        "${TOUYING_VERSION}" "${FLETCHER_VERSION}" > /tmp/packages.typ \
+    && typst compile /tmp/packages.typ /tmp/packages.pdf \
+    && rm /tmp/packages.typ /tmp/packages.pdf
 
 # Pre-create the cargo registry tree so the devcontainer's named volume
 # (mounted at ~/.cargo/registry) is created owned by vscode, not root.
