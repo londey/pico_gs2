@@ -1,7 +1,8 @@
 # Setup engine: numerics
 
-**Status:** Phase 9, first part: the bit-exact model (`models/setup`). The
-microcode, scheduler and interpreter follow.
+**Status:** Phase 9 (`models/setup`): the bit-exact model, the microcode,
+its scheduler and the cycle-level interpreter, done; the Sinter engine is
+Phase 10.
 **Spec:** [setup-engine-brief.md](setup-engine-brief.md) §4, with the
 changes below, each found by measuring the model against its `f64`
 reference.
@@ -53,6 +54,71 @@ value is out of range. Gradients saturate; start values wrap. This drops
   to (0, 0), the far corner to the last pixel centre (639.5, 359.5).
 - The `untextured` program is the full one without S′, T′ and Q. The `flat`
   variant is not built yet.
+
+## Microcode
+
+`src/isa.rs` defines it; `src/program.rs` is the program as an op list,
+`src/schedule.rs` schedules it and allocates registers, `src/interp.rs`
+runs the encoded words, `src/emit.rs` and `setup-gen` write the ROMs.
+
+- **Word:** two ROM words at one address: MUL slot (38 bits: op, a, b,
+  temporary, output slot, shift, by-E, round, saturate) and ALU slot plus
+  sequencer (33 bits: op, a, b, temporary, output slot, NEXT/CHECK/END).
+  The brief's single 64-bit word has no room for a result to go to both a
+  temporary and an output, which gradients, edge coefficients and the
+  bounding box need; without it the ALU would need about 24 more MOVs.
+- **Address spaces:** reads: vertex fields by role (0x00–0x2F), constants
+  (0x30), ALU bank (0x40, 32 registers), MUL bank (0x60, 32). Each bank has
+  one writer. Outputs: 0x00–0x12 written by the MUL slot (edge values,
+  gradients), 0x20–0x31 by the ALU slot (A, B, box, starts).
+- **Pipeline** (Sinter memories read first: a read in the cycle of a write
+  sees the old word):
+
+  | Operation | Operands | Result written | Latency |
+  |---|---|---|---|
+  | ALU | issue + 1 | end of issue + 1 | 2 |
+  | RCPLD | issue + 1 | end of issue + 2 (seed ROM) | 3 |
+  | MUL term | issue + 1 | accumulates at issue + 4; shifted (with E) and written at the end of issue + 5 | 6 |
+
+- **Check and restart:** CHECK aborts on zero area or a culled winding, or
+  swaps roles 1 and 2 and restarts on a negative area; the restarted pass
+  doesn't cull again. Writes still in flight from the first pass land
+  before the restarted pass writes or reads those registers.
+
+### Schedule
+
+| Program | Cycles | Critical path | Check | MUL issues | ALU issues | Temporaries (ALU, MUL) |
+|---|---|---|---|---|---|---|
+| full | 94 | 50 | 13 | 62 (66%) | 54 (57%) | 28, 14 |
+| untextured | 74 | 50 | 13 | 44 (59%) | 45 (61%) | 22, 8 |
+
+A rejected triangle takes 14 cycles, a flipped one 14 more than a kept
+one. The brief targets 85 and 10. The gap is the chain to the gradient
+factors: area, LZC, seed, `t`, `2 − t`, `r`, `k` pass through the
+6-cycle multiplier four times, so `k` is ready about cycle 34 while 48 of
+the 62 multiplies depend on it. Options, to weigh once Phase 10 has real
+timing: a shorter multiplier pipeline (the latencies are generator
+constants), or overlapping one triangle's start with the last one's
+gradients (more registers).
+
+## Verification
+
+| Test | What it checks |
+|---|---|
+| `reciprocal` | the reciprocal over every mantissa |
+| `accuracy` | fixed point against `f64`, by triangle shape |
+| `edge_cases` | zero area, culling × winding, flips, exact edges, box, variants, guard band |
+| `microcode` | interpreter = bit-exact model for 18,000 random triangles (2 programs × 3 cull modes), cycle counts as scheduled, encode/decode |
+| `watertight` | the reference traversal (`src/traverse.rs`, top-left rule) covers each pixel of random meshes and fans exactly once |
+
+Mutations caught: writes landing a cycle late (interpreter), and a fill
+rule without the top-left tie-break (traversal).
+
+Not done yet: a formal range analysis of the op list. Port widths and
+accumulator overflow are asserted at run time over the test corpus
+instead. And `setup-gen` isn't in `just gen` yet: the `sim` workspace
+needs the Sinter crates to exist before any of its members can run, so
+Phase 10 has to break that cycle when the engine first loads the ROMs.
 
 ## Accuracy
 

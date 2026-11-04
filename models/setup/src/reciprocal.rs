@@ -14,7 +14,7 @@ pub const SEEDS: usize = 1024;
 /// The seed table: entry `i` is `1 / m` at the middle of its interval,
 /// `m = 1 + (i + 0.5) / 1024`, as a [`Seed`] count rounded half up. With
 /// `2^17 / m = 2^28 / (2049 + 2i)`, the rounding is exact.
-const SEED_TABLE: [i64; SEEDS] = {
+pub(crate) const SEED_TABLE: [i64; SEEDS] = {
     let mut table = [0; SEEDS];
     let mut i = 0;
     while i < SEEDS {
