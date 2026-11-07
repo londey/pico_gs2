@@ -8,9 +8,10 @@ that supersedes the old one; the old one stays.
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-microcoded-setup-engine.md) | Microcoded triangle setup engine | Accepted |
-| [0002](0002-built-in-test-scene.md) | Built-in test scene before the host link | Accepted |
+| [0002](0002-built-in-test-scene.md) | Built-in test scene before the host link | Accepted; its packet format superseded by 0008 |
 | [0003](0003-pixel-path-and-buffers.md) | Tiled 8×8 blocks, 16-bit Z, triple buffering | Accepted |
 | [0004](0004-generated-files-at-build-time.md) | Generated files at build time only | Accepted |
 | [0005](0005-simulator-verilator-oracle.md) | Simulator vs Verilator oracle | Accepted |
 | [0006](0006-datapath-reset-stopgap.md) | Only control state is reset | Accepted |
 | [0007](0007-fixed-point-notation.md) | Sinter fixed-point notation | Accepted |
+| [0008](0008-register-host-interface.md) | A register host interface | Proposed |

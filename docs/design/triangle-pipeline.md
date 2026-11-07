@@ -267,7 +267,9 @@ I stop and report.
 Perspective-correct texturing (brief phase 5) and tiling into on-chip
 tiles (brief phase 7) aren't in this plan. The Option B experiment (brief
 phase 6) is dropped (ADR 0001). The
-SPI host link is a phase of its own, to be scheduled.
+host link is planned in [host-interface.md](host-interface.md): Phase 13,
+register writes over the USB UART; Phase 14, the same over SPI from an
+RP2350.
 
 ## 9. Risks
 
