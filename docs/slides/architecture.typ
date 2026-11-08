@@ -476,6 +476,32 @@ serialisers and (later) the SPI link have clocks of their own.
   ],
 )
 
+== Colour combiner and alpha test
+
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1em,
+  stack(
+    spacing: 6pt,
+    image("images/combiner-modes.png", height: 37%),
+    image("images/combiner-alpha.png", height: 37%),
+  ),
+  [
+    #set text(size: 14pt)
+    - *One N64-style cycle:* $(A - B) times C + D$, one for colour and one
+      for alpha, from texel, shade, `CONST0`, `CONST1`, one and zero;
+      colour's C can take any source's alpha. Presets: modulate, decal,
+      shade, tint, texture + shade, fade.
+    - *Every triangle* goes through it; untextured, the texel reads white.
+    - *Alpha test:* always, <, ≥ or ≠ `ALPHA_REF`; a failing pixel writes
+      no colour and no depth, so cut-outs show what's behind.
+    - *Cost:* 4 more pipeline stages, 1,349 logic cells, one multiplier.
+    - *Checked* by nine mutations; on the board the demo's last frame read
+      back pixel-exact.
+    - Left: the nine combiner settings; the four alpha tests and a cut-out.
+  ],
+)
+
 == In simulation
 
 #align(center, image("images/cube-sim.png", height: 80%))
@@ -625,10 +651,10 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [13852], [3841], [24288],
-      [flip-flops], [6192], [974], [24288],
+      [logic cells], [15201], [3841], [24288],
+      [flip-flops], [6891], [974], [24288],
       [block RAM (DP16KD)], [27], [5], [56],
-      [multipliers], [11], [2], [28],
+      [multipliers], [12], [2], [28],
       [PLL], [1], [—], [2],
       [I/O], [52], [—], [197],
     )
@@ -641,7 +667,7 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [85.5 MHz], [75],
+      [`clk_core`], [82.4 MHz], [75],
       [`clk_sclk`], [291 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
@@ -669,8 +695,9 @@ serialisers and (later) the SPI link have clocks of their own.
   [14], [v1.0 interface document: textures, combiner, memory, SPI design], done,
   [15], [memory access: uploads, reading frames back], done,
   [16], [textures: cache, perspective-correct sampling], done,
-  [17], [colour combiner and alpha test], next,
-  [18–19], [bilinear filtering if it fits; v1.0 frozen for games], later,
+  [17], [colour combiner and alpha test], done,
+  [18], [bilinear filtering, if it fits], next,
+  [19], [v1.0 frozen for games], later,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
@@ -691,9 +718,9 @@ serialisers and (later) the SPI link have clocks of their own.
   fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
 - *Frame rate:* 66 fps for the cube, but the full clear is about half of
   it; a fast clear (per-block flags) is the first fix if scenes get busier.
-- *Core timing margin:* 85.5 MHz against 75, but placement moves it by
+- *Core timing margin:* 82.4 MHz against 75, but placement moves it by
   several MHz from build to build (one Phase 16 build placed at 74).
-- *`just check` time:* 18 minutes, set by `sinter sim --cosim` replaying
+- *`just check` time:* 20–45 minutes, set by `sinter sim --cosim` replaying
   12M-cycle stimulus at about 13,000 cycles a second in 7 GB (R11).
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
   `#[no_reset]` accepted on non-registers; power-of-two memory depths.

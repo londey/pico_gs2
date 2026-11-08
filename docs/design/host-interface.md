@@ -721,6 +721,12 @@ having been emptied by the upload): 98.4% hits.
 
 ## 17. On the board
 
+**Phase 17.** `gs-host --combiner --screenshot` uploaded the demo's two
+textures and showed its three frames (the nine combiner settings, the
+four alpha tests and the cut-out, then the nine settings cut out by their
+own alpha), then read the last frame back: it matched the reference
+renderer's, and the twin's, pixel for pixel.
+
 **Phase 16.** `gs-host` uploaded the cube's 64 × 64 texture (1,024
 `MEM_DATA` writes) in 0.03 s and streamed the textured cube for 10 s: 614
 frames sent and 614 shown, 60.6 a second, at 4,000 transactions a second
