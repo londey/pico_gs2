@@ -2,8 +2,68 @@
 # Type-check the design, run its directed stimulus tests and the board-level
 # testbenches, then format check, lint and test the Rust workspace. Run via
 # `just check`, which builds first.
+#
+# The slow parts are independent runs (co-simulations, test binaries, the
+# gearbox testbench's cases), so each batch runs in parallel, one process a
+# run; each run's output goes to build/check-logs/<batch>/, and a failed
+# run's is printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Runs commands read from standard input, one a line, at most `max` at once
+# (default: all); waits for them all; prints each failure's command and
+# output. Fails if any failed.
+parallel() {
+    local batch=$1 max=${2:-0}
+    local dir="build/check-logs/$batch"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    local n=0 cmd
+    while IFS= read -r cmd; do
+        if [ "$max" -gt 0 ]; then
+            while [ "$(jobs -rp | wc -l)" -ge "$max" ]; do
+                wait -n || true
+            done
+        fi
+        printf '%s\n' "$cmd" > "$dir/$n.cmd"
+        ( (eval "$cmd") > "$dir/$n.log" 2>&1; echo $? > "$dir/$n.status" ) &
+        n=$((n + 1))
+    done
+    wait
+    local failed=0 k
+    for ((k = 0; k < n; k++)); do
+        if [ "$(cat "$dir/$k.status")" != 0 ]; then
+            echo "FAILED: $(cat "$dir/$k.cmd")" >&2
+            cat "$dir/$k.log" >&2
+            failed=1
+        fi
+    done
+    echo "    $n runs"
+    return $failed
+}
+
+# How many `sinter sim --cosim` runs of the recorded stimulus fit in memory
+# at once: each holds about 8 GB for the longest files.
+cosim_slots() {
+    local avail
+    avail=$(awk '/MemAvailable/ { print $2 }' /proc/meminfo)
+    local slots=$((avail / (8 * 1024 * 1024)))
+    echo $((slots < 1 ? 1 : slots))
+}
+
+# The test binaries of a workspace, as commands that run each from its
+# package's directory (as cargo test does), after building them.
+test_commands() {
+    cargo test "$@" --no-run --message-format=json | python3 -c '
+import json, os, shlex, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    exe = m.get("executable")
+    if m.get("reason") == "compiler-artifact" and m["profile"]["test"] and exe:
+        d = os.path.dirname(m["manifest_path"])
+        print("cd " + shlex.quote(d) + " && " + shlex.quote(exe))
+'
+}
 
 echo "==> sinter check hw/gpu.snt"
 sinter check hw/gpu.snt
@@ -22,9 +82,10 @@ cosim() {
 }
 
 # Directed tests: hw/tests/<root>.<case>.csv.
+echo "==> directed stimulus, --cosim"
 for csv in hw/tests/*.csv; do
-    cosim "$csv"
-done
+    echo "cosim $csv"
+done | parallel directed
 
 # Board-level testbenches: the hand-written logic in board/ that the Rust
 # twin doesn't cover. tmds_gearbox runs at each clk_sclk phase the board can
@@ -40,13 +101,10 @@ verilator --binary --timing -Wall -Wno-UNUSEDSIGNAL --top-module tmds_gearbox_tb
 for offset in 0 1333 2666 4000; do
     for reset in 100000 103333 107777; do
         for delay in 500 2500; do
-            "$tb/tb" +sclk_offset=$offset +reset=$reset +delay=$delay | grep -q '^PASS' || {
-                echo "tmds_gearbox_tb failed: +sclk_offset=$offset +reset=$reset +delay=$delay" >&2
-                exit 1
-            }
+            echo "$tb/tb +sclk_offset=$offset +reset=$reset +delay=$delay | grep '^PASS'"
         done
     done
-done
+done | parallel gearbox
 
 manifest=(--manifest-path sim/Cargo.toml)
 # The setup models are a workspace of their own (models/setup): see gen.sh.
@@ -62,13 +120,21 @@ cargo clippy "${manifest[@]}" --all-targets -- -D warnings
 cargo clippy "${setup[@]}" --all-targets -- -D warnings
 echo "==> cargo test"
 rm -rf build/stimulus
-cargo test "${setup[@]}"
-cargo test "${manifest[@]}"
+cargo test "${setup[@]}" --doc
+cargo test "${manifest[@]}" --doc
+{
+    test_commands "${setup[@]}"
+    test_commands "${manifest[@]}"
+} > build/check-tests.txt
+parallel tests < build/check-tests.txt
 
 # Stimulus the Rust testbenches recorded (build/stimulus/<root>.<case>.csv),
 # replayed against the Verilog: the same long runs the twin was checked on.
-for csv in build/stimulus/*.csv; do
-    cosim "$csv"
-done
+# Largest first, as many at once as memory allows.
+slots=$(cosim_slots)
+echo "==> recorded stimulus, --cosim ($slots at once)"
+for csv in $(ls -S build/stimulus/*.csv); do
+    echo "cosim $csv"
+done | parallel stimulus "$slots"
 
 echo "==> check passed"
