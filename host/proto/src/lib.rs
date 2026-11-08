@@ -13,6 +13,8 @@
 #![cfg_attr(all(not(debug_assertions), not(test)), deny(missing_docs))]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
+// Register flags are bools, one per bit, as the registers have them.
+#![allow(clippy::struct_excessive_bools)]
 
 /// Register addresses (host-interface.md §3).
 pub mod reg {
