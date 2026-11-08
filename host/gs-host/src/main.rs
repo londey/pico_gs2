@@ -10,15 +10,17 @@
 //! Closing the port releases DTR#, and the GPU goes back to its built-in
 //! scene.
 //!
-//! `--screenshot <file>` instead reads the colour buffer on screen back over
-//! the link (`MEM_DATA`, host-interface.md §9), saves it as a 640 × 360
-//! PNG, and compares it with the built-in scene's frames as the reference
-//! renderer draws them: on the board, a pixel-for-pixel check of the
-//! hardware against the model.
+//! `--screenshot <file>`, once streaming ends, reads the colour buffer on
+//! screen (the last frame streamed) back over the link (`MEM_DATA`,
+//! host-interface.md §9), saves it as a 640 × 360 PNG, and compares it with
+//! the reference renderer's version of that frame, texture upload included:
+//! on the board, a pixel-for-pixel check of the hardware against the model.
+//! With `--status` it streams nothing and compares with the built-in
+//! scene's frames.
 //!
 //! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]
-//! [--screenshot file.png]` (`--status` reads `ID` and `STATUS` and streams
-//! nothing).
+//! [--screenshot file.png] [--untextured]` (`--status` reads `ID` and
+//! `STATUS` and streams nothing).
 
 #![deny(unsafe_code)]
 
@@ -407,12 +409,12 @@ fn save_png(path: &str, frame: &[u16]) -> Result<()> {
 ///
 /// # Returns
 ///
-/// Its `TEX0_CFG`, enabled.
+/// Its `TEX0_CFG`, enabled, and the transactions that uploaded it.
 ///
 /// # Errors
 ///
 /// The link fails.
-fn upload_cube_texture(link: &mut Link) -> Result<Tex0Cfg> {
+fn upload_cube_texture(link: &mut Link) -> Result<(Tex0Cfg, Vec<Transaction>)> {
     let texels = cube_texture();
     let size = 1 << CUBE_TEXTURE_LOG2;
     let mut tiled = vec![0; texels.len()];
@@ -429,29 +431,42 @@ fn upload_cube_texture(link: &mut Link) -> Result<Tex0Cfg> {
         "uploaded a {size} x {size} texture in {:.2} s",
         start.elapsed().as_secs_f64()
     );
-    Ok(Tex0Cfg {
+    let cfg = Tex0Cfg {
         enable: true,
         width_log2: CUBE_TEXTURE_LOG2,
         height_log2: CUBE_TEXTURE_LOG2,
         base: u16::try_from(dword / 64)?,
         ..Tex0Cfg::default()
-    })
+    };
+    Ok((cfg, txns))
 }
 
-/// Saves the frame on screen and compares it with the built-in scene's.
+/// The frames a sequence of transactions presents, as the reference
+/// renderer draws them.
+fn reference_frames(txns: &[Transaction]) -> Vec<Vec<u16>> {
+    let mut frame = Frame::new(vec![0; FB_WIDTH * FB_HEIGHT]);
+    render(&mut frame, txns).0
+}
+
+/// Saves the frame on screen and compares it with what the reference
+/// renderer draws.
 ///
 /// # Arguments
 ///
 /// * `link` - The link, connected.
 /// * `path` - Where to save it.
+/// * `reference` - The frames it may be, as the reference renderer draws
+///   them.
+/// * `what` - What those frames are, to report.
 ///
 /// # Errors
 ///
 /// The link fails, or the file can't be written.
-fn screenshot(link: &mut Link, path: &str) -> Result<()> {
-    // The GPU hands over at the built-in scene's next present, and shows
-    // that frame from the next frame start: wait for both, then nothing
-    // changes the buffer on screen while the host presents nothing.
+fn screenshot(link: &mut Link, path: &str, reference: &[Vec<u16>], what: &str) -> Result<()> {
+    // The last frame presented (the built-in scene's, at which the GPU
+    // hands over, or the host's last) is shown from the next frame start:
+    // wait for it, then nothing changes the buffer on screen while the host
+    // presents nothing.
     sleep(Duration::from_millis(50));
     let status = Status::from_bits(link.read(reg::STATUS)?);
     println!("reading buffer {} ...", status.shown);
@@ -464,18 +479,21 @@ fn screenshot(link: &mut Link, path: &str) -> Result<()> {
     );
     save_png(path, &frame)?;
     println!("saved {path}");
-    let mut reference = Frame::new(vec![0; FB_WIDTH * FB_HEIGHT]);
-    let (frames, _) = render(&mut reference, &transactions(&cube_scene()));
-    let (k, differing) = frames
+    let (k, differing) = reference
         .iter()
         .map(|f| f.iter().zip(&frame).filter(|(a, b)| a != b).count())
         .enumerate()
         .min_by_key(|&(_, d)| d)
-        .context("the reference scene has no frames")?;
-    if differing == 0 {
-        println!("matches the built-in scene's frame {k} pixel for pixel");
+        .context("no reference frames")?;
+    let which = if reference.len() > 1 {
+        format!("{what}'s frame {k}")
     } else {
-        println!("nearest the built-in scene's frame {k}, with {differing} pixels differing");
+        what.to_string()
+    };
+    if differing == 0 {
+        println!("matches {which} pixel for pixel");
+    } else {
+        println!("differs from {which} in {differing} pixels");
     }
     Ok(())
 }
@@ -555,19 +573,20 @@ fn main() -> Result<()> {
     }
     let before = Status::from_bits(link.read(reg::STATUS)?);
     print_status("STATUS", before);
-    if let Some(path) = &args.screenshot {
-        screenshot(&mut link, path)?;
-        link.port.write_data_terminal_ready(false)?;
-        return Ok(());
-    }
     if args.status_only {
+        if let Some(path) = &args.screenshot {
+            let rom = reference_frames(&transactions(&cube_scene()));
+            screenshot(&mut link, path, &rom, "the built-in scene")?;
+            link.port.write_data_terminal_ready(false)?;
+        }
         return Ok(());
     }
 
-    let tex = if args.untextured {
-        None
+    let (tex, upload) = if args.untextured {
+        (None, Vec::new())
     } else {
-        Some(upload_cube_texture(&mut link)?)
+        let (cfg, upload) = upload_cube_texture(&mut link)?;
+        (Some(cfg), upload)
     };
     println!(
         "streaming a live {}cube for {} s ...",
@@ -577,6 +596,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let (sent0, bytes0) = (link.sent, link.bytes);
     let mut frames: u32 = 0;
+    let mut last = Vec::new();
     while start.elapsed().as_secs_f64() < args.seconds {
         let angle = std::f32::consts::TAU * f32::from(u16::try_from(frames % FRAMES_PER_TURN)?)
             / f32::from(u16::try_from(FRAMES_PER_TURN)?);
@@ -585,6 +605,7 @@ fn main() -> Result<()> {
             None => transactions(&cube_at(angle, BACKGROUND)),
         };
         link.send(&txns)?;
+        last = txns;
         frames += 1;
     }
     // Everything sent has been taken once a read comes back.
@@ -604,6 +625,13 @@ fn main() -> Result<()> {
         "{} frames shown while streaming",
         after.frames.wrapping_sub(before.frames)
     );
+    if let Some(path) = &args.screenshot {
+        // The last frame streamed, after the texture upload.
+        let mut txns = upload;
+        txns.extend(last);
+        let reference = reference_frames(&txns);
+        screenshot(&mut link, path, &reference, "the last frame streamed")?;
+    }
     link.port.write_data_terminal_ready(false)?;
     Ok(())
 }
