@@ -266,7 +266,8 @@ impl Gpu {
         let clear_ok = idle;
         let present_ok = idle & !self.ready_valid;
         let presenting = frame_end & self.ready_valid;
-        let stalled = pout.ending & self.ready_valid;
+        // Waiting for the display, with nothing left to draw: not counted.
+        let stalled = pout.ending & self.ready_valid & idle;
 
         // The arbiter: a request, once chosen, is in front of the controller
         // from the next cycle until it is accepted. Requesters hold theirs

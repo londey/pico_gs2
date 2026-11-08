@@ -250,6 +250,9 @@ fn set_latency_timer(port: &str) -> String {
     };
     let path = format!("/sys/bus/usb-serial/devices/{name}/latency_timer");
     let before = std::fs::read_to_string(&path).unwrap_or_default();
+    if before.trim() == "1" {
+        return String::from("latency timer: 1 ms");
+    }
     match std::fs::write(&path, "1") {
         Ok(()) => format!("latency timer: {} ms -> 1 ms", before.trim()),
         Err(e) => format!(

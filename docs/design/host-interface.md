@@ -256,7 +256,8 @@ As built (`sim/tb/tests/`):
 
 ## 9. Resources and timing (as built)
 
-The GPU with the host link places and routes at 77.8 MHz (75 needed) in
+The GPU with the host link places and routes at 76 to 78 MHz (75 needed;
+it varies with placement from build to build) in
 10,404 logic cells, 3,948 flip-flops, 21 DP16KD and 2 MULT18X18D, against
 Phase 12's 9,512, 3,391, 26 and 2. The command FIFO takes 2 DP16KD; the
 scene ROM is 2,048 transactions instead of 8,192 words, so the block RAMs
@@ -266,3 +267,20 @@ The parser registers each transaction before acting on it, the ROM's end
 marker included: a block RAM's output can't also choose the ROM's next
 address in the same cycle. (Checking the end marker straight from the FIFO
 or ROM output reached only 67 MHz.)
+
+## 10. On the board (Phase 13)
+
+`gs-host` read `ID` (0x5047533200010000) and `STATUS`, then streamed the
+live cube for 10 s: 616 frames sent and 616 shown, 60.7 a second (the
+display's rate: a `PRESENT` waits while a finished frame is waiting), at
+3,520 transactions and 31,700 bytes a second, 11% of the line. Each frame
+is about 57 transactions, so the link could carry about 9 times as many
+vertices before it limits the frame rate.
+
+The board's `STATUS` showed a frame drawn in about 822,000 cycles where the
+first simulated frames took 1.10 million; the twin, run longer, agreed with
+the board. The counter was at fault: it skipped every cycle the parser
+waited at a present for the display, including cycles in which the
+rasteriser was still drawing. It now skips only waits with the pipeline
+idle, and reads about 1.13 million cycles a frame in steady state (66
+frames a second drawn, so every 60 Hz refresh shows a new frame).
