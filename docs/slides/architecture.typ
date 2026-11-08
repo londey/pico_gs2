@@ -470,7 +470,8 @@ serialisers and (later) the SPI link have clocks of their own.
     - *Texel pass* per block: look up each drawn pixel, texture × shade into
       the colour tile. RGB565 and ARGB4444.
     - *Divide error:* within 1/8 texel down to Q = 1/256.
-    - *Cube:* 98.4% hits, every block fetched once.
+    - *Cube:* 98.4% hits, every block fetched once. On the board: 64.3
+      fps drawn (66.4 untextured), read back pixel-exact.
     - Left: the twin's frames, each pixel-exact against the reference.
   ],
 )

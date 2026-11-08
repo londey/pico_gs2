@@ -699,6 +699,16 @@ having been emptied by the upload): 98.4% hits.
 
 ## 17. On the board
 
+**Phase 16.** `gs-host` uploaded the cube's 64 × 64 texture (1,024
+`MEM_DATA` writes) in 0.03 s and streamed the textured cube for 10 s: 614
+frames sent and 614 shown, 60.6 a second, at 4,000 transactions a second
+(12% of the line). A textured frame drew in 1,165,810 cycles (64.3 frames a
+second), against 1,129,738 for the untextured built-in scene just before:
+texturing costs the cube about 3%, most of a frame still being the clear.
+`--screenshot` then read the last frame streamed back and it matched the
+reference renderer's, texture upload included, pixel for pixel; the
+built-in scene, read back the same way, matched its frame 1.
+
 **Phase 15.** `gs-host --screenshot` read `ID` (interface version 2) and
 `STATUS` (buffer 0 shown, 1 drawn; a frame drawn in 1,130,812 cycles),
 then read buffer 0 back, 230,400 pixels in 1.75 s, and it matched frame 16
