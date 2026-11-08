@@ -1,6 +1,6 @@
 # 0009: The v1.0 interface
 
-**Status:** Proposed (2026-11-08)
+**Status:** Accepted (2026-11-08)
 
 ## Context
 

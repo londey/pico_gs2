@@ -15,4 +15,4 @@ that supersedes the old one; the old one stays.
 | [0006](0006-datapath-reset-stopgap.md) | Only control state is reset | Accepted |
 | [0007](0007-fixed-point-notation.md) | Sinter fixed-point notation | Accepted |
 | [0008](0008-register-host-interface.md) | A register host interface | Accepted |
-| [0009](0009-v1-interface.md) | The v1.0 interface: textures, combiner, memory access | Proposed |
+| [0009](0009-v1-interface.md) | The v1.0 interface: textures, combiner, memory access | Accepted |

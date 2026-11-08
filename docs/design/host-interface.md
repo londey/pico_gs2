@@ -12,7 +12,7 @@ field means the same thing. ADR [0008](../adr/0008-register-host-interface.md)
 records the register interface and ADR
 [0009](../adr/0009-v1-interface.md) its v1.0 scope.
 
-**Status:** interface version 2, the v1.0 draft (Phase 14), for approval.
+**Status:** interface version 2, the v1.0 draft (Phase 14), approved 2026-11-08.
 Each register and field is marked *built* (in the design now) or with the
 phase that builds it. Version 1 (Phase 13) is built and works on the board;
 §14 lists what version 2 changes. The document is frozen as v1.0 at
