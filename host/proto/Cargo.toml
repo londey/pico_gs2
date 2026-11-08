@@ -1,0 +1,13 @@
+# The host interface's registers, transactions and serial framing
+# (docs/design/host-interface.md). no_std and dependency-free, so the PC
+# tool, the testbenches, the scene generator and the RP2350 firmware share
+# it.
+[package]
+name = "gs-proto"
+version = "0.1.0"
+description = "pico-gs2 host interface: registers, transactions, serial framing and credits"
+edition = "2021"
+publish = false
+workspace = "../../sim"
+
+[dependencies]

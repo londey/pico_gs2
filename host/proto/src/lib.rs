@@ -1,0 +1,704 @@
+//! The pico-gs2 host interface (`docs/design/host-interface.md`, ADR 0008):
+//! its registers and their fields, the 72-bit transactions that read and
+//! write them, and the serial link's framing and credit flow control.
+//!
+//! The PC tool, the testbenches, the scene generator (which writes the
+//! built-in scene as transactions) and, later, the RP2350 firmware all use
+//! this crate, so it is `no_std` and has no dependencies.
+
+#![no_std]
+#![deny(unsafe_code)]
+#![cfg_attr(all(not(debug_assertions), not(test)), deny(clippy::all))]
+#![cfg_attr(all(not(debug_assertions), not(test)), deny(clippy::pedantic))]
+#![cfg_attr(all(not(debug_assertions), not(test)), deny(missing_docs))]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::must_use_candidate)]
+
+/// Register addresses (host-interface.md §3).
+pub mod reg {
+    /// Colour and texture coordinates for the vertices that follow.
+    pub const ATTR0: u8 = 0x00;
+
+    /// Reserved: a second colour and texture coordinate set.
+    pub const ATTR1: u8 = 0x01;
+
+    /// A vertex; draws nothing.
+    pub const VERTEX_NOKICK: u8 = 0x06;
+
+    /// A vertex; draws (two back, one back, this one).
+    pub const VERTEX_KICK_012: u8 = 0x07;
+
+    /// A vertex; draws (two back, this one, one back).
+    pub const VERTEX_KICK_021: u8 = 0x08;
+
+    /// A vertex; draws (the primitive's first, one back, this one).
+    pub const VERTEX_KICK_FAN: u8 = 0x09;
+
+    /// Cull mode, depth and colour write enables, and the setup program.
+    pub const RENDER_MODE: u8 = 0x30;
+
+    /// Present the frame, and clear.
+    pub const FRAME: u8 = 0x40;
+
+    /// Frames shown, the last frame's cycles, free FIFO entries.
+    pub const STATUS: u8 = 0x7E;
+
+    /// Identification and interface version.
+    pub const ID: u8 = 0x7F;
+}
+
+/// What `ID` reads: "PGS2" and interface version 1.
+pub const ID_VALUE: u64 = 0x5047_5332_0001_0000;
+
+/// The serial link's line rate: 3 Mbaud, 8N1 (host-interface.md §5).
+pub const BAUD: u32 = 3_000_000;
+
+/// Transactions the GPU's command FIFO holds: the host's starting credits.
+pub const FIFO_ENTRIES: u32 = 512;
+
+/// Transactions each credit byte returns.
+pub const CREDIT_BATCH: u32 = 64;
+
+/// The tag byte of a credit from the GPU.
+pub const TAG_CREDIT: u8 = 0x01;
+
+/// The tag byte of a read reply from the GPU; 8 data bytes follow.
+pub const TAG_REPLY: u8 = 0x02;
+
+/// A 16-bit field as the low half of a word.
+fn bits16(v: i16) -> u64 {
+    u64::from(u16::from_ne_bytes(v.to_ne_bytes()))
+}
+
+/// The 16 bits of a word at `shift`, as signed.
+fn signed16(w: u64, shift: u32) -> i16 {
+    i16::from_ne_bytes(unsigned16(w, shift).to_ne_bytes())
+}
+
+/// The 16 bits of a word at `shift`.
+fn unsigned16(w: u64, shift: u32) -> u16 {
+    // Masked to 16 bits, so the conversion can't fail.
+    u16::try_from((w >> shift) & 0xFFFF).unwrap_or(0)
+}
+
+/// The 8 bits of a word at `shift`.
+fn byte(w: u64, shift: u32) -> u8 {
+    u8::try_from((w >> shift) & 0xFF).unwrap_or(0)
+}
+
+/// `ATTR0`: the colour and texture coordinates the following vertices take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Attr0 {
+    /// Red, 0 to 255.
+    pub r: u8,
+
+    /// Green.
+    pub g: u8,
+
+    /// Blue.
+    pub b: u8,
+
+    /// Alpha (carried, unused until blending).
+    pub a: u8,
+
+    /// S′ = S / W (carried, unused until texturing).
+    pub s: i16,
+
+    /// T′ = T / W.
+    pub t: i16,
+}
+
+impl Attr0 {
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// R in bits 63:56, G, B, A, S′ in 31:16, T′ in 15:0.
+    pub fn bits(self) -> u64 {
+        u64::from(self.r) << 56
+            | u64::from(self.g) << 48
+            | u64::from(self.b) << 40
+            | u64::from(self.a) << 32
+            | bits16(self.s) << 16
+            | bits16(self.t)
+    }
+
+    /// The fields of a register value.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields.
+    pub fn from_bits(w: u64) -> Attr0 {
+        Attr0 {
+            r: byte(w, 56),
+            g: byte(w, 48),
+            b: byte(w, 40),
+            a: byte(w, 32),
+            s: signed16(w, 16),
+            t: signed16(w, 0),
+        }
+    }
+}
+
+/// A `VERTEX_*` register's value: a vertex's position, depth and Q.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Position {
+    /// X, in 1/16 pixels (Q12.4).
+    pub x: i16,
+
+    /// Y, in 1/16 pixels, increasing downwards.
+    pub y: i16,
+
+    /// Depth, 0 nearest to 0xFFFF farthest.
+    pub z: u16,
+
+    /// Q ∝ 1/W (carried, unused until texturing).
+    pub q: u16,
+}
+
+impl Position {
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// X in bits 63:48, Y, Z, Q in 15:0.
+    pub fn bits(self) -> u64 {
+        bits16(self.x) << 48 | bits16(self.y) << 32 | u64::from(self.z) << 16 | u64::from(self.q)
+    }
+
+    /// The fields of a register value.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields.
+    pub fn from_bits(w: u64) -> Position {
+        Position {
+            x: signed16(w, 48),
+            y: signed16(w, 32),
+            z: unsigned16(w, 16),
+            q: unsigned16(w, 0),
+        }
+    }
+}
+
+/// Which way a kick draws its triangle, by vertex register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kick {
+    /// `VERTEX_NOKICK`: no triangle.
+    None,
+
+    /// `VERTEX_KICK_012`: (two back, one back, this one).
+    K012,
+
+    /// `VERTEX_KICK_021`: (two back, this one, one back).
+    K021,
+
+    /// `VERTEX_KICK_FAN`: (the primitive's first, one back, this one).
+    Fan,
+}
+
+impl Kick {
+    /// The vertex register for this kick.
+    ///
+    /// # Returns
+    ///
+    /// Its address.
+    pub fn register(self) -> u8 {
+        match self {
+            Kick::None => reg::VERTEX_NOKICK,
+            Kick::K012 => reg::VERTEX_KICK_012,
+            Kick::K021 => reg::VERTEX_KICK_021,
+            Kick::Fan => reg::VERTEX_KICK_FAN,
+        }
+    }
+
+    /// The kick a vertex register makes.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - A register address.
+    ///
+    /// # Returns
+    ///
+    /// The kick, or `None` if `addr` isn't a vertex register.
+    pub fn of(addr: u8) -> Option<Kick> {
+        match addr {
+            reg::VERTEX_NOKICK => Some(Kick::None),
+            reg::VERTEX_KICK_012 => Some(Kick::K012),
+            reg::VERTEX_KICK_021 => Some(Kick::K021),
+            reg::VERTEX_KICK_FAN => Some(Kick::Fan),
+            _ => None,
+        }
+    }
+}
+
+/// Which winding setup discards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cull {
+    /// Keep both.
+    #[default]
+    None,
+
+    /// Discard triangles anticlockwise on the screen (setup's back faces).
+    Anticlockwise,
+
+    /// Discard triangles clockwise on the screen.
+    Clockwise,
+}
+
+/// `RENDER_MODE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderMode {
+    /// Run the full (textured) setup program; else the untextured one, and
+    /// S′, T′ and Q are ignored.
+    pub textured: bool,
+
+    /// Which winding to discard.
+    pub cull: Cull,
+
+    /// Write the colour buffer.
+    pub colour_write: bool,
+
+    /// Write the depth buffer where a pixel is drawn.
+    pub z_write: bool,
+
+    /// Draw a pixel only if it is nearer than the depth buffer's.
+    pub z_test: bool,
+}
+
+impl Default for RenderMode {
+    /// The reset value: untextured, no culling, depth tested and written,
+    /// colour written.
+    fn default() -> RenderMode {
+        RenderMode {
+            textured: false,
+            cull: Cull::None,
+            colour_write: true,
+            z_write: true,
+            z_test: true,
+        }
+    }
+}
+
+impl RenderMode {
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// `TEXTURED` in bit 8, `CULL` in 6:5, `COLOR_WRITE` 4, `Z_WRITE` 3,
+    /// `Z_TEST` 2.
+    pub fn bits(self) -> u64 {
+        let cull = match self.cull {
+            Cull::None => 0,
+            Cull::Anticlockwise => 1,
+            Cull::Clockwise => 2,
+        };
+        u64::from(self.textured) << 8
+            | cull << 5
+            | u64::from(self.colour_write) << 4
+            | u64::from(self.z_write) << 3
+            | u64::from(self.z_test) << 2
+    }
+
+    /// The fields of a register value.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields; a `CULL` of 3 is none.
+    pub fn from_bits(w: u64) -> RenderMode {
+        RenderMode {
+            textured: w >> 8 & 1 == 1,
+            cull: match w >> 5 & 3 {
+                1 => Cull::Anticlockwise,
+                2 => Cull::Clockwise,
+                _ => Cull::None,
+            },
+            colour_write: w >> 4 & 1 == 1,
+            z_write: w >> 3 & 1 == 1,
+            z_test: w >> 2 & 1 == 1,
+        }
+    }
+}
+
+/// `FRAME`: present the frame being drawn, and clear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Frame {
+    /// The frame being drawn is done: show it from the next frame start,
+    /// and draw into the next buffer.
+    pub present: bool,
+
+    /// Fill the buffer being drawn (after any present) with `colour`.
+    pub clear_colour: bool,
+
+    /// Set its depths to the farthest, 0xFFFF.
+    pub clear_depth: bool,
+
+    /// The clear colour, RGB565.
+    pub colour: u16,
+}
+
+impl Frame {
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// The colour in bits 31:16, `CLEAR_DEPTH` 2, `CLEAR_COLOUR` 1,
+    /// `PRESENT` 0.
+    pub fn bits(self) -> u64 {
+        u64::from(self.colour) << 16
+            | u64::from(self.clear_depth) << 2
+            | u64::from(self.clear_colour) << 1
+            | u64::from(self.present)
+    }
+
+    /// The fields of a register value.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields.
+    pub fn from_bits(w: u64) -> Frame {
+        Frame {
+            present: w & 1 == 1,
+            clear_colour: w >> 1 & 1 == 1,
+            clear_depth: w >> 2 & 1 == 1,
+            colour: unsigned16(w, 16),
+        }
+    }
+}
+
+/// `STATUS`, as read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    /// Free command FIFO entries.
+    pub fifo_free: u16,
+
+    /// Core cycles the last finished frame took to draw.
+    pub render_cycles: u32,
+
+    /// Frames shown since reset, wrapping.
+    pub frames: u16,
+}
+
+impl Status {
+    /// The fields of a register value.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields.
+    pub fn from_bits(w: u64) -> Status {
+        Status {
+            fifo_free: unsigned16(w, 40) & 0x3FF,
+            render_cycles: u32::try_from(w >> 16 & 0xFF_FFFF).unwrap_or(0),
+            frames: unsigned16(w, 0),
+        }
+    }
+
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// Free entries in bits 49:40, cycles in 39:16, frames in 15:0.
+    pub fn bits(self) -> u64 {
+        u64::from(self.fifo_free & 0x3FF) << 40
+            | u64::from(self.render_cycles & 0xFF_FFFF) << 16
+            | u64::from(self.frames)
+    }
+}
+
+/// One transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transaction {
+    /// Write `data` to the register at `addr`.
+    Write {
+        /// The register's address, 0 to 0x7F.
+        addr: u8,
+
+        /// The value.
+        data: u64,
+    },
+
+    /// Read the register at `addr`.
+    Read {
+        /// The register's address, 0 to 0x7F.
+        addr: u8,
+    },
+}
+
+impl Transaction {
+    /// A write.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The register's address.
+    /// * `data` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The transaction.
+    pub fn write(addr: u8, data: u64) -> Transaction {
+        Transaction::Write { addr, data }
+    }
+
+    /// Its bytes on the serial link: a write is the address byte (bit 7
+    /// clear) and the data, MSB first; a read is the address byte with bit
+    /// 7 set.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - Where to put them.
+    ///
+    /// # Returns
+    ///
+    /// How many there are: 9 or 1.
+    pub fn encode(self, out: &mut [u8; 9]) -> usize {
+        match self {
+            Transaction::Write { addr, data } => {
+                out[0] = addr & 0x7F;
+                out[1..].copy_from_slice(&data.to_be_bytes());
+                9
+            }
+            Transaction::Read { addr } => {
+                out[0] = 0x80 | (addr & 0x7F);
+                1
+            }
+        }
+    }
+
+    /// Its 8-bit address field as the scene ROM stores it: bit 7 set for a
+    /// read.
+    ///
+    /// # Returns
+    ///
+    /// The address byte.
+    pub fn addr_byte(self) -> u8 {
+        match self {
+            Transaction::Write { addr, .. } => addr & 0x7F,
+            Transaction::Read { addr } => 0x80 | (addr & 0x7F),
+        }
+    }
+
+    /// Its data, 0 for a read.
+    ///
+    /// # Returns
+    ///
+    /// The data.
+    pub fn data(self) -> u64 {
+        match self {
+            Transaction::Write { data, .. } => data,
+            Transaction::Read { .. } => 0,
+        }
+    }
+}
+
+/// Something the GPU sent back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// [`CREDIT_BATCH`] more transactions have been taken from the FIFO.
+    Credit,
+
+    /// A read's value.
+    Data(u64),
+}
+
+/// Turns the bytes the GPU sends into [`Reply`]s.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplyDecoder {
+    /// Data bytes of a reply still to come (0 between messages).
+    remaining: u8,
+
+    /// The reply's data so far.
+    data: u64,
+}
+
+/// A byte the GPU sent that starts no message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownTag(pub u8);
+
+impl ReplyDecoder {
+    /// Takes one byte.
+    ///
+    /// # Arguments
+    ///
+    /// * `b` - The byte.
+    ///
+    /// # Returns
+    ///
+    /// A reply, if the byte completes one.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownTag`] for a byte between messages that isn't a tag.
+    pub fn push(&mut self, b: u8) -> Result<Option<Reply>, UnknownTag> {
+        if self.remaining > 0 {
+            self.data = self.data << 8 | u64::from(b);
+            self.remaining -= 1;
+            return Ok((self.remaining == 0).then_some(Reply::Data(self.data)));
+        }
+        match b {
+            TAG_CREDIT => Ok(Some(Reply::Credit)),
+            TAG_REPLY => {
+                self.remaining = 8;
+                self.data = 0;
+                Ok(None)
+            }
+            _ => Err(UnknownTag(b)),
+        }
+    }
+}
+
+/// The host's count of the transactions it may still send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Credits {
+    /// Transactions the FIFO has room for, as far as the host knows.
+    available: u32,
+}
+
+impl Default for Credits {
+    /// A fresh link: the whole FIFO.
+    fn default() -> Credits {
+        Credits {
+            available: FIFO_ENTRIES,
+        }
+    }
+}
+
+impl Credits {
+    /// Transactions that may be sent now.
+    ///
+    /// # Returns
+    ///
+    /// The count.
+    pub fn available(self) -> u32 {
+        self.available
+    }
+
+    /// Spends a credit on a transaction, if there is one.
+    ///
+    /// # Returns
+    ///
+    /// Whether the transaction may be sent.
+    pub fn spend(&mut self) -> bool {
+        if self.available == 0 {
+            return false;
+        }
+        self.available -= 1;
+        true
+    }
+
+    /// Takes a credit byte: [`CREDIT_BATCH`] more transactions.
+    pub fn grant(&mut self) {
+        self.available = (self.available + CREDIT_BATCH).min(FIFO_ENTRIES);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Register values decode to what was encoded.
+    #[test]
+    fn fields_round_trip() {
+        let a = Attr0 {
+            r: 1,
+            g: 2,
+            b: 250,
+            a: 255,
+            s: -3,
+            t: 32767,
+        };
+        assert_eq!(Attr0::from_bits(a.bits()), a);
+        let p = Position {
+            x: -16,
+            y: 5000,
+            z: 0xFFFF,
+            q: 0x8000,
+        };
+        assert_eq!(Position::from_bits(p.bits()), p);
+        assert_eq!(p.bits() >> 48, 0xFFF0);
+        for cull in [Cull::None, Cull::Anticlockwise, Cull::Clockwise] {
+            let m = RenderMode {
+                textured: true,
+                cull,
+                colour_write: false,
+                z_write: true,
+                z_test: false,
+            };
+            assert_eq!(RenderMode::from_bits(m.bits()), m);
+        }
+        assert_eq!(RenderMode::default().bits(), 0x1C);
+        let f = Frame {
+            present: true,
+            clear_colour: false,
+            clear_depth: true,
+            colour: 0x2104,
+        };
+        assert_eq!(Frame::from_bits(f.bits()), f);
+        let s = Status {
+            fifo_free: 512,
+            render_cycles: 1_103_542,
+            frames: 7,
+        };
+        assert_eq!(Status::from_bits(s.bits()), s);
+    }
+
+    /// A write is 9 bytes, MSB first; a read is one byte with bit 7 set.
+    #[test]
+    fn transactions_encode() {
+        let mut b = [0; 9];
+        let n = Transaction::write(reg::FRAME, 0x0102_0304_0506_0708).encode(&mut b);
+        assert_eq!(n, 9);
+        assert_eq!(b, [0x40, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(Transaction::Read { addr: reg::ID }.encode(&mut b), 1);
+        assert_eq!(b[0], 0xFF);
+    }
+
+    /// Credit bytes and replies decode, interleaved at message boundaries.
+    #[test]
+    fn replies_decode() {
+        let mut d = ReplyDecoder::default();
+        assert_eq!(d.push(TAG_CREDIT), Ok(Some(Reply::Credit)));
+        assert_eq!(d.push(TAG_REPLY), Ok(None));
+        let mut last = None;
+        for b in ID_VALUE.to_be_bytes() {
+            last = d.push(b).expect("data");
+        }
+        assert_eq!(last, Some(Reply::Data(ID_VALUE)));
+        assert_eq!(d.push(0x55), Err(UnknownTag(0x55)));
+    }
+
+    /// The host never has more credits than the FIFO has entries.
+    #[test]
+    fn credits_are_bounded() {
+        let mut c = Credits::default();
+        for _ in 0..FIFO_ENTRIES {
+            assert!(c.spend());
+        }
+        assert!(!c.spend());
+        c.grant();
+        assert_eq!(c.available(), CREDIT_BATCH);
+        for _ in 0..20 {
+            c.grant();
+        }
+        assert_eq!(c.available(), FIFO_ENTRIES);
+    }
+}

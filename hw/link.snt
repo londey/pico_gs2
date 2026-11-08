@@ -1,0 +1,243 @@
+// The serial host link (docs/design/host-interface.md §5): the board's
+// FT230X USB UART at 3 Mbaud, 8N1, on the 75 MHz core clock (25 clocks a
+// bit).
+//
+// Bytes from the host are assembled into 72-bit transactions: a write is an
+// address byte (bit 7 clear) and 8 data bytes, MSB first; a read is one
+// address byte with bit 7 set. Transactions go into a 512-entry FIFO, which
+// the command parser takes from. Every 64 transactions taken, the link sends
+// the host a credit byte, 0x01; the host starts with 512 credits and spends
+// one per transaction, so it never overruns the FIFO. A read's value goes
+// back as 0x02 and 8 bytes, MSB first.
+//
+// DTR# is the link's enable: while it is high (the port isn't open on the
+// PC) the link is held in reset, with the FIFO empty and no partial
+// transaction kept. `rx` and `dtr_n` arrive synchronised (board/top.sv).
+
+// Core clocks per bit, less one (the countdowns run to 0), and half that:
+// the receiver samples the start bit half a bit after its falling edge,
+// then every bit's middle.
+const BIT_LAST: u5 = 24;
+const HALF_BIT_LAST: u5 = 11;
+
+// The FIFO's depth, and the transactions each credit returns.
+const FIFO_FULL: u10 = 512;
+const CREDIT_TAG: u8 = 0x01;
+const REPLY_TAG: u8 = 0x02;
+
+pub struct LinkOut {
+    // The transaction at the FIFO's head: valid when `avail` is high, and
+    // `rptr` has been the same for a cycle (it changes only on `pop`).
+    pub head_addr: u8,
+    pub head_data: u64,
+    pub avail: u1,
+    // DTR# is low: a host has the port open.
+    pub enabled: u1,
+    // The UART's transmit line.
+    pub tx: u1,
+    // A read's reply is waiting to be sent: another can't be taken yet.
+    pub reply_busy: u1,
+    // Free FIFO entries.
+    pub free: u10,
+    // Sticky: a transaction arrived with the FIFO full (the host broke the
+    // credit rule), or a byte's stop bit was low.
+    pub overflow: u1,
+    pub framing: u1,
+}
+
+#[module]
+pub struct HostLink {
+    enabled: u1 = 0,
+
+    // The receiver: in a byte, the clocks to its next sample, which bit
+    // that is (0 the start bit, 1 to 8 the data, 9 the stop bit), and the
+    // data so far, LSB first.
+    rx_busy: u1 = 0,
+    rx_count: u5 = 0,
+    rx_bit: u4 = 0,
+    #[no_reset]
+    rx_shift: u8 = 0,
+
+    // The transaction being assembled: bytes so far (0 to 8), its address
+    // byte and data.
+    byte_i: u4 = 0,
+    #[no_reset]
+    t_addr: u8 = 0,
+    #[no_reset]
+    t_data: u64 = 0,
+
+    // The FIFO: write and read pointers and the entries in it.
+    wptr: u9 = 0,
+    rptr: u9 = 0,
+    count: u10 = 0,
+    #[storage(bram)]
+    #[no_reset]
+    fifo_addr: mem<u8, 512> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    fifo_data: mem<u64, 512> = 0,
+    overflow: u1 = 0,
+    framing: u1 = 0,
+
+    // Credits: transactions taken since the last credit was earned, and
+    // credit bytes owed.
+    taken: u6 = 0,
+    owed: u4 = 0,
+
+    // A read's reply: waiting or being sent, its data (shifted out from the
+    // top), and the reply's data bytes sent so far (0: the tag is next).
+    reply_valid: u1 = 0,
+    #[no_reset]
+    reply: u64 = 0,
+    reply_sending: u1 = 0,
+    reply_i: u4 = 0,
+
+    // The transmitter: sending a byte, the clocks to the next bit, bits
+    // left after the current one, and the bits still to send (data LSB
+    // first, then the stop bit).
+    tx_busy: u1 = 0,
+    tx_count: u5 = 0,
+    tx_left: u4 = 0,
+    #[no_reset]
+    tx_shift: u9 = 0,
+    tx_line: u1 = 1,
+}
+
+impl HostLink {
+    // `rx`, `dtr_n`: the UART's lines, synchronised. `pop`: the parser
+    // takes the FIFO's head. `reply`: a read's value, taken if
+    // `reply_busy` is low.
+    pub fn step(self, rx: u1, dtr_n: u1, pop: u1, reply: Option<u64>) -> (Self, LinkOut) {
+        // ---- Receive a byte. -----------------------------------------
+        let start = self.rx_busy == 0 & rx == 0;
+        let sample = self.rx_busy == 1 & self.rx_count == 0;
+        let at_start = sample & self.rx_bit == 0;
+        let at_data = sample & self.rx_bit != 0 & self.rx_bit != 9;
+        let at_stop = sample & self.rx_bit == 9;
+        // A start bit that is high again by its middle was a glitch.
+        let false_start = at_start & rx == 1;
+        let byte_done = at_stop & rx == 1;
+        let byte = self.rx_shift;
+
+        // ---- Assemble transactions. ----------------------------------
+        let first = self.byte_i == 0;
+        let read_byte = byte_done & first & byte[7:7] == 1;
+        let last_data = byte_done & self.byte_i == 8;
+        let push = read_byte | last_data;
+        let push_addr: u8 = if first { byte } else { self.t_addr };
+        let push_data: u64 = if first { 0 } else { self.t_data[55:0] @ byte };
+        let full = self.count == FIFO_FULL;
+        let push_ok = push & !full;
+
+        // ---- Take from the FIFO. -------------------------------------
+        let pop_ok = pop == 1 & self.count != 0;
+        let count = (self.count + (0_u9 @ push_ok) - (0_u9 @ pop_ok)) as u10 wrap;
+        let credit = pop_ok & self.taken == 63;
+
+        // ---- Transmit: a reply's bytes once begun, else credits, else
+        // a new reply. ------------------------------------------------
+        let (has_reply, reply_in) = match reply {
+            Some(r) => (1_u1, r),
+            None => (0_u1, 0_u64),
+        };
+        let take_reply = self.reply_valid == 0 & has_reply == 1;
+        let idle = self.tx_busy == 0;
+        let send_data = idle & self.reply_sending == 1;
+        let send_credit = idle & !send_data & self.owed != 0;
+        let send_tag = idle & !send_data & !send_credit & self.reply_valid == 1;
+        let load = send_data | send_credit | send_tag;
+        let tx_byte: u8 = if send_data {
+            self.reply[63:56]
+        } else if send_credit {
+            CREDIT_TAG
+        } else {
+            REPLY_TAG
+        };
+        let reply_done = send_data & self.reply_i == 8;
+        let tick = self.tx_busy == 1 & self.tx_count == 0;
+        let tx_done = tick & self.tx_left == 0;
+
+        let next = Self {
+            enabled: !dtr_n,
+            rx_busy: if start { 1 } else if false_start | at_stop { 0 } else { self.rx_busy },
+            rx_count: if start {
+                HALF_BIT_LAST
+            } else if sample {
+                BIT_LAST
+            } else {
+                (self.rx_count - 1) as u5 wrap
+            },
+            rx_bit: if start { 0 } else if sample { (self.rx_bit + 1) as u4 wrap } else { self.rx_bit },
+            rx_shift: if at_data { rx @ self.rx_shift[7:1] } else { self.rx_shift },
+            byte_i: if push { 0 } else if byte_done { (self.byte_i + 1) as u4 wrap } else { self.byte_i },
+            t_addr: if byte_done & first { byte } else { self.t_addr },
+            t_data: if byte_done & !first { self.t_data[55:0] @ byte } else { self.t_data },
+            wptr: if push_ok { (self.wptr + 1) as u9 wrap } else { self.wptr },
+            rptr: if pop_ok { (self.rptr + 1) as u9 wrap } else { self.rptr },
+            count: count,
+            fifo_addr: self.fifo_addr.next(self.rptr, push_ok, self.wptr, push_addr),
+            fifo_data: self.fifo_data.next(self.rptr, push_ok, self.wptr, push_data),
+            overflow: self.overflow | (push & full),
+            framing: self.framing | (at_stop & rx == 0),
+            taken: if pop_ok { (self.taken + 1) as u6 wrap } else { self.taken },
+            owed: if credit & !send_credit {
+                (self.owed + 1) as u4 wrap
+            } else if send_credit & !credit {
+                (self.owed - 1) as u4 wrap
+            } else {
+                self.owed
+            },
+            reply_valid: if take_reply { 1 } else if reply_done { 0 } else { self.reply_valid },
+            reply: if take_reply {
+                reply_in
+            } else if send_data {
+                self.reply[55:0] @ 0_u8
+            } else {
+                self.reply
+            },
+            reply_sending: if send_tag { 1 } else if reply_done { 0 } else { self.reply_sending },
+            reply_i: if send_tag { 1 } else if send_data { (self.reply_i + 1) as u4 wrap } else { self.reply_i },
+            tx_busy: if load { 1 } else if tx_done { 0 } else { self.tx_busy },
+            tx_count: if load | tick { BIT_LAST } else { (self.tx_count - 1) as u5 wrap },
+            tx_left: if load { 9 } else if tick { (self.tx_left - 1) as u4 wrap } else { self.tx_left },
+            tx_shift: if load { 1_u1 @ tx_byte } else if tick { 1_u1 @ self.tx_shift[8:1] } else { self.tx_shift },
+            tx_line: if load { 0 } else if tick & !tx_done { self.tx_shift[0:0] } else if tx_done { 1 } else { self.tx_line },
+        };
+        // While DTR# is high the link is held in reset; the memories keep
+        // their (now unreachable) contents.
+        let state = if dtr_n == 1 {
+            Self {
+                enabled: 0,
+                rx_busy: 0,
+                byte_i: 0,
+                wptr: 0,
+                rptr: 0,
+                count: 0,
+                taken: 0,
+                owed: 0,
+                reply_valid: 0,
+                reply_sending: 0,
+                reply_i: 0,
+                tx_busy: 0,
+                tx_line: 1,
+                ..next
+            }
+        } else {
+            next
+        };
+        (
+            state,
+            LinkOut {
+                head_addr: self.fifo_addr.value(),
+                head_data: self.fifo_data.value(),
+                avail: self.count != 0,
+                enabled: self.enabled,
+                tx: self.tx_line,
+                reply_busy: self.reply_valid,
+                free: (FIFO_FULL - self.count) as u10 wrap,
+                overflow: self.overflow,
+                framing: self.framing,
+            },
+        )
+    }
+}

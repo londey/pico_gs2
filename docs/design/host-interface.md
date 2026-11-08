@@ -7,7 +7,7 @@ here are the ones this pipeline can honour, with pico-gs's addresses where a
 register means the same thing. ADR [0008](../adr/0008-register-host-interface.md)
 records the decision.
 
-Status: proposed for Phase 13.
+Status: accepted (ADR 0008); built in Phase 13.
 
 ## 1. Phases
 
@@ -68,7 +68,7 @@ colour writes it once. Reset value 0 (black, S′ = T′ = 0).
 | 63:48 | X, signed, 1/16 pixel (Q12.4) |
 | 47:32 | Y, signed, 1/16 pixel (Q12.4) |
 | 31:16 | Z, unsigned, 0 nearest, 0xFFFF farthest |
-| 15:0 | Q = 1/W (UQ1.15; carried, unused until texturing) |
+| 15:0 | Q ∝ 1/W (format provisional; carried, unused until texturing) |
 
 Each write adds a vertex: this position with the latched `ATTR0`. These are
 today's scene vertex words 0 and 2 (position; Z and Q) in one register,
@@ -84,9 +84,15 @@ primitive has three vertices; before that it just adds the vertex.
 - Fan: `NOKICK, NOKICK, KICK_FAN, KICK_FAN, …`.
 - Separate triangles: `NOKICK, NOKICK, KICK_012` each.
 
-The GPU chooses the setup engine's vertex ring slots (four: a fan's first
-vertex keeps one, the rest cycle), as the parser does now; the host never
-sees them. Each triangle takes `RENDER_MODE` as it is at its kick.
+The GPU chooses the setup engine's vertex ring slots; the host never sees
+them. A primitive's first vertex goes in slot 0. If its third vertex is a
+`VERTEX_KICK_FAN` the primitive is a fan, slot 0 is kept, and later
+vertices cycle through slots 1 to 3; otherwise it is a strip and later
+vertices cycle through all four. So a fan's kicks should all be
+`VERTEX_KICK_FAN`, and a strip's never: a `KICK_FAN` in a strip pivots on
+whatever slot 0 then holds. A new primitive waits for the ring to be free,
+since its first vertex reuses slot 0. Each triangle takes `RENDER_MODE` as
+it is at its kick.
 
 ### 0x30 `RENDER_MODE`
 
@@ -154,11 +160,14 @@ with it.
 
 ## 5. The serial link (Phase 13)
 
-The board's FT230X is a USB UART: `usb_rx` into the FPGA, `usb_tx` out, and
-its `DTR#` and `RTS#` outputs. Nothing runs from the FPGA to its `CTS#`, so
-flow control goes over the data.
+The board's USB UART is an FT231X (the v1.3 PCB; its pin file calls it an
+FTDI): its TXD reaches the FPGA as `usb_rx` (ball K16), the FPGA drives its
+RXD as `usb_tx` (K15), and its `DTR#` and `RTS#` outputs reach the FPGA.
+Its `CTS#`, `DSR#`, `DCD#` and `RI#` are the FPGA's JTAG lines (the board is
+programmed through this chip), so there is no hardware flow control from
+the FPGA, and flow control goes over the data.
 
-- **Line:** 3,000,000 baud, 8N1, the FT230X's fastest: 25 core clocks a bit.
+- **Line:** 3,000,000 baud, 8N1, the FT231X's fastest: 25 core clocks a bit.
   About 300 KB/s, so 33,000 transactions a second, or 18,500 vertices
   (two transactions each, when every vertex has its own `ATTR0`).
 - **Bytes:** a write is 9 bytes, the 72 bits MSB first. A read is 1 byte,
@@ -173,9 +182,11 @@ flow control goes over the data.
   `0x01` each time the parser has taken 64 more, and the host adds 64. The
   host never overruns the FIFO, so nothing is dropped. At 33,000
   transactions a second, 512 in flight covers 15 ms of USB latency, about
-  the FT230X's default 16 ms latency timer.
-- **Read replies:** `0x02` and the 8 data bytes, MSB first, in order with
-  the credit bytes.
+  the chip's default 16 ms latency timer (`gs-host` tries to set it to
+  1 ms).
+- **Read replies:** `0x02` and the 8 data bytes, MSB first. Credit bytes
+  may come before or after a reply, never inside it. One reply waits at a
+  time; a read behind it in the FIFO waits.
 - **Synchronisers:** `usb_rx` and `DTR#` pass through two flip-flops in
   `board/top.sv`, outside the Sinter core.
 
@@ -189,10 +200,12 @@ is asserted. It switches only at a `FRAME` with `PRESENT`, so a frame is
 never half one source's; switching back to the ROM restarts it from the
 beginning, which starts with a clear.
 
-Sinter values are at most 64 bits, so the ROM is two: 64-bit data and an
-8-bit address. The cube is about 60 transactions a frame, about 2,000 for
-its 32 frames: 8 DP16KD for the data and 1 for the addresses (est.),
-against 16 now.
+Sinter values are at most 64 bits, so the ROM is two of 2,048 entries:
+64-bit data and an 8-bit address byte, where 0xFF (which would be a read of
+`ID`) marks the end. The cube is 1,825 transactions, 57 a frame: 30
+vertices, 24 `ATTR0`s (a vertex whose colour repeats doesn't rewrite it),
+2 `RENDER_MODE`s and a `FRAME`. An end of frame and the next frame's clear
+are one `FRAME`.
 
 The reference renderer (`render.rs`) runs on the same transactions, so the
 frame test checks the parser too.
@@ -204,37 +217,52 @@ frame test checks the parser too.
   Used by the PC tool, the twin tests, the scene generator, and the RP2350
   firmware in Phase 14.
 - **`host/gs-host`**: a PC command-line tool. It opens the serial port,
-  reads `ID`, streams a scene (the cube, turned live rather than from 32
-  precomputed frames, so it is visibly not the ROM), and prints `STATUS`
-  and the link's throughput. It is built in the devcontainer as a static
-  Linux binary and run on the host, which has the USB port, as
-  openFPGALoader is.
+  reads `ID`, streams a scene (the cube, turned live over a dark blue
+  background rather than from 32 precomputed frames, so it is visibly not
+  the ROM), and prints `STATUS` and the link's throughput. `just gs-host`
+  builds it in the devcontainer (it needs only the C library) to run on
+  the host, which has the USB port, as openFPGALoader is:
+  `sim/target/release/gs-host --port /dev/ttyUSB0 [--seconds 10]`, or
+  `--status` to read `ID` and `STATUS` only.
 
-Both are members of the `sim/` workspace.
+Both are members of the `sim/` workspace; `models/setup`, a workspace of
+its own, uses `host/proto` by path to write the scene ROM.
 
 ## 8. Verification
 
 - **Twin, from reset with DTR deasserted:** today's frame test, unchanged in
   what it checks: the ROM scene's frames pixel-exact against the reference.
-- **Twin, with a host:** a test drives `usb_rx` bit by bit at 25 cycles a
-  bit with bytes from `host/proto`, honouring credits from `usb_tx`; checks
-  `ID`, `STATUS`, frames pixel-exact against the reference renderer given
-  the same transactions, and that the FIFO never overflows.
-- **Link reset:** DTR deasserted in mid-transaction and mid-frame; the ROM
-  scene resumes at a frame boundary.
-- **Directed stimulus:** the UART receiver and transmitter, through
-  `--cosim`, like the other blocks.
-- **Recorded stimulus:** the frame tests record `usb_rx` and `DTR#` with
-  `sdram_dq`, and `just check` replays them with `--cosim`.
-- **Mutation:** break the credits, the kick roles and a write enable on
-  purpose and see the tests fail.
+As built (`sim/tb/tests/`):
 
-## 9. Resources (estimates)
+- **`frame.rs`, from reset with no host:** the ROM scene's frames pixel-exact
+  against the reference renderer on the same transactions.
+- **`host.rs`, with a host:** the ROM scene; then a host (`tb::Host`, at 25
+  cycles a bit, honouring credits) connects, reads `ID`, `STATUS` and
+  `RENDER_MODE`, and streams two frames: one with the depth test off, a
+  depth-only clear, a triangle that writes only depth and one that writes
+  no depth; then a cube frame. Every frame shown is whole and pixel-exact,
+  ROM then host; credits come back for every 64 transactions; the FIFO
+  drains and never overflows. The host disconnects and the ROM scene
+  restarts at its first frame.
+- **`host_link.rs`, the link alone:** transactions in order; DTR# high in
+  mid-transaction drops it and empties the FIFO; credits and whole replies;
+  the overflow and framing flags.
+- **Recorded stimulus:** `frame.rs` and `host.rs` record `sdram_dq`,
+  `usb_rx` and `usb_dtr_n` every cycle, and `just check` replays both with
+  `--cosim`, so the link's Verilog runs the whole host test.
+- **Mutation:** ignoring `Z_TEST`, `COLOR_WRITE` or `Z_WRITE`; clearing
+  colour on a depth-only clear; credits twice as often; `KICK_021` with the
+  old odd-strip roles; a fan pivoting on two back: each fails a test.
 
-| | DP16KD |
-|---|---|
-| command FIFO, 512 × 72 bits | 2 to 3 |
-| scene ROM, about 2,000 × 72 bits | 9 (16 now) |
+## 9. Resources and timing (as built)
 
-The UART, parser registers and credit counter are small. The total should
-fall a little from Phase 12's 26 DP16KD.
+The GPU with the host link places and routes at 77.8 MHz (75 needed) in
+10,404 logic cells, 3,948 flip-flops, 21 DP16KD and 2 MULT18X18D, against
+Phase 12's 9,512, 3,391, 26 and 2. The command FIFO takes 2 DP16KD; the
+scene ROM is 2,048 transactions instead of 8,192 words, so the block RAMs
+fall by 5.
+
+The parser registers each transaction before acting on it, the ROM's end
+marker included: a block RAM's output can't also choose the ROM's next
+address in the same cycle. (Checking the end marker straight from the FIFO
+or ROM output reached only 67 MHz.)

@@ -37,7 +37,7 @@ which is lost at power off; add `--write-flash` to keep it.
 
 The design fills a 640x360 RGB565 framebuffer in the SDRAM, stored as
 tiled 8x8 blocks, with a test pattern and shows it, then draws a built-in
-scene, a spinning Gouraud-shaded cube and two triangles crossing in depth
+scene (register writes in ROM, as a host would send them), a spinning Gouraud-shaded cube and two triangles crossing in depth
 over a dark grey background, depth tested against a 16-bit depth buffer
 and triple buffered: a frame drawn is shown from the next frame start. The
 picture goes out of the GPDI (mini HDMI) port as 1280x720 at 60 Hz (720p),
@@ -53,3 +53,21 @@ one-pixel white border. The LEDs show:
 | `led[2]` | the framebuffer has been filled |
 | `led[3]` | part of the picture wasn't loaded from SDRAM in time (it never should be) |
 | `led[4]` | toggles at every frame shown (so glows at 30 Hz) |
+
+### Driving it from a PC
+
+The board's USB port is also a 3 Mbaud serial link to the GPU
+([docs/design/host-interface.md](docs/design/host-interface.md)): a host
+writes and reads registers with it. With the board plugged in and the
+bitstream loaded, build the PC tool in the devcontainer with
+`just gs-host`, then on the host:
+
+```
+sim/target/release/gs-host --port /dev/ttyUSB0             # stream a live cube for 10 s
+sim/target/release/gs-host --port /dev/ttyUSB0 --status    # read ID and STATUS only
+```
+
+While the port is open the GPU draws what the host sends: the tool's cube
+turns all the way round, over a dark blue background. When it closes, the
+GPU goes back to its built-in scene. The tool reports the frames shown,
+how long a frame took to draw and the link's throughput.

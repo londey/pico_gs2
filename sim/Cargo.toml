@@ -5,7 +5,7 @@
 # command here.
 [workspace]
 resolver = "2"
-members = ["tb", "../models/sdram"]
+members = ["tb", "../models/sdram", "../host/proto", "../host/gs-host"]
 
 [workspace.package]
 edition = "2021"
@@ -15,7 +15,9 @@ publish = false
 gpu-sim = { path = "../build/sinter/gpu-sim" }
 tmds-encoder-sim = { package = "video__tmds_encoder-sim", path = "../build/sinter/video__tmds_encoder-sim" }
 sdram-controller-sim = { package = "sdram__sdram_controller-sim", path = "../build/sinter/sdram__sdram_controller-sim" }
+host-link-sim = { package = "link__host_link-sim", path = "../build/sinter/link__host_link-sim" }
 sdram-model = { path = "../models/sdram" }
+gs-proto = { path = "../host/proto" }
 setup-model = { path = "../models/setup" }
 setup-tb-sim = { package = "setup_tb-sim", path = "../build/sinter-setup/setup_tb-sim" }
 png = { version = "0.18", default-features = false }
@@ -28,6 +30,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package."sdram__sdram_controller-sim"]
+opt-level = 3
+
+[profile.dev.package."link__host_link-sim"]
 opt-level = 3
 
 [profile.dev.package.sdram-model]

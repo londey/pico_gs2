@@ -3,14 +3,17 @@
 //! (top-left rule); a pixel's colour and depth are each plane's start plus
 //! its gradients times the pixel's offset, modulo `2^36` as the
 //! rasteriser's stepping adders give it, then rounded and clamped (RGB565,
-//! and a 16-bit depth). A pixel is drawn if its depth is less than the
-//! depth buffer's, which then takes it.
+//! and a 16-bit depth). With the render mode's depth test on, a pixel is
+//! drawn only if its depth is less than the depth buffer's; a drawn pixel
+//! writes its colour and depth where the mode's write enables say.
+
+use gs_proto::{Cull, RenderMode, Transaction};
 
 use crate::formats::{wrap, REG_BITS};
-use crate::scene::{decode, Command, Primitive};
+use crate::scene::{interpret, Event};
 use crate::setup::setup;
 use crate::traverse::covered;
-use crate::triangle::{Attr, AttrSet, Triangle};
+use crate::triangle::{Attr, AttrSet, CullMode, Triangle};
 use crate::Plane;
 
 /// Framebuffer width, in pixels.
@@ -89,24 +92,30 @@ pub fn depth(v: i64) -> u16 {
     u16::try_from(((v + (1 << 15)) >> 16).clamp(0, 0xFFFF)).expect("in range")
 }
 
-/// Draws one triangle, depth tested.
+/// Draws one triangle.
 ///
 /// # Arguments
 ///
 /// * `frame` - The frame.
 /// * `tri` - The vertices, in role order.
-/// * `prim` - The primitive it belongs to (cull mode and program).
+/// * `mode` - The render mode: cull mode, program, depth test and write
+///   enables.
 ///
 /// # Returns
 ///
 /// Whether setup kept the triangle.
-pub fn draw(frame: &mut Frame, tri: &Triangle, prim: &Primitive) -> bool {
-    let attrs = if prim.untextured {
-        AttrSet::UNTEXTURED
-    } else {
+pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode) -> bool {
+    let attrs = if mode.textured {
         AttrSet::FULL
+    } else {
+        AttrSet::UNTEXTURED
     };
-    let Ok(s) = setup(tri, prim.cull, attrs) else {
+    let cull = match mode.cull {
+        Cull::None => CullMode::None,
+        Cull::Anticlockwise => CullMode::Back,
+        Cull::Clockwise => CullMode::Front,
+    };
+    let Ok(s) = setup(tri, cull, attrs) else {
         return false;
     };
     let plane = |a: Attr| s.planes[a.index()].expect("colour and depth are always computed");
@@ -123,56 +132,63 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, prim: &Primitive) -> bool {
         let index = usize::try_from(py).expect("on screen") * FB_WIDTH
             + usize::try_from(px).expect("on screen");
         let d = depth(value(&z, i, j));
-        if d < frame.depth[index] {
-            frame.depth[index] = d;
-            frame.colour[index] = quantise(value(&r, i, j), 5) << 11
-                | quantise(value(&g, i, j), 6) << 5
-                | quantise(value(&b, i, j), 5);
+        if !mode.z_test || d < frame.depth[index] {
+            if mode.z_write {
+                frame.depth[index] = d;
+            }
+            if mode.colour_write {
+                frame.colour[index] = quantise(value(&r, i, j), 5) << 11
+                    | quantise(value(&g, i, j), 6) << 5
+                    | quantise(value(&b, i, j), 5);
+            }
         }
     }
     true
 }
 
-/// Runs a scene's commands on a frame.
+/// Runs what the command parser makes of a scene on a frame.
 ///
 /// # Arguments
 ///
 /// * `frame` - The frame, holding what the scene starts from.
-/// * `cmds` - The commands.
+/// * `events` - The triangles and frame operations.
 ///
 /// # Returns
 ///
-/// The colours at each end of frame, and how many triangles setup kept.
-pub fn run(frame: &mut Frame, cmds: &[Command]) -> (Vec<Vec<u16>>, usize) {
+/// The colours at each present, and how many triangles setup kept.
+pub fn run(frame: &mut Frame, events: &[Event]) -> (Vec<Vec<u16>>, usize) {
     let mut frames = Vec::new();
     let mut kept = 0;
-    for c in cmds {
-        match c {
-            Command::Clear(rgb) => {
-                frame.colour.fill(*rgb);
-                frame.depth.fill(FAR);
-            }
-            Command::EndFrame => frames.push(frame.colour.clone()),
-            Command::Draw(prim) => {
-                for tri in prim.triangles() {
-                    kept += usize::from(draw(frame, &tri, prim));
+    for e in events {
+        match e {
+            Event::Frame(f) => {
+                // A present first, then the clears, of the next buffer.
+                if f.present {
+                    frames.push(frame.colour.clone());
+                }
+                if f.clear_colour {
+                    frame.colour.fill(f.colour);
+                }
+                if f.clear_depth {
+                    frame.depth.fill(FAR);
                 }
             }
+            Event::Draw(tri, mode) => kept += usize::from(draw(frame, tri, *mode)),
         }
     }
     (frames, kept)
 }
 
-/// Renders a scene's command words over a frame.
+/// Renders a scene's transactions over a frame.
 ///
 /// # Arguments
 ///
 /// * `frame` - The frame.
-/// * `words` - The scene's command words.
+/// * `txns` - The transactions.
 ///
 /// # Returns
 ///
-/// The colours at each end of frame, and how many triangles setup kept.
-pub fn render(frame: &mut Frame, words: &[u32]) -> (Vec<Vec<u16>>, usize) {
-    run(frame, &decode(words))
+/// The colours at each present, and how many triangles setup kept.
+pub fn render(frame: &mut Frame, txns: &[Transaction]) -> (Vec<Vec<u16>>, usize) {
+    run(frame, &interpret(txns))
 }

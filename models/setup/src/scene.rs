@@ -1,43 +1,28 @@
-//! Scenes as the host sends them: command packets of 32-bit words
-//! (`docs/design/triangle-pipeline.md` §6.1), the built-in test card and
-//! spinning cube, and the triangles a scene makes, in the order and with
-//! the roles the command parser (`hw/raster.snt`) gives them.
+//! Scenes as the host sends them: register transactions
+//! (`docs/design/host-interface.md`, ADR 0008), built from a description as
+//! strips, fans, clears and ends of frame; the built-in test card and
+//! spinning cube; and [`interpret`], which turns transactions back into the
+//! triangles and frame operations the GPU's command parser makes of them.
 //!
-//! A command is a header word, then, for a strip or fan, its vertices:
-//!
-//! | Bits | Field |
-//! |---|---|
-//! | 31:28 | opcode: 1 strip, 2 fan, 3 clear, 4 end of frame, 15 end of scene |
-//! | 27:26 | strip, fan: cull mode: 0 none, 1 back, 2 front |
-//! | 25 | strip, fan: 1 for the untextured program |
-//! | 15:0 | strip, fan: vertices that follow; clear: the RGB565 colour |
-//!
-//! Clear fills the frame being drawn with a colour and its depth with the
-//! farthest value; end of frame hands it to the display; end of scene goes
-//! back to the start (the animation loops).
-//!
-//! A vertex is four words: `x @ y` (two `Q12.4` counts), `R @ G @ B @ A`,
-//! `Z @ Q`, `S @ T`.
+//! A primitive's vertices go out as `ATTR0` (only when it changes) and a
+//! vertex register each: `VERTEX_NOKICK` for the first two, then for a strip
+//! `VERTEX_KICK_012` and `VERTEX_KICK_021` in turn, which keeps its winding,
+//! and for a fan `VERTEX_KICK_FAN`. `RENDER_MODE` goes out when a
+//! primitive's cull mode or program differs from the last. A clear is a
+//! `FRAME` with both clears, an end of frame a `FRAME` with `PRESENT`, and
+//! an end of frame followed by a clear is one `FRAME` with all three.
+
+use gs_proto::{reg, Attr0, Cull, Frame as FrameReg, Kick, Position, RenderMode, Transaction};
 
 use crate::formats::Coord;
 use crate::triangle::{CullMode, Triangle, Vertex};
 
-/// Words in the scene ROM.
-pub const SCENE_WORDS: usize = 8192;
+/// Transactions the scene ROM holds.
+pub const SCENE_ENTRIES: usize = 2048;
 
-/// Header opcodes.
-pub mod op {
-    /// A triangle strip.
-    pub const STRIP: u32 = 1;
-    /// A triangle fan.
-    pub const FAN: u32 = 2;
-    /// Clear the frame being drawn.
-    pub const CLEAR: u32 = 3;
-    /// The frame being drawn is done: hand it to the display.
-    pub const END_FRAME: u32 = 4;
-    /// The end of the scene: start again.
-    pub const END: u32 = 15;
-}
+/// The scene ROM's end marker, in the address byte: start again from the
+/// first entry. (It would be a read of `ID`, which a ROM never needs.)
+pub const ROM_END: u8 = 0xFF;
 
 /// One command of a scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,8 +53,8 @@ pub fn draws(prims: Vec<Primitive>) -> Vec<Command> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Each vertex after the second makes a triangle with the two before it;
-    /// every other triangle has roles 1 and 2 swapped, so that all of a
-    /// strip's triangles wind the same way.
+    /// every other triangle takes them in the other order (`KICK_021`), so
+    /// that all of a strip's triangles wind the same way.
     Strip,
     /// Each vertex after the second makes a triangle with the one before it
     /// and the first.
@@ -102,22 +87,61 @@ impl Primitive {
         let v = &self.vertices;
         (2..v.len())
             .map(|i| match self.kind {
-                Kind::Strip if (i - 2) % 2 == 0 => [v[i - 2], v[i - 1], v[i]],
-                Kind::Strip => [v[i - 1], v[i - 2], v[i]],
+                Kind::Strip if (i - 2).is_multiple_of(2) => [v[i - 2], v[i - 1], v[i]],
+                Kind::Strip => [v[i - 2], v[i], v[i - 1]],
                 Kind::Fan => [v[0], v[i - 1], v[i]],
             })
             .collect()
     }
+
+    /// The kick each vertex is written with.
+    fn kick(&self, i: usize) -> Kick {
+        match self.kind {
+            _ if i < 2 => Kick::None,
+            Kind::Strip if (i - 2).is_multiple_of(2) => Kick::K012,
+            Kind::Strip => Kick::K021,
+            Kind::Fan => Kick::Fan,
+        }
+    }
+
+    /// The render mode its triangles are drawn with.
+    fn mode(&self) -> RenderMode {
+        RenderMode {
+            textured: !self.untextured,
+            cull: match self.cull {
+                CullMode::None => Cull::None,
+                CullMode::Back => Cull::Anticlockwise,
+                CullMode::Front => Cull::Clockwise,
+            },
+            ..RenderMode::default()
+        }
+    }
 }
 
-/// The 16-bit field of a signed count.
-fn half(x: i64) -> u32 {
-    u32::from(u16::from_ne_bytes(
-        i16::try_from(x).expect("16-bit field").to_ne_bytes(),
-    ))
+/// A vertex's `ATTR0` value.
+fn attr0(v: &Vertex) -> Attr0 {
+    Attr0 {
+        r: v.r,
+        g: v.g,
+        b: v.b,
+        a: v.a,
+        s: v.s,
+        t: v.t,
+    }
 }
 
-/// Encodes a scene as command words, ending with END.
+/// A vertex's position register value.
+fn position(v: &Vertex) -> Position {
+    let field = |c: Coord| i16::try_from(c.to_count()).expect("a 16-bit coordinate");
+    Position {
+        x: field(v.x),
+        y: field(v.y),
+        z: v.z,
+        q: v.q,
+    }
+}
+
+/// A scene as transactions.
 ///
 /// # Arguments
 ///
@@ -125,116 +149,169 @@ fn half(x: i64) -> u32 {
 ///
 /// # Returns
 ///
-/// The words, for the scene ROM.
+/// The transactions.
 ///
 /// # Panics
 ///
-/// If the scene doesn't fit [`SCENE_WORDS`].
-pub fn encode(cmds: &[Command]) -> Vec<u32> {
-    let mut words = Vec::new();
-    for c in cmds {
+/// If a primitive has fewer than three vertices.
+pub fn transactions(cmds: &[Command]) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    let mut mode: Option<RenderMode> = None;
+    let mut attr: Option<Attr0> = None;
+    let mut cmds = cmds.iter().peekable();
+    while let Some(c) = cmds.next() {
         match c {
-            Command::Clear(rgb) => words.push(op::CLEAR << 28 | u32::from(*rgb)),
-            Command::EndFrame => words.push(op::END_FRAME << 28),
+            Command::Clear(rgb) => out.push(frame(false, Some(*rgb))),
+            Command::EndFrame => {
+                // An end of frame and the next frame's clear are one write.
+                if let Some(Command::Clear(rgb)) = cmds.peek() {
+                    out.push(frame(true, Some(*rgb)));
+                    cmds.next();
+                } else {
+                    out.push(frame(true, None));
+                }
+            }
             Command::Draw(p) => {
-                let opcode = match p.kind {
-                    Kind::Strip => op::STRIP,
-                    Kind::Fan => op::FAN,
-                };
-                let cull = match p.cull {
-                    CullMode::None => 0,
-                    CullMode::Back => 1,
-                    CullMode::Front => 2,
-                };
-                let n = u32::try_from(p.vertices.len()).expect("vertex count");
                 assert!(
-                    (3..=0xFFFF).contains(&n),
+                    p.vertices.len() >= 3,
                     "a primitive needs 3 or more vertices"
                 );
-                words.push(opcode << 28 | cull << 26 | u32::from(p.untextured) << 25 | n);
-                for v in &p.vertices {
-                    words.push(half(v.x.to_count()) << 16 | half(v.y.to_count()));
-                    words.push(u32::from_be_bytes([v.r, v.g, v.b, v.a]));
-                    words.push(u32::from(v.z) << 16 | u32::from(v.q));
-                    words.push(half(v.s.into()) << 16 | half(v.t.into()));
+                if mode != Some(p.mode()) {
+                    mode = Some(p.mode());
+                    out.push(Transaction::write(reg::RENDER_MODE, p.mode().bits()));
+                }
+                for (i, v) in p.vertices.iter().enumerate() {
+                    if attr != Some(attr0(v)) {
+                        attr = Some(attr0(v));
+                        out.push(Transaction::write(reg::ATTR0, attr0(v).bits()));
+                    }
+                    out.push(Transaction::write(p.kick(i).register(), position(v).bits()));
                 }
             }
         }
     }
-    words.push(op::END << 28);
-    assert!(
-        words.len() <= SCENE_WORDS,
-        "the scene is {} words",
-        words.len()
-    );
-    words
+    out
 }
 
-/// Decodes command words, as the command parser does.
+/// A `FRAME` write.
+fn frame(present: bool, clear: Option<u16>) -> Transaction {
+    let f = FrameReg {
+        present,
+        clear_colour: clear.is_some(),
+        clear_depth: clear.is_some(),
+        colour: clear.unwrap_or(0),
+    };
+    Transaction::write(reg::FRAME, f.bits())
+}
+
+/// The scene ROM's contents: a scene's transactions, then the end marker.
 ///
 /// # Arguments
 ///
-/// * `words` - The scene ROM's words, from the first.
+/// * `cmds` - The scene, one loop of it.
 ///
 /// # Returns
 ///
-/// The commands up to END.
-pub fn decode(words: &[u32]) -> Vec<Command> {
-    let signed = |w: u32| {
-        i64::from(i16::from_ne_bytes(
-            u16::try_from(w & 0xFFFF).expect("16 bits").to_ne_bytes(),
-        ))
-    };
-    let mut cmds = Vec::new();
-    let mut i = 0;
-    loop {
-        let h = words[i];
-        i += 1;
-        let kind = match h >> 28 {
-            op::STRIP => Kind::Strip,
-            op::FAN => Kind::Fan,
-            op::CLEAR => {
-                cmds.push(Command::Clear(u16::try_from(h & 0xFFFF).expect("16 bits")));
-                continue;
-            }
-            op::END_FRAME => {
-                cmds.push(Command::EndFrame);
-                continue;
-            }
-            _ => return cmds,
+/// [`SCENE_ENTRIES`] (address byte, data) pairs, padded with end markers.
+///
+/// # Panics
+///
+/// If the scene doesn't fit.
+pub fn rom(cmds: &[Command]) -> Vec<(u8, u64)> {
+    let mut entries: Vec<(u8, u64)> = transactions(cmds)
+        .into_iter()
+        .map(|t| (t.addr_byte(), t.data()))
+        .collect();
+    assert!(
+        entries.len() < SCENE_ENTRIES,
+        "the scene is {} transactions",
+        entries.len()
+    );
+    entries.resize(SCENE_ENTRIES, (ROM_END, 0));
+    entries
+}
+
+/// What the command parser makes of a transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A triangle, its vertices in role order, drawn with a render mode.
+    Draw(Triangle, RenderMode),
+
+    /// A `FRAME` write.
+    Frame(FrameReg),
+}
+
+/// Interprets transactions as the GPU's command parser does: `ATTR0` and
+/// `RENDER_MODE` are latched; a vertex takes the latched `ATTR0`; a
+/// `VERTEX_NOKICK` after a kick starts a primitive; a kick draws once its
+/// primitive has three vertices. Reads and other registers do nothing.
+///
+/// # Arguments
+///
+/// * `txns` - The transactions.
+///
+/// # Returns
+///
+/// The triangles and frame operations, in order.
+pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
+    let mut events = Vec::new();
+    let mut attr = Attr0::default();
+    let mut mode = RenderMode::default();
+    // The last vertex was a kick (as after reset), the primitive's vertices
+    // so far (saturating at 3), its first, and the two before this one.
+    let mut kicked = true;
+    let mut count = 0;
+    let mut first = Vertex::default();
+    let (mut back2, mut back1) = (Vertex::default(), Vertex::default());
+    for t in txns {
+        let Transaction::Write { addr, data } = *t else {
+            continue;
         };
-        let cull = match (h >> 26) & 3 {
-            1 => CullMode::Back,
-            2 => CullMode::Front,
-            _ => CullMode::None,
-        };
-        let n = usize::try_from(h & 0xFFFF).expect("16 bits");
-        let vertices = (0..n)
-            .map(|k| {
-                let w = &words[i + 4 * k..i + 4 * k + 4];
-                let [r, g, b, a] = w[1].to_be_bytes();
-                Vertex {
-                    x: Coord::from_count(signed(w[0] >> 16)),
-                    y: Coord::from_count(signed(w[0])),
-                    r,
-                    g,
-                    b,
-                    a,
-                    z: u16::try_from(w[2] >> 16).expect("16 bits"),
-                    q: u16::try_from(w[2] & 0xFFFF).expect("16 bits"),
-                    s: i16::try_from(signed(w[3] >> 16)).expect("16 bits"),
-                    t: i16::try_from(signed(w[3])).expect("16 bits"),
+        if let Some(kick) = Kick::of(addr) {
+            let p = Position::from_bits(data);
+            let v = Vertex {
+                x: Coord::from_count(i64::from(p.x)),
+                y: Coord::from_count(i64::from(p.y)),
+                r: attr.r,
+                g: attr.g,
+                b: attr.b,
+                a: attr.a,
+                z: p.z,
+                q: p.q,
+                s: attr.s,
+                t: attr.t,
+            };
+            if kick == Kick::None && kicked {
+                count = 0;
+            }
+            if count == 0 {
+                first = v;
+            }
+            count = (count + 1).min(3);
+            if count == 3 {
+                let tri = match kick {
+                    Kick::None => None,
+                    Kick::K012 => Some([back2, back1, v]),
+                    Kick::K021 => Some([back2, v, back1]),
+                    Kick::Fan => Some([first, back1, v]),
+                };
+                if let Some(tri) = tri {
+                    events.push(Event::Draw(tri, mode));
                 }
-            })
-            .collect();
-        i += 4 * n;
-        cmds.push(Command::Draw(Primitive {
-            kind,
-            cull,
-            untextured: (h >> 25) & 1 == 1,
-            vertices,
-        }));
+            }
+            kicked = kick != Kick::None;
+            back2 = back1;
+            back1 = v;
+        } else {
+            match addr {
+                reg::ATTR0 => attr = Attr0::from_bits(data),
+                reg::RENDER_MODE => mode = RenderMode::from_bits(data),
+                reg::FRAME => events.push(Event::Frame(FrameReg::from_bits(data))),
+                _ => {}
+            }
+        }
     }
+    events
 }
 
 /// A vertex at `(x, y)` pixels with colour `rgb`.
@@ -609,7 +686,23 @@ pub fn cube_frame(k: usize) -> Vec<Command> {
     let k = f32::from(u16::try_from(k).expect("small"));
     #[allow(clippy::cast_precision_loss)]
     let angle = std::f32::consts::FRAC_PI_2 * k / CUBE_FRAMES as f32;
-    let mut cmds = vec![Command::Clear(BACKGROUND)];
+    cube_at(angle, BACKGROUND)
+}
+
+/// One frame of the cube at any turn, over any background: cleared, the
+/// cube, the two crossing triangles, then handed to the display. What a
+/// host animating it live sends.
+///
+/// # Arguments
+///
+/// * `angle` - The cube's turn about the vertical, in radians.
+/// * `background` - The clear colour, RGB565.
+///
+/// # Returns
+///
+/// The frame's commands.
+pub fn cube_at(angle: f32, background: u16) -> Vec<Command> {
+    let mut cmds = vec![Command::Clear(background)];
     cmds.extend(draws(cube(angle)));
     cmds.extend(draws(crossing()));
     cmds.push(Command::EndFrame);

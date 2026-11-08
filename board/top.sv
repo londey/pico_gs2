@@ -27,6 +27,10 @@
 // DVI out: the core produces one 10-bit TMDS symbol per channel per clk_core
 // cycle. tmds_gearbox turns them into four bits per clk_sclk cycle, and an
 // ODDRX2F per channel sends those at two bits per clk_eclk cycle.
+//
+// Host link: the FT231X USB UART's TXD and DTR# reach the core through two
+// clk_core flip-flops each (they are asynchronous to it); the core drives
+// its RXD from a register (docs/design/host-interface.md section 5).
 module top (
     input  wire         clk,         // 50 MHz board oscillator
     output logic [4:0]  led,         // User LEDs, active high
@@ -41,7 +45,10 @@ module top (
     output logic [1:0]  sdram_ba,    // SDRAM bank address
     output logic [12:0] sdram_a,     // SDRAM address: row A[12:0], column A[8:0]
     output logic [1:0]  sdram_dqm,   // SDRAM byte masks: [0] DQ[7:0], [1] DQ[15:8]
-    inout  wire  [15:0] sdram_dq     // SDRAM data
+    inout  wire  [15:0] sdram_dq,    // SDRAM data
+    input  wire         usb_rx,      // UART from the FT231X (its TXD), 3 Mbaud, idle high
+    output logic        usb_tx,      // UART to the FT231X (its RXD)
+    input  wire         usb_dtrn     // FT231X DTR#: low while a host has the port open
 );
 
     logic             clk_core;        // 75 MHz core and pixel clock
@@ -65,6 +72,10 @@ module top (
     logic             sdram_dq_oe;     // High while the core drives sdram_dq
     logic             sdram_dq_t;      // Tristate control for the DQ buffers: high releases
     logic [15:0]      sdram_dq_in;     // SDRAM data as the pins see it
+    logic [1:0]       usb_rx_sync;     // usb_rx synchroniser flip-flops, clk_core domain
+    logic [1:0]       usb_rx_next;     // Next synchroniser value
+    logic [1:0]       usb_dtrn_sync;   // usb_dtrn synchroniser flip-flops, clk_core domain
+    logic [1:0]       usb_dtrn_next;   // Next synchroniser value
 
     // ------------------------------------------------------------------
     // Clocks
@@ -192,17 +203,40 @@ module top (
     assign rst_sclk_n = rst_sclk_sync[1];
 
     // ------------------------------------------------------------------
+    // Host link synchronisers. They power up idle (line high, DTR# high:
+    // no host) so the core sees no false start bit or host.
+    // ------------------------------------------------------------------
+    always_comb begin
+        usb_rx_next   = {usb_rx_sync[0], usb_rx};
+        usb_dtrn_next = {usb_dtrn_sync[0], usb_dtrn};
+    end
+
+    always_ff @(posedge clk_core or negedge rst_core_n) begin
+        if (!rst_core_n) begin
+            usb_rx_sync   <= 2'b11;
+            usb_dtrn_sync <= 2'b11;
+        end else begin
+            usb_rx_sync   <= usb_rx_next;
+            usb_dtrn_sync <= usb_dtrn_next;
+        end
+    end
+
+    // ------------------------------------------------------------------
     // GPU core
     // ------------------------------------------------------------------
     logic [15:0] debug_frames;         // Frames shown (for the tests; unused here), UQ16.0
     logic [23:0] debug_render_cycles;  // Core cycles the last frame took to draw (unused), UQ24.0
+    logic [1:0]  debug_link_errors;    // Host link's sticky errors (for the tests; unused here)
 
     Gpu u_gpu (
         .clk                   (clk_core),
         .rst_n                 (rst_core_n),
         .sdram_dq              (sdram_dq_in),
+        .usb_rx                (usb_rx_sync[1]),
+        .usb_dtr_n             (usb_dtrn_sync[1]),
         .debug_frames_q        (debug_frames),
         .debug_render_cycles_q (debug_render_cycles),
+        .debug_link_errors_q   (debug_link_errors),
         .tmds_blue_q           (tmds_blue),
         .tmds_green_q          (tmds_green),
         .tmds_red_q            (tmds_red),
@@ -216,7 +250,8 @@ module top (
         .out_sdram_a           (sdram_a),
         .out_sdram_dqm         (sdram_dqm),
         .out_sdram_dq_out      (sdram_dq_out),
-        .out_sdram_dq_oe       (sdram_dq_oe)
+        .out_sdram_dq_oe       (sdram_dq_oe),
+        .out_usb_tx            (usb_tx)
     );
 
     // ------------------------------------------------------------------

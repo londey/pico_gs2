@@ -4,10 +4,12 @@
 // every framebuffer pixel shown as 2x2 screen pixels, all on the 75 MHz core
 // clock, which is also the pixel clock. After the SDRAM's power-up sequence
 // the core writes a test pattern into the framebuffer in bank 0 and shows
-// it, then draws the built-in scene (ADR 0002), a frame at a time: the
-// command parser feeds the setup engine, and the rasteriser clears the
-// frame and writes its triangles back block by block, depth tested against
-// a 16-bit depth buffer in bank 3.
+// it, then draws a frame at a time: the command parser takes register
+// transactions (ADR 0008) from the built-in scene ROM, or from a host over
+// the USB UART while one is connected (docs/design/host-interface.md), and
+// feeds the setup engine; the rasteriser clears the frame and writes its
+// triangles back block by block, depth tested against a 16-bit depth
+// buffer in bank 3.
 //
 // Triple buffering: colour buffers in banks 0, 1 and 2, one shown, one
 // being drawn, and one either finished and waiting to be shown or spare.
@@ -29,11 +31,13 @@
 // board/top.sv serialises the TMDS symbols and owns the SDRAM's clock and
 // DQ buffers.
 
+mod link;
 mod raster;
 mod sdram;
 mod setup;
 mod video;
 
+use root::link::HostLink;
 use root::raster::Parser;
 use root::raster::Raster;
 use root::sdram::SdramController;
@@ -70,6 +74,14 @@ const LAST_SLOT: u8 = 191;
 // Half blocks in the frame: 90 half-block rows of 80.
 const FRAME_SLOTS: u13 = 7200;
 
+// Register addresses a host can read (docs/design/host-interface.md §3).
+const REG_RENDER_MODE: u7 = 0x30;
+const REG_STATUS: u7 = 0x7E;
+const REG_ID: u7 = 0x7F;
+
+// What ID reads: "PGS2", interface version 1.
+const ID_VALUE: u64 = 0x5047533200010000;
+
 // Who an SDRAM request, or run, belongs to.
 const OWNER_NONE: u2 = 0;
 const OWNER_FILL: u2 = 1;
@@ -95,10 +107,16 @@ struct Gpu {
     granted_req: SdramReq,
     data_owner: u2 = 0,
 
-    // The triangle pipeline.
+    // The host link and the triangle pipeline. `tri_flags`: the write
+    // enables and depth test (RENDER_MODE bits 4 to 2) of the triangle in
+    // the setup engine, which the rasteriser takes if it is kept.
+    link: HostLink,
     parser: Parser,
     setup: SetupEngine,
     raster: Raster,
+    tri_flags: u3 = 7,
+    // The link's free FIFO entries, a cycle old, for STATUS.
+    link_free: u10 = 512,
 
     // The colour buffers' banks: shown, being drawn, and the third: a
     // finished frame waiting to be shown (`ready_valid`), else spare.
@@ -112,9 +130,11 @@ struct Gpu {
     // display to take the last one.
     render_count: u24 = 0,
 
-    // For the tests: frames shown, and the last finished frame's cycles.
+    // For the tests: frames shown, the last finished frame's cycles, and
+    // the host link's sticky errors (FIFO overflow, framing).
     pub debug_frames: u16 = 0,
     pub debug_render_cycles: u24 = 0,
+    pub debug_link_errors: u2 = 0,
 
     // The fill: high until the test pattern is in the framebuffer, the
     // address of its next run, and the pixel it writes next: pixel (px, py)
@@ -191,11 +211,15 @@ struct Out {
     // half block wasn't loaded in time, led[4] toggles at every frame shown.
     led: u5,
     sdram: SdramPins,
+    // The UART's transmit line to the host.
+    usb_tx: u1,
 }
 
 impl Gpu {
     #[clock(domain = core, period = 1)]
-    fn tick(self, sdram_dq: u16) -> (Gpu, Out) {
+    // `usb_rx`, `usb_dtr_n`: the USB UART's receive line and DTR#, both
+    // synchronised in board/top.sv.
+    fn tick(self, sdram_dq: u16, usb_rx: u1, usb_dtr_n: u1) -> (Gpu, Out) {
         let (timing, beam) = self.timing.step(cea_1280x720(), 1);
 
         // The display finishes a half-block row after the last active pixel
@@ -214,6 +238,20 @@ impl Gpu {
         // The triangle pipeline's outputs, from its registers.
         let pout = self.parser.out();
         let rout = self.raster.out(self.draw);
+        // A host's read: the register's value, to the link.
+        let reply: Option<u64> = match pout.read {
+            Some(a) => Some(if a == REG_ID {
+                ID_VALUE
+            } else if a == REG_STATUS {
+                0_u14 @ self.link_free @ self.debug_render_cycles @ self.debug_frames
+            } else if a == REG_RENDER_MODE {
+                0_u55 @ pout.mode
+            } else {
+                0
+            }),
+            None => None,
+        };
+        let (link, lout) = self.link.step(usb_rx, usb_dtr_n, pout.pop, reply);
         let (setup, sout) = self.setup.step(pout.load, pout.start, rout.out_raddr);
         let kept = sout.done & sout.result == RESULT_KEPT;
         let free = !sout.busy & !sout.done & !rout.pending;
@@ -336,9 +374,32 @@ impl Gpu {
                 },
                 granted_req: if self.granted == OWNER_NONE { chosen_req } else { self.granted_req },
                 data_owner: if mem.accepted == 1 { self.granted } else { self.data_owner },
-                parser: self.parser.next(!self.filling, free, ring_free, clear_ok, present_ok),
+                link: link,
+                parser: self.parser.next(
+                    !self.filling,
+                    free,
+                    ring_free,
+                    clear_ok,
+                    present_ok,
+                    lout.enabled,
+                    lout.avail,
+                    lout.head_addr,
+                    lout.head_data,
+                    lout.reply_busy,
+                ),
                 setup: setup,
-                raster: self.raster.next(kept, sout.rdata, pout.clear, accepted_raster, wtake_raster, rdata_raster),
+                raster: self.raster.next(
+                    kept,
+                    self.tri_flags,
+                    sout.rdata,
+                    pout.clear,
+                    accepted_raster,
+                    wtake_raster,
+                    rdata_raster,
+                ),
+                tri_flags: if starting == 1 { pout.mode[4:2] } else { self.tri_flags },
+                link_free: lout.free,
+                debug_link_errors: lout.overflow @ lout.framing,
                 // A finished frame becomes the one waiting, and the spare
                 // the one drawn; at a frame start the one waiting is shown,
                 // and the one shown becomes the spare.
@@ -408,6 +469,7 @@ impl Gpu {
             Out {
                 led: self.frame_led @ self.underflow @ !self.filling @ mem.ready @ self.count[26:26],
                 sdram: mem.pins,
+                usb_tx: lout.tx,
             },
         )
     }

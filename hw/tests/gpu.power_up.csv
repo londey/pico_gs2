@@ -11,13 +11,14 @@
 # (0b11_0101_0100, 852). Until the framebuffer is filled the picture is
 # black: pixel (0, 0), from cycle 6, encodes 0x00 from zero disparity to
 # 0b01_0000_0000 (256), leaving the disparity at -8, so pixel (1, 0) is sent
-# inverted, 0b11_1111_1111 (1023). The LEDs are dark out of reset.
-sdram_dq, expect.tmds_blue_q, expect.tmds_green_q, expect.tmds_red_q, expect.out_led, expect.out_sdram_cke, expect.out_sdram_cs_n, expect.out_sdram_ras_n, expect.out_sdram_cas_n, expect.out_sdram_we_n, expect.out_sdram_dqm, expect.out_sdram_dq_oe
-0, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0    # cycle 0
-0, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
-0, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
-0, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
-0, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
-0, 852,  852,  852,  0, 1, 0, 1, 1, 1, 3, 0    # cycle 5: blanking
-0, 256,  256,  256,  0, 1, 0, 1, 1, 1, 3, 0    # cycle 6: pixel (0, 0)
-0, 1023, 1023, 1023, 0, 1, 0, 1, 1, 1, 3, 0    # cycle 7: pixel (1, 0)
+# inverted, 0b11_1111_1111 (1023). The LEDs are dark out of reset. The
+# USB UART is idle (line high) and no host is connected (DTR# high).
+sdram_dq, usb_rx, usb_dtr_n, expect.tmds_blue_q, expect.tmds_green_q, expect.tmds_red_q, expect.out_led, expect.out_sdram_cke, expect.out_sdram_cs_n, expect.out_sdram_ras_n, expect.out_sdram_cas_n, expect.out_sdram_we_n, expect.out_sdram_dqm, expect.out_sdram_dq_oe
+0, 1, 1, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0    # cycle 0
+0, 1, 1, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
+0, 1, 1, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
+0, 1, 1, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
+0, 1, 1, 0,    0,    0,    0, 1, 0, 1, 1, 1, 3, 0
+0, 1, 1, 852,  852,  852,  0, 1, 0, 1, 1, 1, 3, 0    # cycle 5: blanking
+0, 1, 1, 256,  256,  256,  0, 1, 0, 1, 1, 1, 3, 0    # cycle 6: pixel (0, 0)
+0, 1, 1, 1023, 1023, 1023, 0, 1, 0, 1, 1, 1, 3, 0    # cycle 7: pixel (1, 0)

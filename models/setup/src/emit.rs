@@ -32,8 +32,12 @@ pub struct Generated {
     /// The seed table.
     pub seed_hex: String,
 
-    /// The built-in scene, the spinning cube, as command words (ADR 0002).
-    pub scene_hex: String,
+    /// The built-in scene, the spinning cube, as transactions (ADR 0008):
+    /// each one's address byte (bit 7 set for a read; 0xFF the end).
+    pub scene_addr_hex: String,
+
+    /// Each transaction's data.
+    pub scene_data_hex: String,
 
     /// The schedule report.
     pub report: String,
@@ -93,6 +97,7 @@ pub fn generate() -> Generated {
     }
     mul.resize(ROM_WORDS, 0);
     alu.resize(ROM_WORDS, 0);
+    let scene = crate::scene::rom(&crate::scene::cube_scene());
     Generated {
         mul_hex: hex(
             "setup engine MUL-slot micro-ROM (generated)",
@@ -111,12 +116,15 @@ pub fn generate() -> Generated {
                 .map(|&s| u64::try_from(s).expect("positive")),
             5,
         ),
-        scene_hex: hex(
-            "the built-in scene, the spinning cube: command words (generated)",
-            crate::scene::encode(&crate::scene::cube_scene())
-                .into_iter()
-                .map(u64::from),
-            8,
+        scene_addr_hex: hex(
+            "the built-in scene, the spinning cube: transaction addresses (generated)",
+            scene.iter().map(|&(a, _)| u64::from(a)),
+            2,
+        ),
+        scene_data_hex: hex(
+            "the built-in scene, the spinning cube: transaction data (generated)",
+            scene.iter().map(|&(_, d)| d),
+            16,
         ),
         report,
         bases,

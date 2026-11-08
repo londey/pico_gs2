@@ -109,6 +109,10 @@ These are defaults, refined in the phase that builds each block.
 
 ### 6.1 Command packets
 
+*Superseded in Phase 13 by register transactions (ADR 0008,
+[host-interface.md](host-interface.md)); kept as the record of Phases 11
+and 12.*
+
 32-bit words, from the scene ROM now and the SPI link later. As built in
 Phase 11 (`models/setup/src/scene.rs`, `hw/raster.snt`), a command is a
 header word, then its vertices:

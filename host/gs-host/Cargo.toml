@@ -1,0 +1,16 @@
+# The PC side of the pico-gs2 host link (docs/design/host-interface.md §7):
+# drives the GPU over the board's USB UART. Built in the devcontainer, run on
+# the machine the board is plugged into.
+[package]
+name = "gs-host"
+version = "0.1.0"
+description = "Drives the pico-gs2 GPU over its USB UART: reads ID and STATUS, streams a live scene"
+edition = "2021"
+publish = false
+workspace = "../../sim"
+
+[dependencies]
+anyhow = { version = "1", default-features = false, features = ["std"] }
+gs-proto = { path = "../proto" }
+serialport = { version = "4", default-features = false }
+setup-model = { path = "../../models/setup" }

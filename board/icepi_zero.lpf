@@ -115,3 +115,13 @@ LOCATE COMP "sdram_casn" SITE "B13";
 IOBUF  PORT "sdram_casn" IO_TYPE=LVCMOS33 PULLMODE=NONE DRIVE=4;
 LOCATE COMP "sdram_rasn" SITE "A12";
 IOBUF  PORT "sdram_rasn" IO_TYPE=LVCMOS33 PULLMODE=NONE DRIVE=4;
+
+# USB UART (FT231X; its CTS#, DSR#, DCD# and RI# are the FPGA's JTAG). usb_tx
+# goes to its RXD, usb_rx comes from its TXD. DTR# is pulled up, so that with
+# no host (or the chip unpowered) the link reads as disconnected.
+LOCATE COMP "usb_tx" SITE "K15";
+IOBUF  PORT "usb_tx" PULLMODE=UP IO_TYPE=LVCMOS33 DRIVE=4;
+LOCATE COMP "usb_rx" SITE "K16";
+IOBUF  PORT "usb_rx" PULLMODE=UP IO_TYPE=LVCMOS33;
+LOCATE COMP "usb_dtrn" SITE "L15";
+IOBUF  PORT "usb_dtrn" PULLMODE=UP IO_TYPE=LVCMOS33;

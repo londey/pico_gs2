@@ -36,6 +36,10 @@ setup-report: gen
 slides:
     scripts/slides.sh
 
+# Build gs-host, the PC tool that drives the GPU over USB, to run on the host.
+gs-host: gen
+    scripts/gs_host.sh
+
 # Load build/fpga/top.bit onto a connected ICEpi Zero.
 flash:
     scripts/flash.sh

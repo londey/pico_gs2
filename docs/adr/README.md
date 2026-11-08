@@ -14,4 +14,4 @@ that supersedes the old one; the old one stays.
 | [0005](0005-simulator-verilator-oracle.md) | Simulator vs Verilator oracle | Accepted |
 | [0006](0006-datapath-reset-stopgap.md) | Only control state is reset | Accepted |
 | [0007](0007-fixed-point-notation.md) | Sinter fixed-point notation | Accepted |
-| [0008](0008-register-host-interface.md) | A register host interface | Proposed |
+| [0008](0008-register-host-interface.md) | A register host interface | Accepted |

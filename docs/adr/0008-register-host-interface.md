@@ -1,6 +1,6 @@
 # 0008: A register host interface
 
-**Status:** Proposed (2026-11-07)
+**Status:** Accepted (2026-11-07)
 
 ## Context
 

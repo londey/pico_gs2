@@ -1,19 +1,23 @@
 // The front and back of the triangle pipeline around the setup engine
-// (docs/design/triangle-pipeline.md §6):
+// (docs/design/triangle-pipeline.md §6, docs/design/host-interface.md):
 //
-//   Parser  reads the scene ROM's command packets, writes vertices into the
-//           setup engine's ring and starts its triangles, and passes on
-//           clears and ends of frame. The scene loops.
-//   Raster  clears a frame (colour and depth), or copies a set-up triangle
-//           out of the engine's output buffer and walks its bounding box in
-//           8x8 blocks: it reads a block's depths, steps the edge functions
-//           and the colour and depth planes one pixel per clock into tile
-//           buffers, depth-tests each pixel, and writes the block's colours
-//           and depths back, each half block with a drawn pixel as one
-//           masked 32-word SDRAM run.
+//   Parser  takes register transactions (ADR 0008) from the built-in scene
+//           ROM, or from the host link's FIFO while a host is connected:
+//           latches ATTR0 and RENDER_MODE, writes each vertex into the setup
+//           engine's ring and starts the triangles its kicks make, and
+//           carries out FRAME's present and clears. The ROM scene loops.
+//   Raster  clears a frame (colour, depth or both), or copies a set-up
+//           triangle out of the engine's output buffer and walks its bounding
+//           box in 8x8 blocks: it reads a block's depths, steps the edge
+//           functions and the colour and depth planes one pixel per clock
+//           into tile buffers, depth-tests each pixel, and writes the block's
+//           colours and depths back, each half block with a drawn pixel as
+//           one masked 32-word SDRAM run, as the triangle's render mode
+//           allows.
 //
-// The golden model is models/setup's reference renderer (render.rs); the
-// frame test compares the framebuffer with it pixel for pixel.
+// The golden model is models/setup's reference renderer (render.rs) on what
+// scene.rs's `interpret` makes of the same transactions; the frame tests
+// compare the framebuffer with it pixel for pixel.
 //
 // Both are plain structs inlined into the GPU, not #[module]s: each has
 // `out`, its outputs from its registers alone, and `next`, its next state
@@ -24,20 +28,33 @@ use root::sdram::SdramReq;
 use root::setup::Start;
 use root::setup::VertexWrite;
 
-// Command opcodes (models/setup/src/scene.rs).
-const OP_STRIP: u4 = 1;
-const OP_FAN: u4 = 2;
-const OP_CLEAR: u4 = 3;
-const OP_END_FRAME: u4 = 4;
+// Register addresses (docs/design/host-interface.md §3).
+const REG_ATTR0: u8 = 0x00;
+const REG_VERTEX_NOKICK: u8 = 0x06;
+const REG_VERTEX_KICK_FAN: u8 = 0x09;
+const REG_RENDER_MODE: u8 = 0x30;
+const REG_FRAME: u8 = 0x40;
+
+// The scene ROM's end marker (models/setup/src/scene.rs): start again.
+const ROM_END: u8 = 0xFF;
+
+// Kicks, as a vertex register's address less VERTEX_NOKICK's.
+const KICK_NONE: u2 = 0;
+const KICK_012: u2 = 1;
+const KICK_021: u2 = 2;
+
+// RENDER_MODE's reset value: depth tested and written, colour written.
+const MODE_RESET: u9 = 0x1C;
 
 // Parser states.
 const P_FETCH: u3 = 0;
 const P_DECODE: u3 = 1;
-const P_WRITE: u3 = 2;
-const P_START: u3 = 3;
-const P_CLEAR: u3 = 4;
-const P_HEAD: u3 = 5;
-const P_EOF: u3 = 6;
+const P_EXEC: u3 = 2;
+const P_WRITE: u3 = 3;
+const P_START: u3 = 4;
+const P_PRESENT: u3 = 5;
+const P_CLEAR: u3 = 6;
+const P_READ: u3 = 7;
 
 // Raster states.
 const R_IDLE: u4 = 0;
@@ -70,52 +87,76 @@ const FAR: u16 = 0xFFFF;
 // The framebuffer's last half block: 3,600 blocks of two.
 const LAST_HALF_BLOCK: u13 = 7199;
 
+// A clear of the frame being drawn: its colour, and which buffers.
+pub struct ClearCmd {
+    pub colour: u16 = 0,
+    pub colour_en: u1 = 0,
+    pub depth_en: u1 = 0,
+}
+
 pub struct ParserOut {
     pub load: Option<VertexWrite>,
     pub start: Option<Start>,
-    // Clear the frame being drawn to this colour.
-    pub clear: Option<u16>,
+    pub clear: Option<ClearCmd>,
     // The frame being drawn is done: hand it to the display.
     pub frame_done: u1,
-    // Waiting to end the frame.
+    // Waiting to present.
     pub ending: u1,
+    // Taking the head of the host link's FIFO.
+    pub pop: u1,
+    // A read of this register, waiting for the link to take its value.
+    pub read: Option<u7>,
+    // RENDER_MODE: its write enables go with each triangle started, and a
+    // read returns it.
+    pub mode: u9,
 }
 
 pub struct Parser {
     state: u3 = 0,
-    // The next word to fetch.
-    addr: u13 = 0,
-    // The current primitive: fan (else strip), cull mode, program, its
-    // vertices, and the vertex being loaded.
+    // Taking transactions from the host link (else the ROM), and the next
+    // ROM entry.
+    from_host: u1 = 0,
+    pc: u11 = 0,
+    // The transaction being carried out.
+    #[no_reset]
+    t_addr: u8 = 0,
+    #[no_reset]
+    t_data: u64 = 0,
+    // The latched registers.
+    attr: u64 = 0,
+    mode: u9 = 0x1C,
+    // The primitive: whether the last vertex was a kick (as after reset),
+    // its vertices so far (to 3), whether it is a fan (its third vertex
+    // was a KICK_FAN), and this vertex's kick.
+    kicked: u1 = 1,
+    count: u2 = 0,
     fan: u1 = 0,
-    cull: u2 = 0,
-    untextured: u1 = 0,
-    count: u16 = 0,
-    vertex: u16 = 0,
-    // The next word is a header.
-    header: u1 = 1,
-    // The vertex word being written out (0 to 3), and its next field.
-    word_k: u2 = 0,
-    field_j: u2 = 0,
+    kick: u2 = 0,
     // The ring slots of the vertex two back, one back, and this one.
     s0: u2 = 0,
     s1: u2 = 0,
     s2: u2 = 3,
+    // The vertex field being written (0 to 9).
+    field: u4 = 0,
     // The registered outputs.
     load_valid: u1 = 0,
     start_valid: u1 = 0,
     clear_valid: u1 = 0,
     frame_done: u1 = 0,
     #[no_reset]
-    word: u32 = 0,
-    #[no_reset]
     load: VertexWrite,
     #[no_reset]
     start: Start,
-    // The scene (generated: build/gen/scene.hex).
+    #[no_reset]
+    clear: ClearCmd,
+    // The scene (generated: build/gen/scene_*.hex): each transaction's
+    // address byte and data.
     #[storage(bram)]
     #[no_reset]
-    rom: rom<u32, 8192> = include_hex!("../build/gen/scene.hex"),
+    rom_addr: rom<u8, 2048> = include_hex!("../build/gen/scene_addr.hex"),
+    #[storage(bram)]
+    #[no_reset]
+    rom_data: rom<u64, 2048> = include_hex!("../build/gen/scene_data.hex"),
 }
 
 impl Parser {
@@ -124,186 +165,204 @@ impl Parser {
         ParserOut {
             load: if self.load_valid == 1 { Some(self.load) } else { None },
             start: if self.start_valid == 1 { Some(self.start) } else { None },
-            clear: if self.clear_valid == 1 { Some(self.word[15:0]) } else { None },
+            clear: if self.clear_valid == 1 { Some(self.clear) } else { None },
             frame_done: self.frame_done,
-            ending: (self.state == P_EOF),
+            ending: (self.state == P_PRESENT),
+            pop: (self.state == P_DECODE & self.from_host == 1),
+            read: if self.state == P_READ { Some(self.t_addr[6:0]) } else { None },
+            mode: self.mode,
         }
     }
 
     // `enable`: parse (after the framebuffer fill). `free`: the setup
     // engine can take a triangle: idle, and its last outputs copied.
-    // `ring_free`: no triangle is using the vertex ring: the engine is idle
-    // and no start is on its way to it. `clear_ok`: the rasteriser is idle.
-    // `present_ok`: everything is idle and the display can take a frame.
-    pub fn next(self, enable: u1, free: u1, ring_free: u1, clear_ok: u1, present_ok: u1) -> Self {
-        let w = self.rom.value();
-        let last_field = if self.word_k == 1 { self.field_j == 3 } else { self.field_j == 1 };
-        let last_word = self.word_k == 3;
-        let first_field = self.state == P_WRITE & self.word_k == 0 & self.field_j == 0;
-        // A vertex's ring slot is one no triangle still needs: a strip
-        // cycles through 0 to 3; a fan keeps 0 for its first vertex and
-        // cycles the rest through 1 to 3.
-        let new_slot: u2 = if self.fan == 1 & self.vertex == 0 {
+    // `ring_free`: no triangle is using the vertex ring. `clear_ok`: the
+    // pipeline is idle. `present_ok`: idle, and the display can take a
+    // frame. `link`: the host link's outputs: its FIFO's head, whether a
+    // host is connected, and whether it can take a read's reply.
+    pub fn next(
+        self,
+        enable: u1,
+        free: u1,
+        ring_free: u1,
+        clear_ok: u1,
+        present_ok: u1,
+        link_enabled: u1,
+        head_avail: u1,
+        head_addr: u8,
+        head_data: u64,
+        reply_busy: u1,
+    ) -> Self {
+        let st = self.state;
+
+        // ---- FETCH: the next transaction's source. A host that has gone
+        // hands back to the ROM, which starts again from its beginning. --
+        let host_gone = st == P_FETCH & self.from_host == 1 & link_enabled == 0;
+        let fetching = st == P_FETCH & enable == 1 & !host_gone & (self.from_host == 0 | head_avail == 1);
+
+        // ---- DECODE: the ROM's word, or the FIFO's head, into registers.
+        // Nothing is decided from it until EXEC: a block RAM's output is
+        // too slow to choose the ROM's next address in the same cycle. ----
+        let addr: u8 = if self.from_host == 1 { head_addr } else { self.rom_addr.value() };
+        let data: u64 = if self.from_host == 1 { head_data } else { self.rom_data.value() };
+        let rom_end = st == P_EXEC & self.from_host == 0 & self.t_addr == ROM_END;
+
+        // ---- EXEC. ------------------------------------------------------
+        let a = self.t_addr;
+        let is_vertex = a >= REG_VERTEX_NOKICK & a <= REG_VERTEX_KICK_FAN;
+        // 0x06 to 0x09 end in 2, 3, 0, 1.
+        let kick: u2 = (a[1:0] + 2) as u2 wrap;
+        let new_prim = kick == KICK_NONE & self.kicked == 1;
+        // A new primitive starts again from slot 0, which the last triangle
+        // may still be using: wait for the ring.
+        let vertex_go = st == P_EXEC & is_vertex & (!new_prim | ring_free == 1);
+        let count: u2 = if new_prim { 1 } else if self.count == 3 { 3 } else { (self.count + 1) as u2 wrap };
+        // A vertex's slot is one no triangle still needs: a strip cycles
+        // through 0 to 3; a fan keeps 0 for its first vertex and cycles
+        // the rest through 1 to 3.
+        let new_slot: u2 = if new_prim {
             0
         } else if self.fan == 1 & self.s2 == 3 {
             1
         } else {
             (self.s2 + 1) as u2 wrap
         };
-        // A strip's odd triangles have roles 1 and 2 swapped.
-        let roles: u6 = if self.fan == 1 {
-            0_u2 @ self.s1 @ self.s2
-        } else if self.vertex[0:0] == 1 {
-            self.s1 @ self.s0 @ self.s2
-        } else {
-            self.s0 @ self.s1 @ self.s2
-        };
+        let present = self.t_data[0:0];
+        let clears = self.t_data[2:1] != 0;
+        let is_frame = a == REG_FRAME;
 
-        // The field written this cycle, and its 36-bit value (signed fields
-        // sign-extended).
-        let hi = self.word[31:16];
-        let lo = self.word[15:0];
-        let sext_hi = ((hi as i16 wrap) as i36 wrap) as u36 wrap;
-        let sext_lo = ((lo as i16 wrap) as i36 wrap) as u36 wrap;
-        let byte = if self.field_j == 0 {
-            self.word[31:24]
-        } else if self.field_j == 1 {
-            self.word[23:16]
-        } else if self.field_j == 2 {
-            self.word[15:8]
+        // ---- WRITE: the vertex's ten fields, one a cycle: position and
+        // Z and Q from the register, colour and S'T' from ATTR0. ----------
+        let d = self.t_data;
+        let attr = self.attr;
+        let f = self.field;
+        let value: u36 = if f == 0 {
+            sext16(d[63:48])
+        } else if f == 1 {
+            sext16(d[47:32])
+        } else if f == 2 {
+            0_u28 @ attr[63:56]
+        } else if f == 3 {
+            0_u28 @ attr[55:48]
+        } else if f == 4 {
+            0_u28 @ attr[47:40]
+        } else if f == 5 {
+            0_u28 @ attr[39:32]
+        } else if f == 6 {
+            0_u20 @ d[31:16]
+        } else if f == 7 {
+            sext16(attr[31:16])
+        } else if f == 8 {
+            sext16(attr[15:0])
         } else {
-            self.word[7:0]
+            0_u20 @ d[15:0]
         };
-        let field: u4 = if self.word_k == 0 {
-            0_u3 @ self.field_j[0:0]
-        } else if self.word_k == 1 {
-            (2 + (0_u2 @ self.field_j)) as u4 wrap
-        } else if self.word_k == 2 {
-            if self.field_j == 0 { 6 } else { 9 }
-        } else if self.field_j == 0 {
-            7
-        } else {
-            8
-        };
-        let value: u36 = if self.word_k == 1 {
-            0_u28 @ byte
-        } else if self.word_k == 2 {
-            if self.field_j == 0 { 0_u20 @ hi } else { 0_u20 @ lo }
-        } else if self.field_j == 0 {
-            sext_hi
-        } else {
-            sext_lo
-        };
+        let last_field = st == P_WRITE & f == 9;
+        let draws = self.kick != KICK_NONE & self.count == 3;
 
-        let st = self.state;
+        // ---- START: the triangle's roles by its kick; its cull mode and
+        // program from RENDER_MODE. ----------------------------------------
         let starting = st == P_START & free == 1;
-        let next_vertex = (self.vertex + 1) as u16 wrap;
-        let next = if st == P_FETCH {
-            Self { state: if enable == 1 { P_DECODE } else { P_FETCH }, ..self }
+        let roles: u6 = if self.kick == KICK_012 {
+            self.s0 @ self.s1 @ self.s2
+        } else if self.kick == KICK_021 {
+            self.s0 @ self.s2 @ self.s1
+        } else {
+            0_u2 @ self.s1 @ self.s2
+        };
+        let cull: u2 = if self.mode[6:5] == 3 { 0 } else { self.mode[6:5] };
+
+        let presenting = st == P_PRESENT & present_ok == 1;
+        let clearing = st == P_CLEAR & clear_ok == 1;
+        let replied = st == P_READ & (reply_busy == 0 | link_enabled == 0);
+
+        let state: u3 = if st == P_FETCH {
+            if fetching { P_DECODE } else { P_FETCH }
         } else if st == P_DECODE {
-            // The word is registered before it is decoded: a header decides
-            // the next address, and the ROM's output is too slow to.
-            if self.header == 0 {
-                Self { state: P_WRITE, word: w, field_j: 0, ..self }
+            P_EXEC
+        } else if st == P_EXEC {
+            if rom_end {
+                P_FETCH
+            } else if a[7:7] == 1 {
+                if self.from_host == 1 { P_READ } else { P_FETCH }
+            } else if is_vertex {
+                if vertex_go { P_WRITE } else { P_EXEC }
+            } else if is_frame & present == 1 {
+                P_PRESENT
+            } else if is_frame & clears {
+                P_CLEAR
             } else {
-                Self { state: P_HEAD, word: w, ..self }
-            }
-        } else if st == P_HEAD {
-            let op = self.word[31:28];
-            let prim = op == OP_STRIP | op == OP_FAN;
-            if op == OP_CLEAR {
-                Self { state: P_CLEAR, ..self }
-            } else if op == OP_END_FRAME {
-                Self { state: P_EOF, ..self }
-            } else if prim & ring_free == 0 {
-                // A new primitive's vertices start again from slot 0, which
-                // the last triangle may still be using: wait for it.
-                self
-            } else if prim {
-                Self {
-                    state: P_FETCH,
-                    addr: (self.addr + 1) as u13 wrap,
-                    fan: (op == OP_FAN),
-                    cull: self.word[27:26],
-                    untextured: self.word[25:25],
-                    count: self.word[15:0],
-                    vertex: 0,
-                    header: 0,
-                    word_k: 0,
-                    s2: 3,
-                    ..self
-                }
-            } else {
-                // The end of the scene: start again.
-                Self { state: P_FETCH, addr: 0, ..self }
+                P_FETCH
             }
         } else if st == P_WRITE {
-            if !last_field {
-                Self { field_j: (self.field_j + 1) as u2 wrap, ..self }
-            } else if !last_word {
-                Self {
-                    state: P_FETCH,
-                    addr: (self.addr + 1) as u13 wrap,
-                    word_k: (self.word_k + 1) as u2 wrap,
-                    ..self
-                }
-            } else if self.vertex >= 2 {
-                Self { state: P_START, ..self }
-            } else {
-                Self {
-                    state: P_FETCH,
-                    addr: (self.addr + 1) as u13 wrap,
-                    word_k: 0,
-                    vertex: next_vertex,
-                    header: (next_vertex == self.count),
-                    ..self
-                }
-            }
-        } else if st == P_CLEAR {
-            if clear_ok == 1 {
-                Self { state: P_FETCH, addr: (self.addr + 1) as u13 wrap, ..self }
-            } else {
-                self
-            }
-        } else if st == P_EOF {
-            if present_ok == 1 {
-                Self { state: P_FETCH, addr: (self.addr + 1) as u13 wrap, ..self }
-            } else {
-                self
-            }
+            if !last_field { P_WRITE } else if draws { P_START } else { P_FETCH }
         } else if st == P_START {
-            if starting {
-                Self {
-                    state: P_FETCH,
-                    addr: (self.addr + 1) as u13 wrap,
-                    word_k: 0,
-                    vertex: next_vertex,
-                    header: (next_vertex == self.count),
-                    ..self
-                }
-            } else {
-                self
-            }
+            if starting { P_FETCH } else { P_START }
+        } else if st == P_PRESENT {
+            if !presenting { P_PRESENT } else if clears { P_CLEAR } else { P_FETCH }
+        } else if st == P_CLEAR {
+            if clearing { P_FETCH } else { P_CLEAR }
+        } else if replied {
+            P_FETCH
         } else {
-            self
+            P_READ
         };
+        let exec_plain = st == P_EXEC & a[7:7] == 0;
+        let next_pc: u11 = if host_gone | rom_end {
+            0
+        } else if st == P_DECODE & self.from_host == 0 {
+            (self.pc + 1) as u11 wrap
+        } else {
+            self.pc
+        };
+
         Self {
-                // A vertex's slot is fixed as its first field is written.
-                s0: if first_field { self.s1 } else { next.s0 },
-                s1: if first_field { self.s2 } else { next.s1 },
-                s2: if first_field { new_slot } else { next.s2 },
-                load_valid: (st == P_WRITE),
-                start_valid: starting,
-                clear_valid: (st == P_CLEAR & clear_ok == 1),
-                frame_done: (st == P_EOF & present_ok == 1),
-                load: VertexWrite {
-                    slot: if first_field { new_slot } else { self.s2 },
-                    field: field,
-                    value: value,
-                },
-                start: Start { roles: roles, cull: self.cull, untextured: self.untextured },
-                rom: self.rom.next(next.addr),
-                ..next
+            state: state,
+            // The ROM hands over to a host only at a present, so a frame is
+            // never half from each.
+            from_host: if host_gone {
+                0
+            } else if presenting & self.from_host == 0 & link_enabled == 1 {
+                1
+            } else {
+                self.from_host
+            },
+            pc: next_pc,
+            t_addr: if st == P_DECODE { addr } else { self.t_addr },
+            t_data: if st == P_DECODE { data } else { self.t_data },
+            attr: if exec_plain & a == REG_ATTR0 { self.t_data } else { self.attr },
+            mode: if host_gone {
+                MODE_RESET
+            } else if exec_plain & a == REG_RENDER_MODE {
+                self.t_data[8:0]
+            } else {
+                self.mode
+            },
+            kicked: if host_gone { 1 } else if vertex_go { (kick != KICK_NONE) } else { self.kicked },
+            count: if host_gone { 0 } else if vertex_go { count } else { self.count },
+            fan: if host_gone {
+                0
+            } else if vertex_go & new_prim {
+                0
+            } else if vertex_go & self.count == 2 {
+                (a == REG_VERTEX_KICK_FAN)
+            } else {
+                self.fan
+            },
+            kick: if vertex_go { kick } else { self.kick },
+            s0: if vertex_go { self.s1 } else { self.s0 },
+            s1: if vertex_go { self.s2 } else { self.s1 },
+            s2: if vertex_go { new_slot } else { self.s2 },
+            field: if st == P_WRITE { (self.field + 1) as u4 wrap } else { 0 },
+            load_valid: (st == P_WRITE),
+            start_valid: starting,
+            clear_valid: clearing,
+            frame_done: presenting,
+            load: VertexWrite { slot: self.s2, field: f, value: value },
+            start: Start { roles: roles, cull: cull, untextured: !self.mode[8:8] },
+            clear: ClearCmd { colour: self.t_data[31:16], colour_en: self.t_data[1:1], depth_en: self.t_data[2:2] },
+            rom_addr: self.rom_addr.next(next_pc),
+            rom_data: self.rom_data.next(next_pc),
         }
     }
 }
@@ -405,11 +464,18 @@ pub struct Raster {
     // colour); WRITE and CLEAR: whether its request has been taken.
     run: u2 = 0,
     requested: u1 = 0,
-    // CLEAR: the colour, the half block, and whether this is its depth run.
+    // CLEAR: the colour, which buffers, the half block, and whether this
+    // is its depth run.
     #[no_reset]
     clear_colour: u16 = 0,
+    clear_colour_en: u1 = 0,
+    clear_depth_en: u1 = 0,
     clear_hb: u13 = 0,
     clear_z: u1 = 0,
+    // RENDER_MODE's COLOR_WRITE, Z_WRITE and Z_TEST (bits 2 to 0) for the
+    // triangle being drawn, and for the one waiting to be copied.
+    flags: u3 = 7,
+    pending_flags: u3 = 7,
     // The block's colours and depths, in raster order.
     #[storage(lutram)]
     #[no_reset]
@@ -420,9 +486,13 @@ pub struct Raster {
 }
 
 impl Raster {
-    // The half block of the run being written has a drawn pixel.
+    // The run being written is wanted: its half block has a drawn pixel,
+    // and the triangle writes its buffer (colour for runs 0 and 1, depth
+    // for 2 and 3).
     fn run_used(self) -> u1 {
-        if self.run[0:0] == 0 { self.mask[31:0] != 0 } else { self.mask[63:32] != 0 }
+        let drawn = if self.run[0:0] == 0 { self.mask[31:0] != 0 } else { self.mask[63:32] != 0 };
+        let enabled = if self.run[1:1] == 0 { self.flags[2:2] } else { self.flags[1:1] };
+        drawn & enabled == 1
     }
 
     // A run is wanted: a depth read in ZREAD, a write of a half block with
@@ -464,23 +534,25 @@ impl Raster {
         }
     }
 
-    // `kept`: the setup engine has just finished a triangle it kept.
-    // `rdata`: the output buffer slot addressed last cycle. `clear`: clear
-    // the frame to this colour. `accepted`, `wtake`, `sdram_rdata`: the
-    // SDRAM controller's, for this unit's runs.
+    // `kept`: the setup engine has just finished a triangle it kept, and
+    // `kept_flags` are its write enables and depth test (RENDER_MODE's bits
+    // 4 to 2). `rdata`: the output buffer slot addressed last cycle.
+    // `clear`: clear the frame being drawn. `accepted`, `wtake`,
+    // `sdram_rdata`: the SDRAM controller's, for this unit's runs.
     pub fn next(
         self,
         kept: u1,
+        kept_flags: u3,
         rdata: u36,
-        clear: Option<u16>,
+        clear: Option<ClearCmd>,
         accepted: u1,
         wtake: u1,
         sdram_rdata: Option<u16>,
     ) -> Self {
         let st = self.state;
-        let (clearing, colour_in) = match clear {
+        let (clearing, clear_in) = match clear {
             Some(c) => (1_u1, c),
-            None => (0_u1, 0_u16),
+            None => (0_u1, ClearCmd { colour: 0, colour_en: 0, depth_en: 0 }),
         };
         let (zin, zword) = match sdram_rdata {
             Some(w) => (1_u1, w),
@@ -509,10 +581,12 @@ impl Raster {
         let reading = st == R_ZREAD;
         let zread_done = reading & self.zgot == 64;
 
-        // ---- PIXELS: drawn if covered and nearer than the depth there. ----
+        // ---- PIXELS: drawn if covered and (with the depth test) nearer
+        // than the depth there. -------------------------------------------
         let stepping = st == R_PIXELS;
         let z = depth(self.pz.pix);
-        let drawn = inside(self.e0) & inside(self.e1) & inside(self.e2) & z < self.ztile.value();
+        let nearer = z < self.ztile.value() | self.flags[0:0] == 0;
+        let drawn = inside(self.e0) & inside(self.e1) & inside(self.e2) & nearer;
         let colour = q5(self.pr.pix) @ q6(self.pg.pix) @ q5(self.pb.pix);
         let row_end = self.pix[2:0] == 7;
         let block_end = self.pix == 63;
@@ -524,8 +598,10 @@ impl Raster {
         let want = self.want();
         let sent_last = wtake & self.pix[4:0] == 31;
         let run_done = writing & (!self.run_used() | sent_last);
+        // A half block's colour run, then its depth run, each if enabled.
         let clear_run_done = st == R_CLEAR & sent_last;
-        let clear_done = clear_run_done & self.clear_z == 1 & self.clear_hb == LAST_HALF_BLOCK;
+        let clear_hb_done = clear_run_done & (self.clear_z == 1 | self.clear_depth_en == 0);
+        let clear_done = clear_hb_done & self.clear_hb == LAST_HALF_BLOCK;
         let read_ptr: u6 = if sending & wtake == 1 { (self.pix + 1) as u6 wrap } else { self.pix };
         let next_run = (self.run + 1) as u2 wrap;
 
@@ -550,7 +626,14 @@ impl Raster {
         } else if st == R_TEST {
             R_DECIDE
         } else if st == R_DECIDE {
-            if self.rejected == 1 { R_NEXT } else { R_ZREAD }
+            // Without the depth test there is nothing to read.
+            if self.rejected == 1 {
+                R_NEXT
+            } else if self.flags[0:0] == 1 {
+                R_ZREAD
+            } else {
+                R_PIXELS
+            }
         } else if reading {
             if zread_done { R_PIXELS } else { R_ZREAD }
         } else if stepping {
@@ -588,6 +671,8 @@ impl Raster {
         Self {
                 state: state,
                 pending: if kept == 1 { 1 } else if copy_done { 0 } else { self.pending },
+                pending_flags: if kept == 1 { kept_flags } else { self.pending_flags },
+                flags: if st == R_IDLE & clearing == 0 & self.pending == 1 { self.pending_flags } else { self.flags },
                 copy: if st == R_COPY { (self.copy + 1) as u5 wrap } else { 0 },
                 xs: if got & k == 9 { word as i16 wrap } else { self.xs },
                 ys: if got & k == 10 { word as i16 wrap } else { self.ys },
@@ -645,15 +730,26 @@ impl Raster {
                 } else {
                     0
                 },
-                clear_colour: if st == R_IDLE & clearing == 1 { colour_in } else { self.clear_colour },
+                clear_colour: if st == R_IDLE & clearing == 1 { clear_in.colour } else { self.clear_colour },
+                clear_colour_en: if st == R_IDLE & clearing == 1 { clear_in.colour_en } else { self.clear_colour_en },
+                clear_depth_en: if st == R_IDLE & clearing == 1 { clear_in.depth_en } else { self.clear_depth_en },
                 clear_hb: if st != R_CLEAR {
                     0
-                } else if clear_run_done & self.clear_z == 1 {
+                } else if clear_hb_done {
                     (self.clear_hb + 1) as u13 wrap
                 } else {
                     self.clear_hb
                 },
-                clear_z: if st != R_CLEAR { 0 } else if clear_run_done { !self.clear_z } else { self.clear_z },
+                // Each half block starts with its colour run, if enabled.
+                clear_z: if st == R_IDLE & clearing == 1 {
+                    !clear_in.colour_en
+                } else if clear_hb_done {
+                    !self.clear_colour_en
+                } else if clear_run_done {
+                    1
+                } else {
+                    self.clear_z
+                },
                 tile: self.tile.next(read_ptr, stepping, self.pix, colour),
                 ztile: self.ztile.next(zraddr, zwe, zwaddr, zwdata),
         }
@@ -804,6 +900,11 @@ fn q5(v: i36) -> u5 {
     } else {
         (q as u18 wrap)[4:0]
     }
+}
+
+// A 16-bit field, sign-extended to a vertex ring word.
+fn sext16(v: u16) -> u36 {
+    ((v as i16 wrap) as i36 wrap) as u36 wrap
 }
 
 // The depth plane's iterator count as a 16-bit depth: over 2^16, rounded

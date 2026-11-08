@@ -24,14 +24,20 @@ hw/                     Sinter sources (the design)
   sdram.snt             SDRAM controller (#[module])
   video.snt             video timing generator and TMDS encoder (#[module]s)
   setup.snt             triangle setup engine (#[module])
-  raster.snt            command parser (scene ROM) and rasteriser (clear, traversal,
-                        depth test, tile buffers)
+  raster.snt            command parser (register transactions from the scene ROM or
+                        the host link) and rasteriser (clear, traversal, depth test,
+                        tile buffers)
+  link.snt              host link (#[module]): USB UART at 3 Mbaud, transaction FIFO,
+                        credits, read replies
   setup_tb.snt          the engine's test root (sim/tb drives it); setup_synth.snt its
                         synthesis root
   *_tb.snt              test-harness roots that expose a block's ports to `sinter sim`
   tests/                directed stimulus: <root>.<case>.csv drives hw/<root>.snt
 sim/                    Rust workspace: testbenches (members include models/*)
   tb/                   integration tests driving the generated simulators
+host/                   the host side (docs/design/host-interface.md), sim/ members
+  proto/                gs-proto: no_std registers, transactions, framing, credits
+  gs-host/              PC tool: drives the GPU over the USB UART (`just gs-host`)
 models/                 Rust models of external chips
   sdram/                W9825G6KH SDRAM: pin-level, checks datasheet timing
   setup/                setup engine models, microcode generator (setup-gen) and
@@ -44,7 +50,8 @@ scripts/  justfile      task runner; every recipe is a script in scripts/
 docs/setup.md           the setup and bring-up plan
 docs/design/            design notes: triangle-pipeline.md (the rendering plan and
                         phases), setup-engine-brief.md (the setup engine spec),
-                        setup-engine.md (its numerics, as built)
+                        setup-engine.md (its numerics, as built), host-interface.md
+                        (registers and the host link)
 docs/adr/               architecture decision records, NNNN-title.md
 docs/slides/            Typst architecture slides (Touying + Fletcher, the theme in
                         theme/pico.typ, Inter and JetBrains Mono); `just slides`
@@ -66,6 +73,7 @@ bitstreams all live in `build/`.
 | `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
 | `just setup-report` | place and route the setup engine alone at 75 MHz; resources, Fmax, critical path |
 | `just slides` | `typst compile` each `docs/slides/*.typ` into `build/slides/*.pdf` |
+| `just gs-host` | build `sim/target/release/gs-host`, the PC tool for the host link (the user runs it on the host) |
 | `just flash` | `openFPGALoader -b icepi-zero build/fpga/top.bit` (the user runs this) |
 | `just ci` | everything CI runs, in order |
 | `just clean` | remove `build/` and `sim/target/` |

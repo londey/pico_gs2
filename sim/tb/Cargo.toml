@@ -10,8 +10,10 @@ gpu-sim.workspace = true
 tmds-encoder-sim.workspace = true
 sdram-controller-sim.workspace = true
 sdram-model.workspace = true
+gs-proto.workspace = true
 
 [dev-dependencies]
+host-link-sim.workspace = true
 png.workspace = true
 setup-model.workspace = true
 setup-tb-sim.workspace = true
