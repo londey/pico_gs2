@@ -447,14 +447,17 @@ fn main() -> Result<()> {
     println!("{}", set_latency_timer(&args.port));
     let mut link = Link::open(&args.port)?;
     let id = link.read(reg::ID)?;
-    println!(
-        "ID {id:#018x}{}",
-        if id == ID_VALUE {
-            " (pico-gs2, interface 1)"
-        } else {
-            " (not what pico-gs2 reads!)"
-        }
-    );
+    if id == ID_VALUE {
+        println!("ID {id:#018x} (pico-gs2, interface {})", id >> 16 & 0xFFFF);
+    } else if id >> 32 == ID_VALUE >> 32 {
+        println!(
+            "ID {id:#018x}: pico-gs2 interface {}, but this gs-host is for interface {}; rebuild one or the other",
+            id >> 16 & 0xFFFF,
+            ID_VALUE >> 16 & 0xFFFF
+        );
+    } else {
+        println!("ID {id:#018x} (not what pico-gs2 reads!)");
+    }
     let before = Status::from_bits(link.read(reg::STATUS)?);
     print_status("STATUS", before);
     if let Some(path) = &args.screenshot {

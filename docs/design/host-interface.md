@@ -627,7 +627,16 @@ bilinear filtering reads four texels a cycle. Each phase reports the real
 figures; the frame time of a textured scene, with its cache misses, is
 Phase 16's to measure.
 
-## 17. On the board (Phase 13)
+## 17. On the board
+
+**Phase 15.** `gs-host --screenshot` read `ID` (interface version 2) and
+`STATUS` (buffer 0 shown, 1 drawn; a frame drawn in 1,130,812 cycles),
+then read buffer 0 back, 230,400 pixels in 1.75 s, and it matched frame 16
+of the built-in scene as the reference renderer draws it, pixel for pixel:
+the first check of the board's own framebuffer against the model, not just
+the twin's.
+
+**Phase 13.**
 
 `gs-host` read `ID` (0x5047533200010000) and `STATUS`, then streamed the
 live cube for 10 s: 615 frames sent and 615 shown, 60.7 a second (the
