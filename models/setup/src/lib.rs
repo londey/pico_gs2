@@ -34,6 +34,7 @@
 // Until 1.0.0, allow dead code while the model grows.
 #![allow(dead_code)]
 
+pub mod demo;
 pub mod emit;
 pub mod float;
 mod formats;

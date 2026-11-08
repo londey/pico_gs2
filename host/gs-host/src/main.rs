@@ -6,7 +6,9 @@
 //! reads `ID` and `STATUS`, uploads a texture and streams a textured cube
 //! turned live over a dark blue background for a while, then reads `STATUS`
 //! again and reports the frames shown, the time a frame takes to draw and
-//! the link's throughput. `--untextured` streams the plain cube instead.
+//! the link's throughput. `--untextured` streams the plain cube instead;
+//! `--combiner` shows the colour combiner and alpha test demonstration
+//! (`setup_model::demo`), each of its frames for a few seconds.
 //! Closing the port releases DTR#, and the GPU goes back to its built-in
 //! scene.
 //!
@@ -19,8 +21,8 @@
 //! scene's frames.
 //!
 //! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]
-//! [--screenshot file.png] [--untextured]` (`--status` reads `ID` and
-//! `STATUS` and streams nothing).
+//! [--screenshot file.png] [--untextured | --combiner]` (`--status` reads
+//! `ID` and `STATUS` and streams nothing).
 
 #![deny(unsafe_code)]
 
@@ -38,6 +40,7 @@ use gs_proto::{
     ID_VALUE,
 };
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
+use setup_model::demo::combiner_demo;
 use setup_model::render::{render, Frame};
 use setup_model::scene::{
     cube_at, cube_scene, cube_texture, textured_cube_at, transactions, CUBE_TEXTURE_LOG2,
@@ -74,6 +77,9 @@ struct Args {
 
     /// Stream the cube without its texture.
     untextured: bool,
+
+    /// Show the combiner demonstration instead of the cube.
+    combiner: bool,
 }
 
 /// Parses the command line.
@@ -92,6 +98,7 @@ fn parse_args() -> Result<Args> {
         status_only: false,
         screenshot: None,
         untextured: false,
+        combiner: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -106,12 +113,13 @@ fn parse_args() -> Result<Args> {
             }
             "--status" => args.status_only = true,
             "--untextured" => args.untextured = true,
+            "--combiner" => args.combiner = true,
             "--screenshot" => {
                 args.screenshot = Some(it.next().context("--screenshot needs a file")?);
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png] [--untextured]"
+                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png] [--untextured | --combiner]"
                 );
                 std::process::exit(0);
             }
@@ -441,6 +449,44 @@ fn upload_cube_texture(link: &mut Link) -> Result<(Tex0Cfg, Vec<Transaction>)> {
     Ok((cfg, txns))
 }
 
+/// How long `--combiner` shows each frame.
+const DEMO_FRAME_TIME: Duration = Duration::from_secs(4);
+
+/// Shows the combiner demonstration a frame at a time, then optionally
+/// saves the last and checks it against the reference renderer.
+///
+/// # Arguments
+///
+/// * `link` - The link, connected.
+/// * `screenshot` - Where to save the last frame, if anywhere.
+///
+/// # Errors
+///
+/// The link fails, or the file can't be written.
+fn show_combiner_demo(link: &mut Link, screenshot_path: Option<&str>) -> Result<()> {
+    let txns = combiner_demo();
+    // Send up to and including each present, then hold it on screen.
+    let mut rest: &[Transaction] = &txns;
+    let mut shown = 0;
+    while let Some(end) = rest
+        .iter()
+        .position(|t| matches!(t, Transaction::Write { addr: reg::FRAME, data } if data & 1 == 1))
+    {
+        link.send(&rest[..=end])?;
+        link.read(reg::ID)?;
+        shown += 1;
+        println!("demo frame {shown}");
+        sleep(DEMO_FRAME_TIME);
+        rest = &rest[end + 1..];
+    }
+    if let Some(path) = screenshot_path {
+        let reference = reference_frames(&txns);
+        let last = reference.last().context("the demo has frames")?.clone();
+        screenshot(link, path, &[last], "the demo's last frame")?;
+    }
+    Ok(())
+}
+
 /// The frames a sequence of transactions presents, as the reference
 /// renderer draws them.
 fn reference_frames(txns: &[Transaction]) -> Vec<Vec<u16>> {
@@ -579,6 +625,12 @@ fn main() -> Result<()> {
             screenshot(&mut link, path, &rom, "the built-in scene")?;
             link.port.write_data_terminal_ready(false)?;
         }
+        return Ok(());
+    }
+
+    if args.combiner {
+        show_combiner_demo(&mut link, args.screenshot.as_deref())?;
+        link.port.write_data_terminal_ready(false)?;
         return Ok(());
     }
 

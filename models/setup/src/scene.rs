@@ -13,7 +13,8 @@
 //! an end of frame followed by a clear is one `FRAME` with all three.
 
 use gs_proto::{
-    reg, Attr0, Cull, Frame as FrameReg, Kick, Position, RenderMode, Tex0Cfg, Transaction,
+    const_channels, reg, Attr0, CcMode, Cull, Frame as FrameReg, Kick, Position, RenderMode,
+    Tex0Cfg, Transaction,
 };
 
 use crate::formats::Coord;
@@ -235,9 +236,9 @@ pub fn rom(cmds: &[Command]) -> Vec<(u8, u64)> {
 /// What the command parser makes of a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A triangle, its vertices in role order, drawn with a render mode and
-    /// a texture.
-    Draw(Triangle, RenderMode, Tex0Cfg),
+    /// A triangle, its vertices in role order, and the state it is drawn
+    /// with.
+    Draw(Triangle, DrawState),
 
     /// A `FRAME` write.
     Frame(FrameReg),
@@ -246,8 +247,41 @@ pub enum Event {
     Mem(u32, u64),
 }
 
+/// The render state a triangle is drawn with: the registers as they were at
+/// its kick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawState {
+    /// `RENDER_MODE`.
+    pub mode: RenderMode,
+
+    /// `TEX0_CFG`.
+    pub tex: Tex0Cfg,
+
+    /// `CC_MODE`.
+    pub cc: CcMode,
+
+    /// `CONST0`, R, G, B, A.
+    pub const0: [u8; 4],
+
+    /// `CONST1`.
+    pub const1: [u8; 4],
+}
+
+impl Default for DrawState {
+    /// The registers' reset values.
+    fn default() -> DrawState {
+        DrawState {
+            mode: RenderMode::default(),
+            tex: Tex0Cfg::default(),
+            cc: CcMode::default(),
+            const0: [255; 4],
+            const1: [255; 4],
+        }
+    }
+}
+
 /// Interprets transactions as the GPU's command parser does: `ATTR0`,
-/// `RENDER_MODE` and `TEX0_CFG` are latched; a vertex takes the latched
+/// `RENDER_MODE`, `TEX0_CFG`, `CC_MODE`, `CONST0` and `CONST1` are latched; a vertex takes the latched
 /// `ATTR0`; a `VERTEX_NOKICK` after a kick starts a primitive; a kick draws
 /// once its primitive has three vertices; `MEM_DATA` writes at `MEM_ADDR`
 /// and moves it on. Reads and other registers do nothing.
@@ -262,8 +296,7 @@ pub enum Event {
 pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
     let mut events = Vec::new();
     let mut attr = Attr0::default();
-    let mut mode = RenderMode::default();
-    let mut tex = Tex0Cfg::default();
+    let mut state = DrawState::default();
     let mut mem_addr: u32 = 0;
     // The last vertex was a kick (as after reset), the primitive's vertices
     // so far (saturating at 3), its first, and the two before this one.
@@ -304,7 +337,7 @@ pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
                     Kick::Fan => Some([first, back1, v]),
                 };
                 if let Some(tri) = tri {
-                    events.push(Event::Draw(tri, mode, tex));
+                    events.push(Event::Draw(tri, state));
                 }
             }
             kicked = kick != Kick::None;
@@ -313,9 +346,12 @@ pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
         } else {
             match addr {
                 reg::ATTR0 => attr = Attr0::from_bits(data),
-                reg::RENDER_MODE => mode = RenderMode::from_bits(data),
+                reg::RENDER_MODE => state.mode = RenderMode::from_bits(data),
                 reg::FRAME => events.push(Event::Frame(FrameReg::from_bits(data))),
-                reg::TEX0_CFG => tex = Tex0Cfg::from_bits(data),
+                reg::TEX0_CFG => state.tex = Tex0Cfg::from_bits(data),
+                reg::CC_MODE => state.cc = CcMode::from_bits(data),
+                reg::CONST0 => state.const0 = const_channels(data),
+                reg::CONST1 => state.const1 = const_channels(data),
                 reg::MEM_ADDR => mem_addr = u32::try_from(data & 0x3F_FFFF).unwrap_or(0),
                 reg::MEM_DATA => {
                     events.push(Event::Mem(mem_addr, data));

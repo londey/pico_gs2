@@ -67,6 +67,7 @@ sim/target/release/gs-host --port /dev/ttyUSB0             # stream a live cube 
 sim/target/release/gs-host --port /dev/ttyUSB0 --status    # read ID and STATUS only
 sim/target/release/gs-host --port /dev/ttyUSB0 --screenshot cube.png         # stream, then save the last frame
 sim/target/release/gs-host --port /dev/ttyUSB0 --status --screenshot rom.png  # save the built-in scene's frame
+sim/target/release/gs-host --port /dev/ttyUSB0 --combiner                     # the colour combiner and alpha test
 ```
 
 While the port is open the GPU draws what the host sends: the tool uploads

@@ -12,13 +12,14 @@
 
 use std::collections::HashMap;
 
-use gs_proto::{unpack_words, Cull, RenderMode, Tex0Cfg, Transaction};
+use gs_proto::{unpack_words, Cull, Tex0Cfg, Transaction};
 
 use crate::formats::{wrap, REG_BITS};
-use crate::scene::{interpret, Event};
+use crate::scene::{interpret, DrawState, Event};
 use crate::setup::setup;
 use crate::texture::{
-    coordinate, decode, modulate, reciprocal, rgb565, shade8, texel_addr, wrap as wrap_texel,
+    combine, coordinate, decode, reciprocal, rgb565, shade8, texel_addr, wrap as wrap_texel,
+    CcInputs,
 };
 use crate::traverse::covered;
 use crate::triangle::{Attr, AttrSet, CullMode, Triangle};
@@ -122,13 +123,15 @@ pub fn depth(v: i64) -> u16 {
 ///
 /// * `frame` - The frame.
 /// * `tri` - The vertices, in role order.
-/// * `mode` - The render mode: cull mode, depth test and write enables.
-/// * `tex` - The texture, which also picks the setup program.
+/// * `state` - The render state: render mode (cull mode, depth test, write
+///   enables, alpha test), texture (which also picks the setup program),
+///   combiner and its constants.
 ///
 /// # Returns
 ///
 /// Whether setup kept the triangle.
-pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode, tex: &Tex0Cfg) -> bool {
+pub fn draw(frame: &mut Frame, tri: &Triangle, state: &DrawState) -> bool {
+    let (mode, tex) = (state.mode, &state.tex);
     let attrs = if tex.enable {
         AttrSet::FULL
     } else {
@@ -143,12 +146,8 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode, tex: &Tex0Cfg) 
         return false;
     };
     let plane = |a: Attr| s.planes[a.index()].expect("colour and depth are always computed");
-    let (r, g, b, z) = (
-        plane(Attr::R),
-        plane(Attr::G),
-        plane(Attr::B),
-        plane(Attr::Z),
-    );
+    let shade_planes = [Attr::R, Attr::G, Attr::B, Attr::A].map(plane);
+    let z = plane(Attr::Z);
     let px0 = s.xs.to_count() >> 4;
     let py0 = s.ys.to_count() >> 4;
     for (px, py) in covered(&s) {
@@ -156,20 +155,28 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode, tex: &Tex0Cfg) 
         let index = usize::try_from(py).expect("on screen") * FB_WIDTH
             + usize::try_from(px).expect("on screen");
         let d = depth(value(&z, i, j));
-        if !mode.z_test || d < frame.depth[index] {
-            if mode.z_write {
-                frame.depth[index] = d;
-            }
-            if mode.colour_write {
-                let shade = [r, g, b].map(|p| shade8(value(&p, i, j)));
-                let colour = if tex.enable {
-                    let texel = sample(frame, &s, tex, i, j);
-                    [0, 1, 2].map(|c| modulate(texel[c], shade[c]))
-                } else {
-                    shade
-                };
-                frame.colour[index] = rgb565(colour);
-            }
+        if mode.z_test && d >= frame.depth[index] {
+            continue;
+        }
+        let inputs = CcInputs {
+            tex: if tex.enable {
+                sample(frame, &s, tex, i, j)
+            } else {
+                [255; 4]
+            },
+            shade: shade_planes.map(|p| shade8(value(&p, i, j))),
+            const0: state.const0,
+            const1: state.const1,
+        };
+        let out = combine(&state.cc, &inputs);
+        if !mode.alpha_test.passes(out[3], mode.alpha_ref) {
+            continue;
+        }
+        if mode.z_write {
+            frame.depth[index] = d;
+        }
+        if mode.colour_write {
+            frame.colour[index] = rgb565([out[0], out[1], out[2]]);
         }
     }
     true
@@ -227,7 +234,7 @@ pub fn run(frame: &mut Frame, events: &[Event]) -> (Vec<Vec<u16>>, usize) {
                     frame.depth.fill(FAR);
                 }
             }
-            Event::Draw(tri, mode, tex) => kept += usize::from(draw(frame, tri, *mode, tex)),
+            Event::Draw(tri, state) => kept += usize::from(draw(frame, tri, state)),
             Event::Mem(dword, data) => frame.write_dword(*dword, *data),
         }
     }

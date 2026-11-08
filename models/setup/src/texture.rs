@@ -1,7 +1,7 @@
 //! Texture sampling, bit for bit as the rasteriser does it
 //! (`docs/design/host-interface.md` §6): the perspective divide, the wrap
 //! modes, the texel's address in the 4 × 4-block tiled layout and its
-//! cache line, the texel formats, and texture × shade.
+//! cache line, the texel formats, and the colour combiner (§7).
 //!
 //! Each pixel has the S′, T′ and Q planes' iterator values (36-bit counts,
 //! 16 fraction bits over each field's native units: Q4.12 for S′ and T′,
@@ -19,7 +19,7 @@
 //! right (arithmetically, so rounding down), then saturated to 20 bits,
 //! ±32,768 texels.
 
-use gs_proto::{Tex0Cfg, TexFormat, Wrap};
+use gs_proto::{CcMode, CcSource, Tex0Cfg, TexFormat, Wrap};
 
 use crate::reciprocal::SEED_TABLE;
 
@@ -206,6 +206,57 @@ pub fn modulate(a: u8, c: u8) -> u8 {
     u8::try_from((u32::from(a) * c + 128) >> 8).expect("at most 255")
 }
 
+/// The combiner's inputs at a pixel, each R, G, B, A.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcInputs {
+    /// The texel (opaque white for an untextured triangle).
+    pub tex: [u8; 4],
+
+    /// The shade: the interpolated vertex colour.
+    pub shade: [u8; 4],
+
+    /// `CONST0`.
+    pub const0: [u8; 4],
+
+    /// `CONST1`.
+    pub const1: [u8; 4],
+}
+
+/// The colour combiner (host-interface.md §7): for each channel,
+/// `clamp(D + (((A − B) × C′ + 128) >> 8), 0, 255)`, `C′` being `C`
+/// stretched to 0 to 256 and `>>` rounding down.
+///
+/// # Arguments
+///
+/// * `cc` - `CC_MODE`.
+/// * `inputs` - The inputs.
+///
+/// # Returns
+///
+/// R, G, B and A.
+pub fn combine(cc: &CcMode, inputs: &CcInputs) -> [u8; 4] {
+    let pick = |s: CcSource, ch: usize| -> i32 {
+        i32::from(match s {
+            CcSource::Tex0 => inputs.tex[ch],
+            CcSource::Shade0 => inputs.shade[ch],
+            CcSource::Const0 => inputs.const0[ch],
+            CcSource::Const1 => inputs.const1[ch],
+            CcSource::One => 255,
+            CcSource::Zero | CcSource::Reserved(_) => 0,
+            CcSource::Tex0Alpha => inputs.tex[3],
+            CcSource::Shade0Alpha => inputs.shade[3],
+            CcSource::Const0Alpha => inputs.const0[3],
+        })
+    };
+    [0, 1, 2, 3].map(|ch| {
+        let abcd = if ch < 3 { cc.rgb } else { cc.alpha };
+        let [a, b, c, d] = abcd.map(|s| pick(s, ch));
+        let c = c + (c >> 7);
+        let v = d + (((a - b) * c + 128) >> 8);
+        u8::try_from(v.clamp(0, 255)).expect("clamped")
+    })
+}
+
 /// An 8-bit colour as RGB565, keeping each channel's top bits.
 ///
 /// # Arguments
@@ -287,6 +338,29 @@ mod tests {
         // Block (1, 1) of 8 across: block 9; texel (1, 2) in it.
         assert_eq!(a.word, 512 + 9 * 16 + 2 * 4 + 1);
         assert_eq!((a.tag, a.line, a.offset), (32 + 9, 0x11, 9));
+    }
+
+    /// The combiner: modulate is [`modulate`]; decal and shade pass an
+    /// input through; `(A − B)` can go negative, rounding down, and the sum
+    /// is clamped.
+    #[test]
+    fn combiner() {
+        let inputs = CcInputs {
+            tex: [200, 100, 50, 255],
+            shade: [128, 255, 0, 64],
+            const0: [10, 20, 30, 40],
+            const1: [255, 0, 255, 0],
+        };
+        let want = [0, 1, 2, 3].map(|c| modulate(inputs.tex[c], inputs.shade[c]));
+        assert_eq!(combine(&CcMode::MODULATE, &inputs), want);
+        assert_eq!(combine(&CcMode::DECAL, &inputs), inputs.tex);
+        assert_eq!(combine(&CcMode::SHADE, &inputs), inputs.shade);
+        // Fade: (tex - const1) x shade alpha + const1. Red: 255 +
+        // floor((-55 x 64 + 128) / 256) = 255 - 14.
+        let f = combine(&CcMode::FADE, &inputs);
+        assert_eq!(f, [241, 25, 204, 255]);
+        // Texture + shade saturates.
+        assert_eq!(combine(&CcMode::ADD_SHADE, &inputs)[1], 255);
     }
 
     /// Texel formats widen each field; modulating by white keeps a value.

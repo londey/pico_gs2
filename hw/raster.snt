@@ -39,6 +39,9 @@ const REG_ATTR0: u8 = 0x00;
 const REG_VERTEX_NOKICK: u8 = 0x06;
 const REG_VERTEX_KICK_FAN: u8 = 0x09;
 const REG_TEX0_CFG: u8 = 0x10;
+const REG_CC_MODE: u8 = 0x18;
+const REG_CONST0: u8 = 0x19;
+const REG_CONST1: u8 = 0x1B;
 const REG_RENDER_MODE: u8 = 0x30;
 const REG_FRAME: u8 = 0x40;
 const REG_MEM_ADDR: u8 = 0x70;
@@ -53,7 +56,11 @@ const KICK_012: u2 = 1;
 const KICK_021: u2 = 2;
 
 // RENDER_MODE's reset value: depth tested and written, colour written.
-const MODE_RESET: u9 = 0x1C;
+const MODE_RESET: u27 = 0x1C;
+
+// CC_MODE's reset value, texture x shade; and the constants', opaque white.
+const CC_RESET: u32 = 0x73717371;
+const CONST_RESET: u32 = 0xFFFFFFFF;
 
 // Parser states.
 const P_FETCH: u4 = 0;
@@ -65,7 +72,8 @@ const P_PRESENT: u4 = 5;
 const P_CLEAR: u4 = 6;
 const P_READ: u4 = 7;
 const P_MEM: u4 = 8;
-const P_TEX: u4 = 9;
+// TEX0_CFG, CC_MODE, CONST0 or CONST1: waiting for the pipeline to be idle.
+const P_STATE: u4 = 9;
 
 // A MEM_DATA access, in P_MEM: waiting for the pipeline to be idle, its run
 // waiting to be accepted, then its four words moving.
@@ -113,7 +121,7 @@ const M_NEXT_ROW: u3 = 5;
 const M_HOLD: u3 = 6;
 
 // Output buffer slots copied, in order (see copy_slot).
-const COPY_SLOTS: u6 = 34;
+const COPY_SLOTS: u6 = 37;
 
 // The depth buffer's SDRAM bank (ADR 0003), and what a clear sets it to.
 const DEPTH_BANK: u2 = 3;
@@ -141,9 +149,9 @@ pub struct ParserOut {
     pub pop: u1,
     // A read of this register, waiting for the link to take its value.
     pub read: Option<u7>,
-    // RENDER_MODE: its write enables go with each triangle started, and a
-    // read returns it.
-    pub mode: u9,
+    // RENDER_MODE (bits 26:0): its write enables, depth test and alpha
+    // test go with each triangle started, and a read returns it.
+    pub mode: u27,
     // MEM_DATA's run, held until accepted, and the word to write, taken on
     // `wtake`; MEM_ADDR, and the last 64 bits MEM_DATA read.
     pub mem_req: Option<SdramReq>,
@@ -155,6 +163,11 @@ pub struct ParserOut {
     // has been written).
     pub tex: u64,
     pub flush: u1,
+    // CC_MODE's pass 0, CONST0 and CONST1, which like TEX0_CFG change only
+    // with the pipeline idle.
+    pub cc: u32,
+    pub const0: u32,
+    pub const1: u32,
 }
 
 pub struct Parser {
@@ -170,7 +183,10 @@ pub struct Parser {
     t_data: u64 = 0,
     // The latched registers.
     attr: u64 = 0,
-    mode: u9 = 0x1C,
+    mode: u27 = 0x1C,
+    cc: u32 = 0x73717371,
+    const0: u32 = 0xFFFFFFFF,
+    const1: u32 = 0xFFFFFFFF,
     // The primitive: whether the last vertex was a kick (as after reset),
     // its vertices so far (to 3), whether it is a fan (its third vertex
     // was a KICK_FAN), and this vertex's kick.
@@ -245,6 +261,9 @@ impl Parser {
             mem_rdata: self.mem_rdata,
             tex: self.tex,
             flush: self.flush,
+            cc: self.cc,
+            const0: self.const0,
+            const1: self.const1,
         }
     }
 
@@ -352,6 +371,7 @@ impl Parser {
         let cull: u2 = if self.mode[6:5] == 3 { 0 } else { self.mode[6:5] };
 
         let presenting = st == P_PRESENT & present_ok == 1;
+        let latching = st == P_STATE & clear_ok == 1;
         let clearing = st == P_CLEAR & clear_ok == 1;
         let replied = st == P_READ & (reply_busy == 0 | link_enabled == 0);
 
@@ -376,8 +396,8 @@ impl Parser {
                 P_FETCH
             } else if is_mem_data & (a[7:7] == 0 | self.from_host == 1) {
                 P_MEM
-            } else if a == REG_TEX0_CFG {
-                P_TEX
+            } else if a == REG_TEX0_CFG | a == REG_CC_MODE | a == REG_CONST0 | a == REG_CONST1 {
+                P_STATE
             } else if a[7:7] == 1 {
                 if self.from_host == 1 { P_READ } else { P_FETCH }
             } else if is_vertex {
@@ -399,8 +419,8 @@ impl Parser {
             if clearing { P_FETCH } else { P_CLEAR }
         } else if in_mem {
             if !mem_done { P_MEM } else if mem_read { P_READ } else { P_FETCH }
-        } else if st == P_TEX {
-            if clear_ok == 1 { P_FETCH } else { P_TEX }
+        } else if st == P_STATE {
+            if clear_ok == 1 { P_FETCH } else { P_STATE }
         } else if replied {
             P_FETCH
         } else {
@@ -433,7 +453,7 @@ impl Parser {
             mode: if host_gone {
                 MODE_RESET
             } else if exec_plain & a == REG_RENDER_MODE {
-                self.t_data[8:0]
+                self.t_data[26:0]
             } else {
                 self.mode
             },
@@ -472,13 +492,35 @@ impl Parser {
                 self.mem_step
             },
             mem_i: if !in_mem { 0 } else if moved { (self.mem_i + 1) as u2 wrap } else { self.mem_i },
-            // TEX0_CFG waits for the triangles before it to be drawn.
+            // TEX0_CFG, CC_MODE, CONST0 and CONST1 wait for the triangles
+            // before them to be drawn.
             tex: if host_gone {
                 0
-            } else if st == P_TEX & clear_ok == 1 {
+            } else if latching & self.t_addr == REG_TEX0_CFG {
                 self.t_data
             } else {
                 self.tex
+            },
+            cc: if host_gone {
+                CC_RESET
+            } else if latching & self.t_addr == REG_CC_MODE {
+                self.t_data[31:0]
+            } else {
+                self.cc
+            },
+            const0: if host_gone {
+                CONST_RESET
+            } else if latching & self.t_addr == REG_CONST0 {
+                self.t_data[31:0]
+            } else {
+                self.const0
+            },
+            const1: if host_gone {
+                CONST_RESET
+            } else if latching & self.t_addr == REG_CONST1 {
+                self.t_data[31:0]
+            } else {
+                self.const1
             },
             // The cache's tags are whole addresses, so only new memory
             // contents make it stale, not a new texture.
@@ -586,6 +628,8 @@ pub struct Raster {
     pt: PlaneState,
     #[no_reset]
     pq: PlaneState,
+    #[no_reset]
+    pa: PlaneState,
     // PIXELS: the pixel (py @ px); WRITE and CLEAR: the word being sent.
     pix: u6 = 0,
     // The depth test, a cycle after PIXELS: the pixel, whether it is
@@ -598,7 +642,7 @@ pub struct Raster {
     #[no_reset]
     zt_z: u16 = 0,
     #[no_reset]
-    zt_shade: u24 = 0,
+    zt_shade: u32 = 0,
     // DRAIN: cycles left.
     drain: u4 = 0,
     // TEX0_CFG decoded, a cycle behind it (it only changes while this unit
@@ -615,6 +659,10 @@ pub struct Raster {
     tc_uwrap: u2 = 0,
     tc_vwrap: u2 = 0,
     tc_base: u20 = 0,
+    // CC_MODE's pass 0, CONST0 and CONST1, a cycle behind the parser's.
+    tc_cc: u32 = 0x73717371,
+    tc_const0: u32 = 0xFFFFFFFF,
+    tc_const1: u32 = 0xFFFFFFFF,
     // The texel address pipeline, twelve stages from a pixel's S', T' and
     // Q to its texel's place in memory and the cache.
     #[no_reset]
@@ -667,19 +715,22 @@ pub struct Raster {
     #[no_reset]
     tx3_texel: u16 = 0,
     #[no_reset]
-    tx3_shade: u24 = 0,
+    tx3_shade: u32 = 0,
+    // Then the combiner: its inputs; A, B, C (stretched to 0 to 256) and D
+    // for each channel; (A - B) x C, and D; the result; and the alpha test
+    // with the colour tile's write. Channels R, G, B, A from the top.
     tx4_valid: u1 = 0,
-    #[no_reset]
-    tx4_pix: u6 = 0,
-    #[no_reset]
-    tx4_texel: u24 = 0,
-    #[no_reset]
-    tx4_shade: u27 = 0,
     tx5_valid: u1 = 0,
+    tx6_valid: u1 = 0,
+    tx7_valid: u1 = 0,
     #[no_reset]
-    tx5_pix: u6 = 0,
+    tx4: CombStage,
     #[no_reset]
-    tx5_colour: u24 = 0,
+    tx5: CombStage,
+    #[no_reset]
+    tx6: CombStage,
+    #[no_reset]
+    tx7: CombStage,
     // TEXEL: a missing block being fetched, the words of it so far, and
     // which line and tag it goes to.
     filling: u1 = 0,
@@ -714,8 +765,8 @@ pub struct Raster {
     clear_z: u1 = 0,
     // RENDER_MODE's COLOR_WRITE, Z_WRITE and Z_TEST (bits 2 to 0) for the
     // triangle being drawn, and for the one waiting to be copied.
-    flags: u3 = 7,
-    pending_flags: u3 = 7,
+    flags: u13 = 7,
+    pending_flags: u13 = 7,
     // The block's colours and depths, in raster order.
     #[storage(lutram)]
     #[no_reset]
@@ -727,7 +778,7 @@ pub struct Raster {
     // and place in its block), in raster order.
     #[storage(lutram)]
     #[no_reset]
-    stile: mem<u24, 64> = 0,
+    stile: mem<u32, 64> = 0,
     #[storage(lutram)]
     #[no_reset]
     atile: mem<u32, 64> = 0,
@@ -744,6 +795,33 @@ pub struct Raster {
     #[storage(bram)]
     #[no_reset]
     seeds: rom<u18, 1024> = include_hex!("../build/gen/setup_seed.hex"),
+}
+
+// One stage of the combiner's pipeline, after the texel pass's hit test
+// (each stage's valid bit is a register of its own). Not every field means
+// something at every stage.
+struct CombStage {
+    pix: u6 = 0,
+    // The pixel was drawn by the depth test.
+    drawn: u1 = 0,
+    // The inputs, RGBA8888: texel and shade.
+    tex: u32 = 0,
+    shade: u32 = 0,
+    // A - B for each channel (9 bits, signed), D (RGBA8888), and C
+    // stretched, 9 bits a channel.
+    dr: i9 = 0,
+    dg: i9 = 0,
+    db: i9 = 0,
+    da: i9 = 0,
+    c: u36 = 0,
+    d: u32 = 0,
+    // (A - B) x C for each channel.
+    pr: i20 = 0,
+    pg: i20 = 0,
+    pb: i20 = 0,
+    pa: i20 = 0,
+    // The result, RGBA8888.
+    out: u32 = 0,
 }
 
 // One stage of the texel address pipeline. Not every field means something
@@ -841,7 +919,7 @@ impl Raster {
     pub fn next(
         self,
         kept: u1,
-        kept_flags: u3,
+        kept_flags: u13,
         rdata: u36,
         clear: Option<ClearCmd>,
         accepted: u1,
@@ -849,6 +927,9 @@ impl Raster {
         sdram_rdata: Option<u16>,
         tex: u64,
         flush: u1,
+        cc: u32,
+        const0: u32,
+        const1: u32,
     ) -> Self {
         let st = self.state;
         // TEX0_CFG's fields, from their registers; sizes clamped to 4 to
@@ -895,7 +976,7 @@ impl Raster {
         // depth test) nearer than the depth there. -------------------------
         let stepping = st == R_PIXELS;
         let covered = inside(self.e0) & inside(self.e1) & inside(self.e2);
-        let shade = s8(self.pr.pix) @ s8(self.pg.pix) @ s8(self.pb.pix);
+        let shade = s8(self.pr.pix) @ s8(self.pg.pix) @ s8(self.pb.pix) @ s8(self.pa.pix);
         let nearer = self.zt_z < self.ztile.value() | self.flags[0:0] == 0;
         let drawn = self.zt_valid == 1 & self.zt_cov == 1 & nearer;
         let row_end = self.pix[2:0] == 7;
@@ -944,15 +1025,46 @@ impl Raster {
         let texeling = st == R_TEXEL;
         let pass = texeling & self.filling == 0;
         let a1 = self.atile.value();
-        let hit = self.tx3_tag == (1_u1 @ self.tx3_addr[31:12]);
+        // Untextured, every lookup is a hit (on opaque white).
+        let hit = !textured | self.tx3_tag == (1_u1 @ self.tx3_addr[31:12]);
         let tx_ok = pass & self.tx3_valid == 1 & (hit | self.tx3_drawn == 0);
         let tx_miss = pass & self.tx3_valid == 1 & !hit & self.tx3_drawn == 1;
-        let tx_write = texeling & self.tx5_valid == 1;
-        let texel_done = tx_write & self.tx5_pix == 63;
         let issuing = pass & !tx_miss & self.tx_issue != 64;
-        let combined = modulate(self.tx4_texel[23:16], self.tx4_shade[26:18])
-            @ modulate(self.tx4_texel[15:8], self.tx4_shade[17:9])
-            @ modulate(self.tx4_texel[7:0], self.tx4_shade[8:0]);
+        // The combiner: each channel's A, B, C and D by CC_MODE; (A - B) x
+        // C; + D, clamped; then the alpha test on the result's alpha.
+        let ccm = self.tc_cc;
+        let c4 = self.tx4;
+        let k0 = self.tc_const0;
+        let k1 = self.tc_const1;
+        let op_a = operand(ccm[3:0], 0, 0, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[3:0], 0, 1, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[3:0], 0, 2, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[19:16], 0, 3, c4.tex, c4.shade, k0, k1);
+        let op_b = operand(ccm[7:4], 0, 0, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[7:4], 0, 1, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[7:4], 0, 2, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[23:20], 0, 3, c4.tex, c4.shade, k0, k1);
+        let op_c = stretch(operand(ccm[11:8], 1, 0, c4.tex, c4.shade, k0, k1))
+            @ stretch(operand(ccm[11:8], 1, 1, c4.tex, c4.shade, k0, k1))
+            @ stretch(operand(ccm[11:8], 1, 2, c4.tex, c4.shade, k0, k1))
+            @ stretch(operand(ccm[27:24], 0, 3, c4.tex, c4.shade, k0, k1));
+        let op_d = operand(ccm[15:12], 0, 0, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[15:12], 0, 1, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[15:12], 0, 2, c4.tex, c4.shade, k0, k1)
+            @ operand(ccm[31:28], 0, 3, c4.tex, c4.shade, k0, k1);
+        let c5 = self.tx5;
+        let c6 = self.tx6;
+        let c7 = self.tx7;
+        let alpha_test = self.flags[4:3];
+        let alpha_ref = self.flags[12:5];
+        let alpha = c7.out[7:0];
+        let alpha_pass = alpha_test == 0
+            | (alpha_test == 1 & alpha < alpha_ref)
+            | (alpha_test == 2 & alpha >= alpha_ref)
+            | (alpha_test == 3 & alpha != alpha_ref);
+        let tx_write = texeling & self.tx7_valid == 1;
+        let alpha_fail = tx_write & c7.drawn == 1 & !alpha_pass;
+        let texel_done = tx_write & c7.pix == 63;
         let fill_word = texeling & self.filling == 1 & zin == 1;
         let fill_done = fill_word & self.fill_got == 15;
 
@@ -991,7 +1103,7 @@ impl Raster {
         } else if flushing {
             if flush_done { R_IDLE } else { R_FLUSH }
         } else if draining {
-            if !drained { R_DRAIN } else if textured { R_TEXEL } else { R_WRITE }
+            if !drained { R_DRAIN } else { R_TEXEL }
         } else if texeling {
             if texel_done { R_WRITE } else { R_TEXEL }
         } else if st == R_CLEAR {
@@ -1047,8 +1159,8 @@ impl Raster {
         // The colour tile: each pixel's shade from the depth test's stage,
         // then, textured, texture x shade from TEXEL's last.
         let cwe = self.zt_valid | tx_write;
-        let cwaddr: u6 = if texeling { self.tx5_pix } else { self.zt_pix };
-        let cwdata: u24 = if texeling { self.tx5_colour } else { self.zt_shade };
+        let cwaddr: u6 = if texeling { c7.pix } else { self.zt_pix };
+        let cwdata: u24 = if texeling { c7.out[31:8] } else { self.zt_shade[31:8] };
 
         Self {
                 state: state,
@@ -1089,6 +1201,7 @@ impl Raster {
                 ps: copy_plane(step_plane(self.ps, mode), got, k, word, 25, 26, 27),
                 pt: copy_plane(step_plane(self.pt, mode), got, k, word, 28, 29, 30),
                 pq: copy_plane(step_plane(self.pq, mode), got, k, word, 31, 32, 33),
+                pa: copy_plane(step_plane(self.pa, mode), got, k, word, 34, 35, 36),
                 zt_valid: stepping,
                 zt_pix: self.pix,
                 zt_cov: covered,
@@ -1127,6 +1240,9 @@ impl Raster {
                 tc_uwrap: tex[17:16],
                 tc_vwrap: tex[19:18],
                 tc_base: tex[47:32] @ 0_u4,
+                tc_cc: cc,
+                tc_const0: const0,
+                tc_const1: const1,
                 tx_issue: if !texeling {
                     0
                 } else if tx_miss {
@@ -1150,12 +1266,39 @@ impl Raster {
                 tx3_texel: self.cdata.value(),
                 tx3_shade: self.stile.value(),
                 tx4_valid: tx_ok,
-                tx4_pix: self.tx3_pix,
-                tx4_texel: decode(self.tx3_texel, argb),
-                tx4_shade: stretch(self.tx3_shade[23:16]) @ stretch(self.tx3_shade[15:8]) @ stretch(self.tx3_shade[7:0]),
                 tx5_valid: texeling & self.tx4_valid == 1,
-                tx5_pix: self.tx4_pix,
-                tx5_colour: combined,
+                tx6_valid: texeling & self.tx5_valid == 1,
+                tx7_valid: texeling & self.tx6_valid == 1,
+                tx4: CombStage {
+                    pix: self.tx3_pix,
+                    drawn: self.tx3_drawn,
+                    tex: if textured { decode(self.tx3_texel, argb) } else { 0xFFFFFFFF },
+                    shade: self.tx3_shade,
+                    ..self.tx4
+                },
+                tx5: CombStage {
+                    dr: difference(op_a[31:24], op_b[31:24]),
+                    dg: difference(op_a[23:16], op_b[23:16]),
+                    db: difference(op_a[15:8], op_b[15:8]),
+                    da: difference(op_a[7:0], op_b[7:0]),
+                    c: op_c,
+                    d: op_d,
+                    ..c4
+                },
+                tx6: CombStage {
+                    pr: product(c5.dr, c5.c[35:27]),
+                    pg: product(c5.dg, c5.c[26:18]),
+                    pb: product(c5.db, c5.c[17:9]),
+                    pa: product(c5.da, c5.c[8:0]),
+                    ..c5
+                },
+                tx7: CombStage {
+                    out: finish(c6.pr, c6.d[31:24])
+                        @ finish(c6.pg, c6.d[23:16])
+                        @ finish(c6.pb, c6.d[15:8])
+                        @ finish(c6.pa, c6.d[7:0]),
+                    ..c6
+                },
                 filling: if tx_miss { 1 } else if fill_done { 0 } else { self.filling },
                 fill_got: if fill_done | !texeling { 0 } else if fill_word { (self.fill_got + 1) as u5 wrap } else { self.fill_got },
                 fill_tag: if tx_miss { self.tx3_addr[31:12] } else { self.fill_tag },
@@ -1177,6 +1320,10 @@ impl Raster {
                     0
                 } else if drawn {
                     self.mask | ((0_u63 @ drawn) << self.zt_pix)
+                } else if alpha_fail {
+                    // A pixel the alpha test fails writes neither colour
+                    // nor depth.
+                    self.mask & (((0_u63 @ 1_u1) << c7.pix) ^ 0xFFFFFFFFFFFFFFFF)
                 } else {
                     self.mask
                 },
@@ -1261,6 +1408,12 @@ fn copy_slot(c: u6) -> u6 {
         0x11
     } else if c == 33 {
         0x12
+    } else if c == 34 {
+        0x2D
+    } else if c == 35 {
+        0x09
+    } else if c == 36 {
+        0x0A
     } else {
         0
     }
@@ -1509,14 +1662,75 @@ fn wrap_texel(u: i20, log2: u4, size_mask: u10, mode: u2) -> u10 {
     }
 }
 
-// A texel as 8 bits a channel, R @ G @ B: RGB565 with each field's bits
-// repeated, or ARGB4444's colour with each nibble repeated (texture.rs
-// `decode`).
-fn decode(t: u16, argb: u1) -> u24 {
+// A texel as 8 bits a channel, R @ G @ B @ A: RGB565 with each field's
+// bits repeated and opaque, or ARGB4444 with each nibble repeated
+// (texture.rs `decode`).
+fn decode(t: u16, argb: u1) -> u32 {
     if argb == 1 {
-        t[11:8] @ t[11:8] @ t[7:4] @ t[7:4] @ t[3:0] @ t[3:0]
+        t[11:8] @ t[11:8] @ t[7:4] @ t[7:4] @ t[3:0] @ t[3:0] @ t[15:12] @ t[15:12]
     } else {
-        t[15:11] @ t[15:13] @ t[10:5] @ t[10:9] @ t[4:0] @ t[4:2]
+        t[15:11] @ t[15:13] @ t[10:5] @ t[10:9] @ t[4:0] @ t[4:2] @ 0xFF_u8
+    }
+}
+
+// Channel k (0 R, 1 G, 2 B, 3 A) of an RGBA8888 value.
+fn channel(x: u32, k: u2) -> u8 {
+    if k == 0 {
+        x[31:24]
+    } else if k == 1 {
+        x[23:16]
+    } else if k == 2 {
+        x[15:8]
+    } else {
+        x[7:0]
+    }
+}
+
+// A combiner input's channel k, by its code (host-interface.md §7): 1 the
+// texel, 3 the shade, 4 CONST0, 5 CONST1, 6 one, 7 zero; where `broadcast`
+// (RGB_C), 8, 10 and 11 the texel's, shade's and CONST0's alpha; anything
+// else 0 (texture.rs `combine`).
+fn operand(code: u4, broadcast: u1, k: u2, tex: u32, shade: u32, c0: u32, c1: u32) -> u8 {
+    if code == 1 {
+        channel(tex, k)
+    } else if code == 3 {
+        channel(shade, k)
+    } else if code == 4 {
+        channel(c0, k)
+    } else if code == 5 {
+        channel(c1, k)
+    } else if code == 6 {
+        255
+    } else if broadcast == 1 & code == 8 {
+        tex[7:0]
+    } else if broadcast == 1 & code == 10 {
+        shade[7:0]
+    } else if broadcast == 1 & code == 11 {
+        c0[7:0]
+    } else {
+        0
+    }
+}
+
+// A - B, signed.
+fn difference(a: u8, b: u8) -> i9 {
+    (((0_u1 @ a) as i9 wrap) - ((0_u1 @ b) as i9 wrap)) as i9 wrap
+}
+
+// (A - B) x C, C stretched.
+fn product(diff: i9, c: u9) -> i20 {
+    (diff as i10 wrap) * ((0_u1 @ c) as i10 wrap)
+}
+
+// D + ((A - B) x C + 128) / 256 rounded down, clamped to 0 to 255.
+fn finish(p: i20, d: u8) -> u8 {
+    let v = ((p + 128) >> 8) + ((0_u1 @ d) as i9 wrap);
+    if v < 0 {
+        0
+    } else if v > 255 {
+        255
+    } else {
+        (v as u14 wrap)[7:0]
     }
 }
 
@@ -1525,8 +1739,3 @@ fn stretch(c: u8) -> u9 {
     ((0_u1 @ c) + (0_u8 @ c[7:7])) as u9 wrap
 }
 
-// a x c, c already stretched, rounded (texture.rs `modulate`).
-fn modulate(a: u8, c9: u9) -> u8 {
-    let product = a * c9;
-    ((product + 128) as u17 wrap)[15:8]
-}

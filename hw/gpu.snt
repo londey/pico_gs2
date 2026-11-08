@@ -77,6 +77,9 @@ const FRAME_SLOTS: u13 = 7200;
 
 // Register addresses a host can read (docs/design/host-interface.md §3).
 const REG_TEX0_CFG: u7 = 0x10;
+const REG_CC_MODE: u7 = 0x18;
+const REG_CONST0: u7 = 0x19;
+const REG_CONST1: u7 = 0x1B;
 const REG_RENDER_MODE: u7 = 0x30;
 const REG_MEM_ADDR: u7 = 0x70;
 const REG_MEM_DATA: u7 = 0x71;
@@ -112,14 +115,15 @@ struct Gpu {
     granted_req: SdramReq,
     data_owner: u3 = 0,
 
-    // The host link and the triangle pipeline. `tri_flags`: the write
-    // enables and depth test (RENDER_MODE bits 4 to 2) of the triangle in
-    // the setup engine, which the rasteriser takes if it is kept.
+    // The host link and the triangle pipeline. `tri_flags`: the alpha
+    // reference and test, write enables and depth test (RENDER_MODE bits
+    // 26:17 and 4:2) of the triangle in the setup engine, which the
+    // rasteriser takes if it is kept.
     link: HostLink,
     parser: Parser,
     setup: SetupEngine,
     raster: Raster,
-    tri_flags: u3 = 7,
+    tri_flags: u13 = 7,
     // The link's free FIFO entries, a cycle old, for STATUS.
     link_free: u10 = 512,
 
@@ -253,7 +257,13 @@ impl Gpu {
                 0_u8 @ self.draw @ self.debug_link_errors[0:0] @ self.debug_link_errors[1:1] @ self.disp
                     @ self.link_free @ self.debug_render_cycles @ self.debug_frames
             } else if a == REG_RENDER_MODE {
-                0_u55 @ pout.mode
+                0_u37 @ pout.mode
+            } else if a == REG_CC_MODE {
+                0_u32 @ pout.cc
+            } else if a == REG_CONST0 {
+                0_u32 @ pout.const0
+            } else if a == REG_CONST1 {
+                0_u32 @ pout.const1
             } else if a == REG_TEX0_CFG {
                 pout.tex
             } else if a == REG_MEM_ADDR {
@@ -425,8 +435,11 @@ impl Gpu {
                     rdata_raster,
                     pout.tex,
                     pout.flush,
+                    pout.cc,
+                    pout.const0,
+                    pout.const1,
                 ),
-                tri_flags: if starting == 1 { pout.mode[4:2] } else { self.tri_flags },
+                tri_flags: if starting == 1 { pout.mode[26:17] @ pout.mode[4:2] } else { self.tri_flags },
                 link_free: lout.free,
                 debug_link_errors: lout.overflow @ lout.framing,
                 // A finished frame becomes the one waiting, and the spare

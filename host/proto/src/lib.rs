@@ -39,7 +39,16 @@ pub mod reg {
     /// The texture: enable, format, size, filter, wrap modes, address.
     pub const TEX0_CFG: u8 = 0x10;
 
-    /// Cull mode, depth test, depth and colour write enables.
+    /// The colour combiner's inputs.
+    pub const CC_MODE: u8 = 0x18;
+
+    /// A constant colour for the combiner, RGBA8888.
+    pub const CONST0: u8 = 0x19;
+
+    /// A second constant colour.
+    pub const CONST1: u8 = 0x1B;
+
+    /// Cull mode, depth test, depth and colour write enables, alpha test.
     pub const RENDER_MODE: u8 = 0x30;
 
     /// Present the frame, and clear.
@@ -413,9 +422,54 @@ pub enum Cull {
     Clockwise,
 }
 
+/// The alpha test: which pixels it passes, by the combiner's alpha against
+/// `ALPHA_REF`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaTest {
+    /// Every pixel.
+    #[default]
+    Always,
+
+    /// Alpha below the reference.
+    Less,
+
+    /// Alpha at or above the reference: cut-outs.
+    GEqual,
+
+    /// Alpha other than the reference.
+    NotEqual,
+}
+
+impl AlphaTest {
+    /// Whether a pixel passes.
+    ///
+    /// # Arguments
+    ///
+    /// * `alpha` - The combiner's alpha.
+    /// * `reference` - `ALPHA_REF`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if it is drawn.
+    pub fn passes(self, alpha: u8, reference: u8) -> bool {
+        match self {
+            AlphaTest::Always => true,
+            AlphaTest::Less => alpha < reference,
+            AlphaTest::GEqual => alpha >= reference,
+            AlphaTest::NotEqual => alpha != reference,
+        }
+    }
+}
+
 /// `RENDER_MODE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderMode {
+    /// The alpha test's reference.
+    pub alpha_ref: u8,
+
+    /// The alpha test.
+    pub alpha_test: AlphaTest,
+
     /// Which winding to discard.
     pub cull: Cull,
 
@@ -434,6 +488,8 @@ impl Default for RenderMode {
     /// written.
     fn default() -> RenderMode {
         RenderMode {
+            alpha_ref: 0,
+            alpha_test: AlphaTest::Always,
             cull: Cull::None,
             colour_write: true,
             z_write: true,
@@ -447,14 +503,23 @@ impl RenderMode {
     ///
     /// # Returns
     ///
-    /// `CULL` in 6:5, `COLOR_WRITE` 4, `Z_WRITE` 3, `Z_TEST` 2.
+    /// `ALPHA_REF` in 26:19, `ALPHA_TEST` 18:17, `CULL` 6:5, `COLOR_WRITE`
+    /// 4, `Z_WRITE` 3, `Z_TEST` 2.
     pub fn bits(self) -> u64 {
         let cull = match self.cull {
             Cull::None => 0,
             Cull::Anticlockwise => 1,
             Cull::Clockwise => 2,
         };
-        cull << 5
+        let test = match self.alpha_test {
+            AlphaTest::Always => 0,
+            AlphaTest::Less => 1,
+            AlphaTest::GEqual => 2,
+            AlphaTest::NotEqual => 3,
+        };
+        u64::from(self.alpha_ref) << 19
+            | test << 17
+            | cull << 5
             | u64::from(self.colour_write) << 4
             | u64::from(self.z_write) << 3
             | u64::from(self.z_test) << 2
@@ -471,6 +536,13 @@ impl RenderMode {
     /// The fields; a `CULL` of 3 is none.
     pub fn from_bits(w: u64) -> RenderMode {
         RenderMode {
+            alpha_ref: byte(w, 19),
+            alpha_test: match w >> 17 & 3 {
+                1 => AlphaTest::Less,
+                2 => AlphaTest::GEqual,
+                3 => AlphaTest::NotEqual,
+                _ => AlphaTest::Always,
+            },
             cull: match w >> 5 & 3 {
                 1 => Cull::Anticlockwise,
                 2 => Cull::Clockwise,
@@ -481,6 +553,234 @@ impl RenderMode {
             z_test: w >> 2 & 1 == 1,
         }
     }
+}
+
+/// A colour combiner input (host-interface.md §7), at pico-gs's codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcSource {
+    /// The texel (opaque white if the triangle isn't textured).
+    Tex0,
+
+    /// The interpolated vertex colour.
+    Shade0,
+
+    /// `CONST0`.
+    Const0,
+
+    /// `CONST1`.
+    Const1,
+
+    /// 1 (255).
+    One,
+
+    /// 0.
+    Zero,
+
+    /// The texel's alpha, in each colour channel (`RGB_C` only).
+    Tex0Alpha,
+
+    /// The vertex colour's alpha, in each colour channel (`RGB_C` only).
+    Shade0Alpha,
+
+    /// `CONST0`'s alpha, in each colour channel (`RGB_C` only).
+    Const0Alpha,
+
+    /// A code with no source here (reserved, or pico-gs's second pass,
+    /// second texture or destination colour): reads 0.
+    Reserved(u8),
+}
+
+impl CcSource {
+    /// The source's code.
+    pub fn code(self) -> u64 {
+        match self {
+            CcSource::Tex0 => 1,
+            CcSource::Shade0 => 3,
+            CcSource::Const0 => 4,
+            CcSource::Const1 => 5,
+            CcSource::One => 6,
+            CcSource::Zero => 7,
+            CcSource::Tex0Alpha => 8,
+            CcSource::Shade0Alpha => 10,
+            CcSource::Const0Alpha => 11,
+            CcSource::Reserved(c) => u64::from(c & 0xF),
+        }
+    }
+
+    /// The source a code picks.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The 4-bit field.
+    /// * `alpha_broadcasts` - The field is `RGB_C`, where codes 8, 10 and
+    ///   11 broadcast an alpha.
+    ///
+    /// # Returns
+    ///
+    /// The source.
+    pub fn from_code(code: u64, alpha_broadcasts: bool) -> CcSource {
+        match (code & 0xF, alpha_broadcasts) {
+            (1, _) => CcSource::Tex0,
+            (3, _) => CcSource::Shade0,
+            (4, _) => CcSource::Const0,
+            (5, _) => CcSource::Const1,
+            (6, _) => CcSource::One,
+            (7, _) => CcSource::Zero,
+            (8, true) => CcSource::Tex0Alpha,
+            (10, true) => CcSource::Shade0Alpha,
+            (11, true) => CcSource::Const0Alpha,
+            (c, _) => CcSource::Reserved(u8::try_from(c).unwrap_or(0)),
+        }
+    }
+}
+
+/// `CC_MODE`: the combiner's `(A − B) × C + D`, for colour and for alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcMode {
+    /// Colour's A, B, C and D.
+    pub rgb: [CcSource; 4],
+
+    /// Alpha's A, B, C and D.
+    pub alpha: [CcSource; 4],
+}
+
+impl CcMode {
+    /// Texture × shade, colour and alpha: the reset value.
+    pub const MODULATE: CcMode = CcMode::same([
+        CcSource::Tex0,
+        CcSource::Zero,
+        CcSource::Shade0,
+        CcSource::Zero,
+    ]);
+
+    /// The texture alone.
+    pub const DECAL: CcMode = CcMode::same([
+        CcSource::Zero,
+        CcSource::Zero,
+        CcSource::Zero,
+        CcSource::Tex0,
+    ]);
+
+    /// The shade alone.
+    pub const SHADE: CcMode = CcMode::same([
+        CcSource::Zero,
+        CcSource::Zero,
+        CcSource::Zero,
+        CcSource::Shade0,
+    ]);
+
+    /// The texture × `CONST0`.
+    pub const TINT: CcMode = CcMode::same([
+        CcSource::Tex0,
+        CcSource::Zero,
+        CcSource::Const0,
+        CcSource::Zero,
+    ]);
+
+    /// The texture + shade (a cheap specular), alpha modulated.
+    pub const ADD_SHADE: CcMode = CcMode {
+        rgb: [
+            CcSource::Tex0,
+            CcSource::Zero,
+            CcSource::One,
+            CcSource::Shade0,
+        ],
+        alpha: [
+            CcSource::Tex0,
+            CcSource::Zero,
+            CcSource::Shade0,
+            CcSource::Zero,
+        ],
+    };
+
+    /// From the texture to `CONST1` as the shade's alpha falls (fog);
+    /// alpha the texture's.
+    pub const FADE: CcMode = CcMode {
+        rgb: [
+            CcSource::Tex0,
+            CcSource::Const1,
+            CcSource::Shade0Alpha,
+            CcSource::Const1,
+        ],
+        alpha: [
+            CcSource::Tex0,
+            CcSource::Zero,
+            CcSource::One,
+            CcSource::Zero,
+        ],
+    };
+
+    /// The same inputs for colour and alpha.
+    const fn same(abcd: [CcSource; 4]) -> CcMode {
+        CcMode {
+            rgb: abcd,
+            alpha: abcd,
+        }
+    }
+
+    /// The register's value: pass 1 (bits 63:32) zero.
+    ///
+    /// # Returns
+    ///
+    /// Alpha's D, C, B, A in bits 31:16, colour's in 15:0, A lowest.
+    pub fn bits(self) -> u64 {
+        let nibbles = |abcd: [CcSource; 4]| {
+            abcd.iter()
+                .enumerate()
+                .fold(0, |acc, (i, s)| acc | s.code() << (4 * i))
+        };
+        nibbles(self.alpha) << 16 | nibbles(self.rgb)
+    }
+
+    /// The inputs a register value picks.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The inputs (pass 1 ignored).
+    pub fn from_bits(w: u64) -> CcMode {
+        let field = |k: u32| w >> (4 * k) & 0xF;
+        CcMode {
+            rgb: [0, 1, 2, 3].map(|k| CcSource::from_code(field(k), k == 2)),
+            alpha: [4, 5, 6, 7].map(|k| CcSource::from_code(field(k), false)),
+        }
+    }
+}
+
+impl Default for CcMode {
+    /// [`CcMode::MODULATE`].
+    fn default() -> CcMode {
+        CcMode::MODULATE
+    }
+}
+
+/// A `CONST0` or `CONST1` value: R, G, B and A, R in bits 31:24.
+///
+/// # Arguments
+///
+/// * `rgba` - The channels.
+///
+/// # Returns
+///
+/// The register's value.
+pub fn const_colour(rgba: [u8; 4]) -> u64 {
+    rgba.iter().fold(0, |acc, &c| acc << 8 | u64::from(c))
+}
+
+/// A `CONST0` or `CONST1` value's channels.
+///
+/// # Arguments
+///
+/// * `w` - The value.
+///
+/// # Returns
+///
+/// R, G, B and A.
+pub fn const_channels(w: u64) -> [u8; 4] {
+    [byte(w, 24), byte(w, 16), byte(w, 8), byte(w, 0)]
 }
 
 /// How a texture coordinate outside the texture is brought back into it.
@@ -935,6 +1235,7 @@ mod tests {
                 colour_write: false,
                 z_write: true,
                 z_test: false,
+                ..RenderMode::default()
             };
             assert_eq!(RenderMode::from_bits(m.bits()), m);
         }
@@ -957,6 +1258,33 @@ mod tests {
         };
         assert_eq!(Status::from_bits(s.bits()), s);
         assert_eq!(s.bits() >> 50, 0b10_10_01);
+    }
+
+    /// `CC_MODE`'s presets have the values the interface document gives;
+    /// `RENDER_MODE`'s alpha test is at pico-gs's bits.
+    #[test]
+    fn combiner_and_alpha_test_fields() {
+        assert_eq!(CcMode::MODULATE.bits(), 0x7371_7371);
+        assert_eq!(CcMode::DECAL.bits(), 0x1777_1777);
+        assert_eq!(CcMode::SHADE.bits(), 0x3777_3777);
+        assert_eq!(CcMode::TINT.bits(), 0x7471_7471);
+        assert_eq!(CcMode::ADD_SHADE.bits(), 0x7371_3671);
+        assert_eq!(CcMode::FADE.bits(), 0x7671_5A51);
+        for m in [CcMode::MODULATE, CcMode::ADD_SHADE, CcMode::FADE] {
+            assert_eq!(CcMode::from_bits(m.bits()), m);
+        }
+        // Codes 8, 10 and 11 broadcast an alpha only in RGB_C.
+        assert_eq!(CcMode::from_bits(0x8).rgb[0], CcSource::Reserved(8));
+        assert_eq!(CcMode::from_bits(0x800).rgb[2], CcSource::Tex0Alpha);
+        let m = RenderMode {
+            alpha_test: AlphaTest::GEqual,
+            alpha_ref: 0x80,
+            ..RenderMode::default()
+        };
+        assert_eq!(m.bits(), 0x80 << 19 | 2 << 17 | 0x1C);
+        assert_eq!(RenderMode::from_bits(m.bits()), m);
+        assert_eq!(const_channels(const_colour([1, 2, 3, 4])), [1, 2, 3, 4]);
+        assert_eq!(const_colour([0xFF; 4]), 0xFFFF_FFFF);
     }
 
     /// `TEX0_CFG`'s fields at pico-gs's positions; sizes clamped to 4 to

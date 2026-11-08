@@ -4,11 +4,11 @@
 //! should; scenes render; the cube's winding matches its faces' visibility,
 //! so back-face culling draws only the faces the camera sees.
 
-use gs_proto::{reg, Attr0, Frame as FrameReg, Position, RenderMode, Tex0Cfg, Transaction};
+use gs_proto::{reg, Attr0, Frame as FrameReg, Position, RenderMode, Transaction};
 use setup_model::render::{render, Frame, FB_HEIGHT, FB_WIDTH};
 use setup_model::scene::{
-    cube_frame, cube_scene, draws, interpret, rom, test_card, transactions, Command, Event, Kind,
-    BACKGROUND, CUBE_FRAMES, ROM_END, SCENE_ENTRIES,
+    cube_frame, cube_scene, draws, interpret, rom, test_card, transactions, Command, DrawState,
+    Event, Kind, BACKGROUND, CUBE_FRAMES, ROM_END, SCENE_ENTRIES,
 };
 
 /// What the parser should make of a scene: each primitive's triangles,
@@ -39,15 +39,11 @@ fn expected_events(cmds: &[Command]) -> Vec<Event> {
                 let mode = interpret(&transactions(std::slice::from_ref(c)))
                     .into_iter()
                     .find_map(|e| match e {
-                        Event::Draw(_, m, _) => Some(m),
+                        Event::Draw(_, st) => Some(st),
                         _ => None,
                     })
                     .expect("a primitive draws");
-                events.extend(
-                    p.triangles()
-                        .into_iter()
-                        .map(|t| Event::Draw(t, mode, Tex0Cfg::default())),
-                );
+                events.extend(p.triangles().into_iter().map(|t| Event::Draw(t, mode)));
             }
         }
     }
@@ -130,9 +126,8 @@ fn kicks_follow_the_rules() {
     let tris: Vec<_> = interpret(&txns)
         .into_iter()
         .map(|e| match e {
-            Event::Draw(t, m, tex) => {
-                assert_eq!(m, RenderMode::default());
-                assert_eq!(tex, Tex0Cfg::default());
+            Event::Draw(t, st) => {
+                assert_eq!(st, DrawState::default());
                 assert!(t.iter().all(|v| v.r == 255 && v.z == 100));
                 t.map(|v| (v.x.to_count() / 16, v.y.to_count() / 16))
             }

@@ -74,10 +74,12 @@ registers return 0.
 
 **Render state goes with each triangle.** A triangle is drawn with
 `RENDER_MODE`, `TEX0_CFG`, `CC_MODE`, `CONST0` and `CONST1` as they were at
-its kick, however long it waits in the pipeline. A write to `TEX0_CFG` or
-`MEM_DATA` waits until the triangles before it are drawn, so group
-triangles by texture: each change costs the pipeline's drain, about the
-time of one large triangle. A `MEM_DATA` write also empties the texture
+its kick, however long it waits in the pipeline. A write to `TEX0_CFG`,
+`CC_MODE`, `CONST0`, `CONST1` or `MEM_DATA` waits until the triangles
+before it are drawn, so group triangles by texture and combiner setting:
+each change costs the pipeline's drain, about the time of one large
+triangle. (`RENDER_MODE` doesn't wait: its fields travel with each
+triangle.) A `MEM_DATA` write also empties the texture
 cache, so the next textured triangle sees what was written.
 
 ## 4. Registers
@@ -293,7 +295,7 @@ the first triangle after a `MEM_DATA` write.
 The depth test moved a stage later in the pixel pass (the depth compared a
 cycle after it is rounded), which took it off the critical path.
 
-## 7. The colour combiner (Phase 17)
+## 7. The colour combiner (Phase 17, built)
 
 After texturing, each pixel's colour comes from one combiner pass, as the
 N64's one-cycle mode, for R, G and B and separately for A:
@@ -367,8 +369,8 @@ factor here, so `CONST1` is just a second constant.)
 
 | Bits | Field | Reset | Status |
 |---|---|---|---|
-| 26:19 | `ALPHA_REF`: the alpha test's reference, 0 to 255 | 0 | 17 |
-| 18:17 | `ALPHA_TEST`: 0 always pass, 1 pass if alpha < `ALPHA_REF`, 2 pass if alpha ≥ `ALPHA_REF`, 3 pass if alpha ≠ `ALPHA_REF` | 0 | 17 |
+| 26:19 | `ALPHA_REF`: the alpha test's reference, 0 to 255 | 0 | built |
+| 18:17 | `ALPHA_TEST`: 0 always pass, 1 pass if alpha < `ALPHA_REF`, 2 pass if alpha ≥ `ALPHA_REF`, 3 pass if alpha ≠ `ALPHA_REF` | 0 | built |
 | 15:13 | `Z_COMPARE`: 0 less than; others reserved (pico-gs: 1 ≤, 6 always, …) | 0 | after v1.0 |
 | 9:7 | `ALPHA_BLEND`: 0 off; others reserved (pico-gs: 1 add, 3 blend) | 0 | after v1.0 |
 | 6:5 | `CULL`: 0 none, 1 discard anticlockwise (on screen), 2 discard clockwise, 3 none | 0 | built |
@@ -655,15 +657,35 @@ and the twin tests compare against it pixel for pixel, as now.
   ARGB4444 read as RGB565; the shade not stretched to 256; no
   Newton–Raphson step; the depth test reading the next pixel's depth;
   undrawn pixels' misses fetched.
-- **17:** each combiner preset in §7 and every source; each alpha test; a
-  cut-out in front of and behind other triangles.
+- **17, as built (`combiner.rs`):** `setup_model::demo::combiner_demo`,
+  which `gs-host --combiner` also shows, drawn pixel-exact in three
+  frames: nine quads, one for each preset in §7 plus a combination using
+  every alpha broadcast with a negative `A − B`, reserved codes, and an
+  untextured quad tinted by `CONST0`'s alpha, all with varying vertex
+  colours and alphas; the four alpha tests on an alpha ramp, and a cut-out
+  in front of a later, farther triangle that shows through its holes; and
+  the nine quads again under an alpha test, so each setting's alpha shows.
+  The existing scenes stay pixel-exact with every triangle now through the
+  combiner. Mutations, each caught: `<` as `≤`; failing pixels still
+  drawn; no alpha broadcast; no clamp at 0; alpha taking colour's
+  inputs; no alpha plane; `CONST1` read as `CONST0`; C not stretched; a
+  `CC_MODE` write not waiting for the pipeline.
 - **18:** bilinear against the reference, including at wrap edges.
 
 ## 16. Resources and timing
 
-As built (Phase 16): the GPU places and routes at 85.5 MHz (75 needed) in
-13,852 logic cells, 6,192 flip-flops, 27 DP16KD and 11 MULT18X18D, of
-24,288, 24,288, 56 and 28 (57%, 25%, 48%, 39%). Texturing added 3,101 cells,
+As built (Phase 17): the GPU places and routes at 82.4 MHz (75 needed) in
+15,201 logic cells, 6,891 flip-flops, 27 DP16KD and 12 MULT18X18D, of
+24,288, 24,288, 56 and 28 (62%, 28%, 48%, 43%). The combiner and alpha test
+added 1,349 cells, 699 flip-flops and one multiplier (four (A − B) × C
+products replacing three texture × shade ones), against the brief's 1,500
+cells and 6 multipliers. The critical path is the SDRAM write path into
+the colour tile, nearly all routing. Every block now goes through the
+combine pass (64 cycles and 7 of latency); untextured triangles skip only
+the cache.
+
+Phase 16 placed at 85.5 MHz in 13,852 logic cells, 6,192 flip-flops, 27
+DP16KD and 11 multipliers. Texturing added 3,101 cells,
 2,137 flip-flops (most of them the address pipeline's stages), 6 DP16KD
 (the cache's texels 4, its tags 1, the seed table 1) and 9 multipliers
 (the reciprocal 2, S′ and T′ × it 4, texture × shade 3). The critical path
