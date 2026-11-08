@@ -271,9 +271,10 @@ I stop and report.
 Perspective-correct texturing (brief phase 5) and tiling into on-chip
 tiles (brief phase 7) aren't in this plan. The Option B experiment (brief
 phase 6) is dropped (ADR 0001). The
-host link is planned in [host-interface.md](host-interface.md): Phase 13,
-register writes over the USB UART; Phase 14, the same over SPI from an
-RP2350.
+host link and the phases after Phase 12 are planned in
+[host-interface.md](host-interface.md): Phase 13, register writes over the
+USB UART; Phases 14 to 19, the v1.0 interface with texturing, the colour
+combiner and memory access (ADR 0009).
 
 ## 9. Risks
 

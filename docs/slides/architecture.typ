@@ -93,7 +93,7 @@
   buffer, drawn by the setup engine and rasteriser at 66 frames per second,
   shown at 60. A PC drives it with register writes over USB serial; with no
   PC it plays a built-in scene. Pixel-exact against a reference renderer in
-  simulation, and on the board. Textures and alpha blending are next.
+  simulation, and on the board. Textures and the colour combiner are next.
 
 #v(0.5em)
 #key
@@ -624,7 +624,7 @@ serialisers and (later) the SPI link have clocks of their own.
 
 == Status by phase
 
-#text(size: 14pt, table(
+#text(size: 12.5pt, table(
   columns: (auto, 1fr, auto),
   [*Phase*], [*Work*], [*Status*],
   [2–3], [toolchain, CI; 640×480 colour bars], done,
@@ -637,11 +637,12 @@ serialisers and (later) the SPI link have clocks of their own.
   [11], [command parser, traversal, tile buffer: first triangles on screen], done,
   [12], [Z buffer, clears, triple buffering, spinning cube], done,
   [13], [register interface; USB serial host link; `gs-host`], done,
-  [14], [interface document for v1.0: serial and SPI; texture uploads], next,
-  [15–16], [textures: upload, cache, perspective correction], later,
-  [17], [alpha blending], later,
-  [18], [v1.0: interface frozen for games], later,
-  [—], [SPI from an RP2350; meshes kept in SDRAM], later,
+  [14], [v1.0 interface document: textures, combiner, memory, SPI design], next,
+  [15], [memory access: uploads, reading frames back], later,
+  [16], [textures: cache, perspective-correct sampling], later,
+  [17], [colour combiner and alpha test], later,
+  [18–19], [bilinear filtering if it fits; v1.0 frozen for games], later,
+  [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
 == Open issues
