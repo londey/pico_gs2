@@ -49,8 +49,12 @@ const BACKGROUND: u16 = 0x0010;
 /// second.
 const FRAMES_PER_TURN: u32 = 240;
 
-/// How long to wait for a read's reply.
+/// How long to wait for a read's reply, or for the port to take a byte.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to keep trying to open the port (it goes away for a moment
+/// when the board is programmed).
+const OPEN_RETRY: Duration = Duration::from_secs(5);
 
 /// The command line.
 struct Args {
@@ -153,14 +157,23 @@ impl Link {
     ///
     /// The port can't be opened or set up.
     fn open(path: &str) -> Result<Link> {
-        let mut port = serialport::new(path, BAUD)
-            .data_bits(DataBits::Eight)
-            .parity(Parity::None)
-            .stop_bits(StopBits::One)
-            .flow_control(FlowControl::None)
-            .timeout(Duration::from_millis(5))
-            .open()
-            .with_context(|| format!("opening {path}"))?;
+        // Just after the board is programmed (through the same FTDI chip)
+        // the port goes and comes back: keep trying for a few seconds.
+        let deadline = Instant::now() + OPEN_RETRY;
+        let mut port = loop {
+            let opened = serialport::new(path, BAUD)
+                .data_bits(DataBits::Eight)
+                .parity(Parity::None)
+                .stop_bits(StopBits::One)
+                .flow_control(FlowControl::None)
+                .timeout(Duration::from_millis(5))
+                .open();
+            match opened {
+                Ok(p) => break p,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(200)),
+                Err(e) => return Err(e).with_context(|| format!("opening {path}")),
+            }
+        };
         port.write_data_terminal_ready(false)?;
         sleep(Duration::from_millis(20));
         port.clear(ClearBuffer::All)?;
@@ -231,8 +244,42 @@ impl Link {
                 self.sent += 1;
                 rest = tail;
             }
-            self.port.write_all(&buf)?;
+            self.write_bytes(&buf)?;
             self.bytes += u64::try_from(buf.len())?;
+        }
+        Ok(())
+    }
+
+    /// Writes bytes to the port, however long the line takes: the port's
+    /// short timeout (for reads) can end a write part-way, so keep going.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The bytes.
+    ///
+    /// # Errors
+    ///
+    /// The port fails, or takes no byte for longer than [`REPLY_TIMEOUT`].
+    fn write_bytes(&mut self, buf: &[u8]) -> Result<()> {
+        let mut rest = buf;
+        let mut deadline = Instant::now() + REPLY_TIMEOUT;
+        while !rest.is_empty() {
+            match self.port.write(rest) {
+                Ok(n) if n > 0 => {
+                    rest = &rest[n..];
+                    deadline = Instant::now() + REPLY_TIMEOUT;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::Interrupted => {
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "the serial port took no data for {} s",
+                    REPLY_TIMEOUT.as_secs()
+                );
+            }
         }
         Ok(())
     }
