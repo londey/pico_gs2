@@ -97,7 +97,7 @@ the pipeline's drain, about the time of one large triangle.
 | 0x40 | `FRAME` | W | present the frame, and clear | built |
 | 0x70 | `MEM_ADDR` | R/W | the memory address `MEM_DATA` reads and writes | 15 |
 | 0x71 | `MEM_DATA` | R/W | 64 bits of GPU memory, then the next | 15 |
-| 0x7E | `STATUS` | R | frames shown, the last frame's cycles, FIFO space, the buffer on screen, link errors | built; version 2 in 15 |
+| 0x7E | `STATUS` | R | frames shown, the last frame's cycles, FIFO space, the buffers shown and drawn, link errors | built; version 2 in 15 |
 | 0x7F | `ID` | R | identification and interface version | built |
 
 pico-gs's `FB_CONFIG`, `FB_DISPLAY`, `MEM_FILL`, `PALETTEn`, `Z_RANGE` and
@@ -373,6 +373,7 @@ the display, and a frame is never torn.
 
 | Bits | Field | Status |
 |---|---|---|
+| 55:54 | the colour buffer being drawn, 0 to 2 | 15 |
 | 53:52 | link errors, sticky until the link resets: bit 52 a transaction arrived with the FIFO full, bit 53 a malformed byte | 15 |
 | 51:50 | the colour buffer on screen, 0 to 2 (§9.2) | 15 |
 | 49:40 | free FIFO entries | built |
@@ -429,7 +430,9 @@ alignment). The GPU's regions can be read at any time; writing them while
 the GPU draws or shows them gives an undefined picture, not a fault.
 
 **Reading a frame back:** `STATUS` bits 51:50 name the buffer on screen,
-which stays there until the next `PRESENT` is shown. Each buffer is
+which stays there until the next `PRESENT` is shown; bits 55:54 name the
+one being drawn, whose pixels a `MEM_DATA` read sees up to the
+transactions before it. Each buffer is
 640 × 360 RGB565, tiled in 8 × 8 blocks: pixel (x, y) is word
 
 ```
@@ -543,7 +546,8 @@ Version 1 is Phase 13, as built. Version 2:
 - `RENDER_MODE` gains `ALPHA_TEST` and `ALPHA_REF`, and reserves
   `ALPHA_BLEND` and `Z_COMPARE` at pico-gs's positions.
 - New: `TEX0_CFG`, `CC_MODE`, `CONST0`, `CONST1`, `MEM_ADDR`, `MEM_DATA`.
-- `STATUS` gains the buffer on screen and the link's error flags.
+- `STATUS` gains the buffers on screen and being drawn, and the link's
+  error flags.
 - S′ and T′ are signed Q4.12 and Q is UQ1.15 (version 1 left them
   provisional and unused).
 - Colour reaches RGB565 by keeping each 8-bit channel's top bits, after the
@@ -578,10 +582,19 @@ As built in Phase 13 (`sim/tb/tests/`):
 Planned, phase by phase: the reference renderer gains each feature first,
 and the twin tests compare against it pixel for pixel, as now.
 
-- **15:** a host writes memory and reads it back; reads the frame on screen
-  and gets the reference frame; `MEM_DATA` after a triangle sees it drawn.
-  On the board, `gs-host --screenshot` of the ROM cube matches the twin's
-  frame.
+- **15, as built (`memory.rs`):** once the ROM's first frame is up, a host
+  writes 40 words to an odd dword in bank 2's host memory, reads
+  `MEM_ADDR` (moved on by 10) and the words back, and finds them in the
+  SDRAM model where §9.2 puts them. It then clears and draws a triangle
+  without presenting, reads `STATUS` for the buffer being drawn, and reads
+  the four blocks under the triangle's corner: pixel-exact against the
+  reference renderer (158 of the 256 pixels are the triangle's), so a
+  `MEM_DATA` read waits for drawing. Recorded as `gpu.memory.csv` and
+  replayed with `--cosim`. Mutations, each caught: no wait for drawing;
+  the words of a write out of order; the words of a read out of order;
+  `MEM_ADDR` not moving on; `STATUS`'s buffers swapped. On the board,
+  `gs-host --screenshot` compares the frame on screen with the reference
+  renderer's built-in scene.
 - **16:** textured triangles in both formats, every wrap mode, textures
   smaller and larger than the cache, a texture uploaded between two frames
   (the cache emptied), steep perspective; the setup engine's S′, T′ and Q
@@ -592,10 +605,13 @@ and the twin tests compare against it pixel for pixel, as now.
 
 ## 16. Resources and timing
 
-As built (Phase 13): the GPU places and routes at 76 to 78 MHz (75 needed;
-it varies with placement from build to build) in 10,404 logic cells, 3,948
-flip-flops, 21 DP16KD and 2 MULT18X18D, of 24,288, 24,288, 56 and 28. The
-command FIFO takes 2 DP16KD and the scene ROM 11.
+As built (Phase 15): the GPU places and routes at 75.6 MHz (75 needed) in
+10,751 logic cells, 4,055 flip-flops, 21 DP16KD and 2 MULT18X18D, of 24,288,
+24,288, 56 and 28; memory access added 347 cells and 107 flip-flops. The
+command FIFO takes 2 DP16KD and the scene ROM 11. Phase 13 reached 76 to
+78 MHz in 10,404 cells. The critical path is still the depth test (the Z
+iterator rounded, clamped and compared, then the pixel mask); Phase 16
+reworks the pixel path for texturing and registers the depth there.
 
 The setup engine brief's budget (an estimate, ±50%) for what v1.0 adds:
 

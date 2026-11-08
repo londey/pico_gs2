@@ -9,21 +9,33 @@
 //! Closing the port releases DTR#, and the GPU goes back to its built-in
 //! scene.
 //!
-//! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]`
-//! (`--status` reads `ID` and `STATUS` and streams nothing).
+//! `--screenshot <file>` instead reads the colour buffer on screen back over
+//! the link (`MEM_DATA`, host-interface.md §9), saves it as a 640 × 360
+//! PNG, and compares it with the built-in scene's frames as the reference
+//! renderer draws them: on the board, a pixel-for-pixel check of the
+//! hardware against the model.
+//!
+//! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]
+//! [--screenshot file.png]` (`--status` reads `ID` and `STATUS` and streams
+//! nothing).
 
 #![deny(unsafe_code)]
 
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::fs::File;
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use gs_proto::{reg, Credits, Reply, ReplyDecoder, Status, Transaction, BAUD, ID_VALUE};
+use gs_proto::{
+    colour_buffer, mem_read, pixel_word, reg, unpack_words, Credits, Reply, ReplyDecoder, Status,
+    Transaction, BAUD, FB_HEIGHT, FB_WIDTH, ID_VALUE,
+};
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
-use setup_model::scene::{cube_at, transactions};
+use setup_model::render::{render, Frame};
+use setup_model::scene::{cube_at, cube_scene, transactions};
 
 /// The background the host draws on, RGB565: dark blue, unlike the built-in
 /// scene's grey, so it is plain which is showing.
@@ -46,6 +58,9 @@ struct Args {
 
     /// Only read `ID` and `STATUS`.
     status_only: bool,
+
+    /// Save the frame on screen here, and stream nothing.
+    screenshot: Option<String>,
 }
 
 /// Parses the command line.
@@ -62,6 +77,7 @@ fn parse_args() -> Result<Args> {
         port: String::from("/dev/ttyUSB0"),
         seconds: 10.0,
         status_only: false,
+        screenshot: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -75,8 +91,13 @@ fn parse_args() -> Result<Args> {
                     .context("--seconds needs a number")?;
             }
             "--status" => args.status_only = true,
+            "--screenshot" => {
+                args.screenshot = Some(it.next().context("--screenshot needs a file")?);
+            }
             "-h" | "--help" => {
-                println!("usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]");
+                println!(
+                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png]"
+                );
                 std::process::exit(0);
             }
             other => bail!("unknown option {other}; try --help"),
@@ -232,6 +253,136 @@ impl Link {
         }
         self.replies.pop_front().context("a reply")
     }
+
+    /// Reads dwords of GPU memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `dword` - The first dword's address.
+    /// * `n` - Dwords to read.
+    ///
+    /// # Returns
+    ///
+    /// The dwords, in address order.
+    ///
+    /// # Errors
+    ///
+    /// The port fails, or the replies stop coming.
+    fn read_memory(&mut self, dword: u32, n: usize) -> Result<Vec<u64>> {
+        if !self.replies.is_empty() {
+            bail!("replies left over from an earlier read");
+        }
+        let txns: Vec<Transaction> = mem_read(dword, n).collect();
+        self.send(&txns)?;
+        self.port.flush()?;
+        let mut deadline = Instant::now() + REPLY_TIMEOUT;
+        let mut had = 0;
+        while self.replies.len() < n {
+            if self.replies.len() != had {
+                had = self.replies.len();
+                deadline = Instant::now() + REPLY_TIMEOUT;
+            }
+            if Instant::now() > deadline {
+                bail!("{} of {n} memory reads answered", self.replies.len());
+            }
+            self.poll(true)?;
+        }
+        Ok(self.replies.drain(..).collect())
+    }
+}
+
+/// Reads a colour buffer back and untiles it.
+///
+/// # Arguments
+///
+/// * `link` - The link.
+/// * `buffer` - The buffer, 0 to 2.
+///
+/// # Returns
+///
+/// Its pixels, RGB565, in raster order.
+///
+/// # Errors
+///
+/// The link fails.
+fn read_frame(link: &mut Link, buffer: u8) -> Result<Vec<u16>> {
+    let words = FB_WIDTH * FB_HEIGHT;
+    let dwords = link.read_memory(colour_buffer(u32::from(buffer)), words / 4)?;
+    let tiled: Vec<u16> = dwords.into_iter().flat_map(unpack_words).collect();
+    Ok((0..words)
+        .map(|i| tiled[pixel_word(i % FB_WIDTH, i / FB_WIDTH)])
+        .collect())
+}
+
+/// An RGB565 colour as 8 bits a channel, each channel's bits repeated.
+fn rgb888(c: u16) -> [u8; 3] {
+    let (r, g, b) = (c >> 11, c >> 5 & 0x3F, c & 0x1F);
+    [r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2].map(|v| u8::try_from(v).unwrap_or(u8::MAX))
+}
+
+/// Saves a frame as a PNG.
+///
+/// # Arguments
+///
+/// * `path` - The file.
+/// * `frame` - The pixels, RGB565, in raster order.
+///
+/// # Errors
+///
+/// The file can't be written.
+fn save_png(path: &str, frame: &[u16]) -> Result<()> {
+    let mut encoder = png::Encoder::new(
+        BufWriter::new(File::create(path).with_context(|| format!("creating {path}"))?),
+        u32::try_from(FB_WIDTH)?,
+        u32::try_from(FB_HEIGHT)?,
+    );
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let rgb: Vec<u8> = frame.iter().flat_map(|&c| rgb888(c)).collect();
+    encoder.write_header()?.write_image_data(&rgb)?;
+    Ok(())
+}
+
+/// Saves the frame on screen and compares it with the built-in scene's.
+///
+/// # Arguments
+///
+/// * `link` - The link, connected.
+/// * `path` - Where to save it.
+///
+/// # Errors
+///
+/// The link fails, or the file can't be written.
+fn screenshot(link: &mut Link, path: &str) -> Result<()> {
+    // The GPU hands over at the built-in scene's next present, and shows
+    // that frame from the next frame start: wait for both, then nothing
+    // changes the buffer on screen while the host presents nothing.
+    sleep(Duration::from_millis(50));
+    let status = Status::from_bits(link.read(reg::STATUS)?);
+    println!("reading buffer {} ...", status.shown);
+    let start = Instant::now();
+    let frame = read_frame(link, status.shown)?;
+    println!(
+        "read {} pixels in {:.2} s",
+        frame.len(),
+        start.elapsed().as_secs_f64()
+    );
+    save_png(path, &frame)?;
+    println!("saved {path}");
+    let mut reference = Frame::new(vec![0; FB_WIDTH * FB_HEIGHT]);
+    let (frames, _) = render(&mut reference, &transactions(&cube_scene()));
+    let (k, differing) = frames
+        .iter()
+        .map(|f| f.iter().zip(&frame).filter(|(a, b)| a != b).count())
+        .enumerate()
+        .min_by_key(|&(_, d)| d)
+        .context("the reference scene has no frames")?;
+    if differing == 0 {
+        println!("matches the built-in scene's frame {k} pixel for pixel");
+    } else {
+        println!("nearest the built-in scene's frame {k}, with {differing} pixels differing");
+    }
+    Ok(())
 }
 
 /// Tries to set the FTDI chip's latency timer to 1 ms (from 16), which
@@ -271,9 +422,24 @@ fn print_status(label: &str, s: Status) {
         0.0
     };
     println!(
-        "{label}: {} frames shown, last frame drawn in {} cycles ({fps:.1} fps), {} FIFO entries free",
-        s.frames, s.render_cycles, s.fifo_free
+        "{label}: {} frames shown, last frame drawn in {} cycles ({fps:.1} fps), {} FIFO entries free; buffer {} shown, {} drawn",
+        s.frames, s.render_cycles, s.fifo_free, s.shown, s.drawn
     );
+    if s.link_overflow || s.link_malformed {
+        println!(
+            "link errors since it connected:{}{}",
+            if s.link_overflow {
+                " a transaction arrived with the FIFO full;"
+            } else {
+                ""
+            },
+            if s.link_malformed {
+                " a malformed byte;"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -291,6 +457,11 @@ fn main() -> Result<()> {
     );
     let before = Status::from_bits(link.read(reg::STATUS)?);
     print_status("STATUS", before);
+    if let Some(path) = &args.screenshot {
+        screenshot(&mut link, path)?;
+        link.port.write_data_terminal_ready(false)?;
+        return Ok(());
+    }
     if args.status_only {
         return Ok(());
     }

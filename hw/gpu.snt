@@ -17,8 +17,9 @@
 // at an end of frame while one is already waiting.
 //
 // The SDRAM controller has one request port; an arbiter shares it: the
-// fill until it is done, then scan-out loads first and the rasteriser's
-// writes in the gaps.
+// fill until it is done, then scan-out loads first, the rasteriser's runs
+// in the gaps, and the parser's MEM_DATA runs (which wait for the
+// rasteriser to be idle).
 //
 // The framebuffer is tiled (ADR 0003): 80 x 45 blocks of 8x8 pixels, block
 // (bx, by) the 64 words from (by * 80 + bx) * 64, its pixels in raster
@@ -76,17 +77,20 @@ const FRAME_SLOTS: u13 = 7200;
 
 // Register addresses a host can read (docs/design/host-interface.md §3).
 const REG_RENDER_MODE: u7 = 0x30;
+const REG_MEM_ADDR: u7 = 0x70;
+const REG_MEM_DATA: u7 = 0x71;
 const REG_STATUS: u7 = 0x7E;
 const REG_ID: u7 = 0x7F;
 
-// What ID reads: "PGS2", interface version 1.
-const ID_VALUE: u64 = 0x5047533200010000;
+// What ID reads: "PGS2", interface version 2.
+const ID_VALUE: u64 = 0x5047533200020000;
 
 // Who an SDRAM request, or run, belongs to.
-const OWNER_NONE: u2 = 0;
-const OWNER_FILL: u2 = 1;
-const OWNER_SCAN: u2 = 2;
-const OWNER_RASTER: u2 = 3;
+const OWNER_NONE: u3 = 0;
+const OWNER_FILL: u3 = 1;
+const OWNER_SCAN: u3 = 2;
+const OWNER_RASTER: u3 = 3;
+const OWNER_MEM: u3 = 4;
 
 // The screen's active area: the first pixel after it, and its last line.
 const H_ACTIVE: u11 = 1280;
@@ -102,10 +106,10 @@ struct Gpu {
     // register until it is accepted (so that choosing it isn't on the
     // controller's paths), whose it is, and whose run the controller's
     // words belong to.
-    granted: u2 = 0,
+    granted: u3 = 0,
     #[no_reset]
     granted_req: SdramReq,
-    data_owner: u2 = 0,
+    data_owner: u3 = 0,
 
     // The host link and the triangle pipeline. `tri_flags`: the write
     // enables and depth test (RENDER_MODE bits 4 to 2) of the triangle in
@@ -243,9 +247,14 @@ impl Gpu {
             Some(a) => Some(if a == REG_ID {
                 ID_VALUE
             } else if a == REG_STATUS {
-                0_u14 @ self.link_free @ self.debug_render_cycles @ self.debug_frames
+                0_u8 @ self.draw @ self.disp @ self.debug_link_errors[0:0] @ self.debug_link_errors[1:1]
+                    @ self.link_free @ self.debug_render_cycles @ self.debug_frames
             } else if a == REG_RENDER_MODE {
                 0_u55 @ pout.mode
+            } else if a == REG_MEM_ADDR {
+                0_u42 @ pout.mem_addr
+            } else if a == REG_MEM_DATA {
+                pout.mem_rdata
             } else {
                 0
             }),
@@ -277,12 +286,18 @@ impl Gpu {
             Some(r) => (1_u1, r),
             None => (0_u1, SdramReq { write: 1, addr: 0, len: 0 }),
         };
-        let choice: u2 = if self.filling == 1 {
+        let (mem_wants, mem_req) = match pout.mem_req {
+            Some(r) => (1_u1, r),
+            None => (0_u1, SdramReq { write: 1, addr: 0, len: 0 }),
+        };
+        let choice: u3 = if self.filling == 1 {
             OWNER_FILL
         } else if reading == 1 {
             OWNER_SCAN
         } else if raster_wants == 1 {
             OWNER_RASTER
+        } else if mem_wants == 1 {
+            OWNER_MEM
         } else {
             OWNER_NONE
         };
@@ -290,6 +305,8 @@ impl Gpu {
             SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN }
         } else if choice == OWNER_SCAN {
             SdramReq { write: 0, addr: self.disp @ 0_u4 @ load_addr, len: RUN }
+        } else if choice == OWNER_MEM {
+            mem_req
         } else {
             raster_req
         };
@@ -297,22 +314,23 @@ impl Gpu {
         let x = self.fill_bx @ self.fill_px;
         let y = 0_u1 @ self.fill_by @ self.fill_py;
         let fill_run = self.data_owner == OWNER_FILL;
-        let wdata = if fill_run { pattern(x, y) } else { rout.wdata };
-        let wmask: u1 = if fill_run { 0 } else { rout.wmask };
+        let mem_run = self.data_owner == OWNER_MEM;
+        let wdata = if fill_run { pattern(x, y) } else if mem_run { pout.mem_wdata } else { rout.wdata };
+        let wmask: u1 = if fill_run | mem_run { 0 } else { rout.wmask };
         let (sdram, mem) = self.sdram.step(req, wdata, wmask, sdram_dq);
         // `accepted` is for the request granted last cycle; `wtake` for the
         // run accepted before it.
         let accepted_fill = mem.accepted & self.granted == OWNER_FILL;
         let accepted_scan = mem.accepted & self.granted == OWNER_SCAN;
         let accepted_raster = mem.accepted & self.granted == OWNER_RASTER;
+        let accepted_mem = mem.accepted & self.granted == OWNER_MEM;
         let wtake_fill = mem.wtake & self.data_owner == OWNER_FILL;
         let wtake_raster = mem.wtake & self.data_owner == OWNER_RASTER;
+        let wtake_mem = mem.wtake & mem_run;
         let no_word: Option<u16> = None;
-        let (rdata_scan, rdata_raster) = if self.data_owner == OWNER_RASTER {
-            (no_word, mem.rdata)
-        } else {
-            (mem.rdata, no_word)
-        };
+        let rdata_scan = if self.data_owner == OWNER_SCAN { mem.rdata } else { no_word };
+        let rdata_raster = if self.data_owner == OWNER_RASTER { mem.rdata } else { no_word };
+        let rdata_mem = if mem_run { mem.rdata } else { no_word };
 
         // The fill, in word order: px, then py, then bx, then by.
         let last_run = accepted_fill & self.fill_addr == LAST_RUN;
@@ -387,6 +405,9 @@ impl Gpu {
                     lout.head_addr,
                     lout.head_data,
                     lout.reply_busy,
+                    accepted_mem,
+                    wtake_mem,
+                    rdata_mem,
                 ),
                 setup: setup,
                 raster: self.raster.next(

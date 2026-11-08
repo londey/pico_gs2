@@ -40,15 +40,153 @@ pub mod reg {
     /// Present the frame, and clear.
     pub const FRAME: u8 = 0x40;
 
-    /// Frames shown, the last frame's cycles, free FIFO entries.
+    /// The GPU memory address `MEM_DATA` reads and writes, in dwords.
+    pub const MEM_ADDR: u8 = 0x70;
+
+    /// 64 bits of GPU memory at `MEM_ADDR`, which then moves on by one.
+    pub const MEM_DATA: u8 = 0x71;
+
+    /// Frames shown, the last frame's cycles, free FIFO entries, the
+    /// buffers shown and drawn, the link's errors.
     pub const STATUS: u8 = 0x7E;
 
     /// Identification and interface version.
     pub const ID: u8 = 0x7F;
 }
 
-/// What `ID` reads: "PGS2" and interface version 1.
-pub const ID_VALUE: u64 = 0x5047_5332_0001_0000;
+/// What `ID` reads: "PGS2" and interface version 2.
+pub const ID_VALUE: u64 = 0x5047_5332_0002_0000;
+
+/// The framebuffer's width in pixels.
+pub const FB_WIDTH: usize = 640;
+
+/// The framebuffer's height in pixels.
+pub const FB_HEIGHT: usize = 360;
+
+/// The 64-bit units ("dwords") in each SDRAM bank (host-interface.md §9.2).
+pub const BANK_DWORDS: u32 = 0x10_0000;
+
+/// The dwords at the start of each bank the GPU keeps for its buffers.
+pub const GPU_DWORDS: u32 = 0x1_0000;
+
+/// The first dword of the host's memory in a bank.
+///
+/// # Arguments
+///
+/// * `bank` - The bank, 0 to 3.
+///
+/// # Returns
+///
+/// Its dword address.
+pub const fn host_memory(bank: u32) -> u32 {
+    bank * BANK_DWORDS + GPU_DWORDS
+}
+
+/// The dword address of a colour buffer.
+///
+/// # Arguments
+///
+/// * `buffer` - The buffer, 0 to 2, as `STATUS` names it.
+///
+/// # Returns
+///
+/// Its first dword.
+pub const fn colour_buffer(buffer: u32) -> u32 {
+    buffer * BANK_DWORDS
+}
+
+/// The word, within a colour buffer, that holds a pixel: buffers are tiled
+/// in 8 × 8 blocks (host-interface.md §9.2).
+///
+/// # Arguments
+///
+/// * `x` - The pixel's column, 0 to 639.
+/// * `y` - Its line, 0 to 359.
+///
+/// # Returns
+///
+/// Its word offset from the buffer's start.
+pub const fn pixel_word(x: usize, y: usize) -> usize {
+    (y >> 3) * 5120 + (x >> 3) * 64 + (y & 7) * 8 + (x & 7)
+}
+
+/// Packs four 16-bit words as `MEM_DATA` holds them: the first (lowest
+/// address) in bits 15:0.
+///
+/// # Arguments
+///
+/// * `words` - The words, in address order.
+///
+/// # Returns
+///
+/// The 64-bit value.
+pub fn pack_words(words: [u16; 4]) -> u64 {
+    words
+        .iter()
+        .rev()
+        .fold(0, |acc, &w| acc << 16 | u64::from(w))
+}
+
+/// Unpacks a `MEM_DATA` value into its four words, in address order.
+///
+/// # Arguments
+///
+/// * `d` - The value.
+///
+/// # Returns
+///
+/// The words.
+pub fn unpack_words(d: u64) -> [u16; 4] {
+    [
+        unsigned16(d, 0),
+        unsigned16(d, 16),
+        unsigned16(d, 32),
+        unsigned16(d, 48),
+    ]
+}
+
+/// The transactions that write 16-bit words into GPU memory: a `MEM_ADDR`
+/// write, then a `MEM_DATA` write for every four words (the last padded
+/// with zeros).
+///
+/// # Arguments
+///
+/// * `dword` - The dword address to start at.
+/// * `words` - The words.
+///
+/// # Returns
+///
+/// The transactions, in order.
+pub fn mem_write(dword: u32, words: &[u16]) -> impl Iterator<Item = Transaction> + '_ {
+    let start = core::iter::once(Transaction::write(reg::MEM_ADDR, u64::from(dword)));
+    start.chain(words.chunks(4).map(|c| {
+        let mut four = [0; 4];
+        four[..c.len()].copy_from_slice(c);
+        Transaction::write(reg::MEM_DATA, pack_words(four))
+    }))
+}
+
+/// The transactions that read `n` dwords of GPU memory: a `MEM_ADDR` write,
+/// then `n` reads of `MEM_DATA`, whose replies come back in order.
+///
+/// # Arguments
+///
+/// * `dword` - The dword address to start at.
+/// * `n` - Dwords to read.
+///
+/// # Returns
+///
+/// The transactions, in order.
+pub fn mem_read(dword: u32, n: usize) -> impl Iterator<Item = Transaction> {
+    core::iter::once(Transaction::write(reg::MEM_ADDR, u64::from(dword))).chain(
+        core::iter::repeat_n(
+            Transaction::Read {
+                addr: reg::MEM_DATA,
+            },
+            n,
+        ),
+    )
+}
 
 /// The serial link's line rate: 3 Mbaud, 8N1 (host-interface.md §5).
 pub const BAUD: u32 = 3_000_000;
@@ -385,6 +523,18 @@ impl Frame {
 /// `STATUS`, as read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Status {
+    /// The colour buffer being drawn, 0 to 2.
+    pub drawn: u8,
+
+    /// The colour buffer on screen, 0 to 2.
+    pub shown: u8,
+
+    /// A byte arrived malformed (a low stop bit) since the link reset.
+    pub link_malformed: bool,
+
+    /// A transaction arrived with the FIFO full since the link reset.
+    pub link_overflow: bool,
+
     /// Free command FIFO entries.
     pub fifo_free: u16,
 
@@ -407,6 +557,10 @@ impl Status {
     /// The fields.
     pub fn from_bits(w: u64) -> Status {
         Status {
+            drawn: byte(w, 54) & 3,
+            shown: byte(w, 50) & 3,
+            link_malformed: w >> 53 & 1 == 1,
+            link_overflow: w >> 52 & 1 == 1,
             fifo_free: unsigned16(w, 40) & 0x3FF,
             render_cycles: u32::try_from(w >> 16 & 0xFF_FFFF).unwrap_or(0),
             frames: unsigned16(w, 0),
@@ -417,9 +571,14 @@ impl Status {
     ///
     /// # Returns
     ///
-    /// Free entries in bits 49:40, cycles in 39:16, frames in 15:0.
+    /// The buffer drawn in bits 55:54, shown in 51:50, the link's errors
+    /// in 53:52, free entries in 49:40, cycles in 39:16, frames in 15:0.
     pub fn bits(self) -> u64 {
-        u64::from(self.fifo_free & 0x3FF) << 40
+        u64::from(self.drawn & 3) << 54
+            | u64::from(self.link_malformed) << 53
+            | u64::from(self.link_overflow) << 52
+            | u64::from(self.shown & 3) << 50
+            | u64::from(self.fifo_free & 0x3FF) << 40
             | u64::from(self.render_cycles & 0xFF_FFFF) << 16
             | u64::from(self.frames)
     }
@@ -654,11 +813,43 @@ mod tests {
         };
         assert_eq!(Frame::from_bits(f.bits()), f);
         let s = Status {
+            drawn: 2,
+            shown: 1,
+            link_malformed: true,
+            link_overflow: false,
             fifo_free: 512,
             render_cycles: 1_103_542,
             frames: 7,
         };
         assert_eq!(Status::from_bits(s.bits()), s);
+        assert_eq!(s.bits() >> 50, 0b10_10_01);
+    }
+
+    /// Memory words pack with the first in the low bits; a write is
+    /// `MEM_ADDR` then a `MEM_DATA` per four words, the last padded.
+    #[test]
+    fn memory_words() {
+        let d = pack_words([1, 2, 3, 4]);
+        assert_eq!(d, 0x0004_0003_0002_0001);
+        assert_eq!(unpack_words(d), [1, 2, 3, 4]);
+        let mut w = mem_write(host_memory(1), &[1, 2, 3, 4, 5]);
+        assert_eq!(w.next(), Some(Transaction::write(reg::MEM_ADDR, 0x11_0000)));
+        assert_eq!(w.next(), Some(Transaction::write(reg::MEM_DATA, d)));
+        assert_eq!(w.next(), Some(Transaction::write(reg::MEM_DATA, 5)));
+        assert_eq!(w.next(), None);
+        assert_eq!(mem_read(colour_buffer(2), 3).count(), 4);
+    }
+
+    /// Pixels are tiled in 8 × 8 blocks: raster order within a block,
+    /// blocks across, block rows of 5,120 words.
+    #[test]
+    fn pixels_are_tiled() {
+        assert_eq!(pixel_word(0, 0), 0);
+        assert_eq!(pixel_word(7, 0), 7);
+        assert_eq!(pixel_word(0, 1), 8);
+        assert_eq!(pixel_word(8, 0), 64);
+        assert_eq!(pixel_word(0, 8), 5120);
+        assert_eq!(pixel_word(639, 359), 44 * 5120 + 79 * 64 + 63);
     }
 
     /// A write is 9 bytes, MSB first; a read is one byte with bit 7 set.

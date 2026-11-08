@@ -4,8 +4,10 @@
 //   Parser  takes register transactions (ADR 0008) from the built-in scene
 //           ROM, or from the host link's FIFO while a host is connected:
 //           latches ATTR0 and RENDER_MODE, writes each vertex into the setup
-//           engine's ring and starts the triangles its kicks make, and
-//           carries out FRAME's present and clears. The ROM scene loops.
+//           engine's ring and starts the triangles its kicks make,
+//           carries out FRAME's present and clears, and reads and writes
+//           GPU memory for MEM_DATA, four words at a time, once the
+//           pipeline is idle. The ROM scene loops.
 //   Raster  clears a frame (colour, depth or both), or copies a set-up
 //           triangle out of the engine's output buffer and walks its bounding
 //           box in 8x8 blocks: it reads a block's depths, steps the edge
@@ -34,6 +36,8 @@ const REG_VERTEX_NOKICK: u8 = 0x06;
 const REG_VERTEX_KICK_FAN: u8 = 0x09;
 const REG_RENDER_MODE: u8 = 0x30;
 const REG_FRAME: u8 = 0x40;
+const REG_MEM_ADDR: u8 = 0x70;
+const REG_MEM_DATA: u8 = 0x71;
 
 // The scene ROM's end marker (models/setup/src/scene.rs): start again.
 const ROM_END: u8 = 0xFF;
@@ -47,14 +51,24 @@ const KICK_021: u2 = 2;
 const MODE_RESET: u9 = 0x1C;
 
 // Parser states.
-const P_FETCH: u3 = 0;
-const P_DECODE: u3 = 1;
-const P_EXEC: u3 = 2;
-const P_WRITE: u3 = 3;
-const P_START: u3 = 4;
-const P_PRESENT: u3 = 5;
-const P_CLEAR: u3 = 6;
-const P_READ: u3 = 7;
+const P_FETCH: u4 = 0;
+const P_DECODE: u4 = 1;
+const P_EXEC: u4 = 2;
+const P_WRITE: u4 = 3;
+const P_START: u4 = 4;
+const P_PRESENT: u4 = 5;
+const P_CLEAR: u4 = 6;
+const P_READ: u4 = 7;
+const P_MEM: u4 = 8;
+
+// A MEM_DATA access, in P_MEM: waiting for the pipeline to be idle, its run
+// waiting to be accepted, then its four words moving.
+const M_WAIT: u2 = 0;
+const M_REQ: u2 = 1;
+const M_MOVE: u2 = 2;
+
+// Words in a MEM_DATA access: 64 bits.
+const MEM_WORDS: u6 = 4;
 
 // Raster states.
 const R_IDLE: u4 = 0;
@@ -109,10 +123,16 @@ pub struct ParserOut {
     // RENDER_MODE: its write enables go with each triangle started, and a
     // read returns it.
     pub mode: u9,
+    // MEM_DATA's run, held until accepted, and the word to write, taken on
+    // `wtake`; MEM_ADDR, and the last 64 bits MEM_DATA read.
+    pub mem_req: Option<SdramReq>,
+    pub mem_wdata: u16,
+    pub mem_addr: u22,
+    pub mem_rdata: u64,
 }
 
 pub struct Parser {
-    state: u3 = 0,
+    state: u4 = 0,
     // Taking transactions from the host link (else the ROM), and the next
     // ROM entry.
     from_host: u1 = 0,
@@ -138,6 +158,14 @@ pub struct Parser {
     s2: u2 = 3,
     // The vertex field being written (0 to 9).
     field: u4 = 0,
+    // GPU memory: MEM_ADDR (in 64-bit units), a MEM_DATA access's step and
+    // its words moved so far, and the 64 bits read (the first word in bits
+    // 15:0).
+    mem_addr: u22 = 0,
+    mem_step: u2 = 0,
+    mem_i: u2 = 0,
+    #[no_reset]
+    mem_rdata: u64 = 0,
     // The registered outputs.
     load_valid: u1 = 0,
     start_valid: u1 = 0,
@@ -171,6 +199,22 @@ impl Parser {
             pop: (self.state == P_DECODE & self.from_host == 1),
             read: if self.state == P_READ { Some(self.t_addr[6:0]) } else { None },
             mode: self.mode,
+            mem_req: if self.state == P_MEM & self.mem_step == M_REQ {
+                Some(SdramReq { write: !self.t_addr[7:7], addr: self.mem_addr @ 0_u2, len: MEM_WORDS })
+            } else {
+                None
+            },
+            mem_wdata: if self.mem_i == 0 {
+                self.t_data[15:0]
+            } else if self.mem_i == 1 {
+                self.t_data[31:16]
+            } else if self.mem_i == 2 {
+                self.t_data[47:32]
+            } else {
+                self.t_data[63:48]
+            },
+            mem_addr: self.mem_addr,
+            mem_rdata: self.mem_rdata,
         }
     }
 
@@ -179,7 +223,9 @@ impl Parser {
     // `ring_free`: no triangle is using the vertex ring. `clear_ok`: the
     // pipeline is idle. `present_ok`: idle, and the display can take a
     // frame. `link`: the host link's outputs: its FIFO's head, whether a
-    // host is connected, and whether it can take a read's reply.
+    // host is connected, and whether it can take a read's reply. `mem_*`:
+    // the SDRAM's answers to MEM_DATA's run: accepted, a word taken, a word
+    // read.
     pub fn next(
         self,
         enable: u1,
@@ -192,6 +238,9 @@ impl Parser {
         head_addr: u8,
         head_data: u64,
         reply_busy: u1,
+        mem_accepted: u1,
+        mem_wtake: u1,
+        mem_word: Option<u16>,
     ) -> Self {
         let st = self.state;
 
@@ -276,13 +325,27 @@ impl Parser {
         let clearing = st == P_CLEAR & clear_ok == 1;
         let replied = st == P_READ & (reply_busy == 0 | link_enabled == 0);
 
-        let state: u3 = if st == P_FETCH {
+        // ---- MEM: MEM_DATA, written (from either source) or read (from a
+        // host), once everything before it is drawn. ----------------------
+        let is_mem_data = (0_u1 @ a[6:0]) == REG_MEM_DATA;
+        let mem_read = a[7:7] == 1;
+        let in_mem = st == P_MEM;
+        let (got_word, word) = match mem_word {
+            Some(w) => (1_u1, w),
+            None => (0_u1, 0_u16),
+        };
+        let moved = in_mem & self.mem_step == M_MOVE & ((!mem_read & mem_wtake == 1) | (mem_read & got_word == 1));
+        let mem_done = moved & self.mem_i == 3;
+
+        let state: u4 = if st == P_FETCH {
             if fetching { P_DECODE } else { P_FETCH }
         } else if st == P_DECODE {
             P_EXEC
         } else if st == P_EXEC {
             if rom_end {
                 P_FETCH
+            } else if is_mem_data & (a[7:7] == 0 | self.from_host == 1) {
+                P_MEM
             } else if a[7:7] == 1 {
                 if self.from_host == 1 { P_READ } else { P_FETCH }
             } else if is_vertex {
@@ -302,6 +365,8 @@ impl Parser {
             if !presenting { P_PRESENT } else if clears { P_CLEAR } else { P_FETCH }
         } else if st == P_CLEAR {
             if clearing { P_FETCH } else { P_CLEAR }
+        } else if in_mem {
+            if !mem_done { P_MEM } else if mem_read { P_READ } else { P_FETCH }
         } else if replied {
             P_FETCH
         } else {
@@ -354,6 +419,26 @@ impl Parser {
             s1: if vertex_go { self.s2 } else { self.s1 },
             s2: if vertex_go { new_slot } else { self.s2 },
             field: if st == P_WRITE { (self.field + 1) as u4 wrap } else { 0 },
+            mem_addr: if host_gone {
+                0
+            } else if exec_plain & a == REG_MEM_ADDR {
+                self.t_data[21:0]
+            } else if mem_done {
+                (self.mem_addr + 1) as u22 wrap
+            } else {
+                self.mem_addr
+            },
+            mem_step: if !in_mem {
+                M_WAIT
+            } else if self.mem_step == M_WAIT & clear_ok == 1 {
+                M_REQ
+            } else if self.mem_step == M_REQ & mem_accepted == 1 {
+                M_MOVE
+            } else {
+                self.mem_step
+            },
+            mem_i: if !in_mem { 0 } else if moved { (self.mem_i + 1) as u2 wrap } else { self.mem_i },
+            mem_rdata: if in_mem & mem_read & got_word == 1 { word @ self.mem_rdata[63:16] } else { self.mem_rdata },
             load_valid: (st == P_WRITE),
             start_valid: starting,
             clear_valid: clearing,

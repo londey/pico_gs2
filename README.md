@@ -65,9 +65,13 @@ bitstream loaded, build the PC tool in the devcontainer with
 ```
 sim/target/release/gs-host --port /dev/ttyUSB0             # stream a live cube for 10 s
 sim/target/release/gs-host --port /dev/ttyUSB0 --status    # read ID and STATUS only
+sim/target/release/gs-host --port /dev/ttyUSB0 --screenshot frame.png
 ```
 
 While the port is open the GPU draws what the host sends: the tool's cube
 turns all the way round, over a dark blue background. When it closes, the
 GPU goes back to its built-in scene. The tool reports the frames shown,
-how long a frame took to draw and the link's throughput.
+how long a frame took to draw and the link's throughput. `--screenshot`
+reads the frame on screen back over the link (about 2 s), saves it as a
+640×360 PNG, and says whether it matches one of the built-in scene's frames
+as the reference renderer draws them, pixel for pixel.
