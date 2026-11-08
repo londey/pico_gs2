@@ -84,16 +84,16 @@
 - A from-scratch rewrite of *pico-gs*: a fixed-function 3D GPU of the
   PS1/N64 era, on a small FPGA board.
 - *Board:* ICEpi Zero v1.3. Lattice ECP5-25K (LFE5U-25F-6BG256C), 32 MB SDRAM
-  (Winbond W9825G6KH), DVI out on mini-HDMI, an RP2350 microcontroller as the
-  host.
+  (Winbond W9825G6KH), DVI out on mini-HDMI, an FT231X USB UART to a PC.
 - *Language:* Sinter. One source compiles to SystemVerilog for the FPGA *and*
   a cycle-accurate Rust simulator, the design's digital twin. There is no
   separate hand-written model.
 - *Today:* 1280×720 DVI from a tiled, triple-buffered 640×360 framebuffer
   in SDRAM: a spinning Gouraud-shaded cube, depth-tested against a 16-bit Z
-  buffer, drawn by the setup engine and rasteriser at 68 frames per second,
-  shown at 60. Pixel-exact against a reference renderer in simulation, and
-  on the board. The SPI host link and textures are next.
+  buffer, drawn by the setup engine and rasteriser at 66 frames per second,
+  shown at 60. A PC drives it with register writes over USB serial; with no
+  PC it plays a built-in scene. Pixel-exact against a reference renderer in
+  simulation, and on the board. Textures and alpha blending are next.
 
 #v(0.5em)
 #key
@@ -104,15 +104,17 @@
   columns: (1.15fr, 1fr),
   gutter: 1em,
   text(size: 14pt, diagram(
-    spacing: (16mm, 12mm),
+    spacing: (22mm, 12mm),
     node-inset: 7pt,
     chip((1, 0), [50 MHz oscillator], name: <osc>),
-    planned((0, 1), [RP2350\ host], name: <host>),
+    chip((0, 1), [PC\ FT231X], name: <host>),
+    planned((0, 2), [RP2350\ (later)], name: <rp>),
     built((1, 1), [ECP5-25K\ PLL · Sinter core\ `board/top.sv`], name: <fpga>),
     chip((2, 1), [SDRAM\ 32 MB], name: <sdram>),
     chip((1, 2), [mini-HDMI (DVI)], name: <hdmi>),
     edge(<osc>, <fpga>, "-|>"),
-    edge(<host>, <fpga>, "--|>", [SPI]),
+    edge(<host>, <fpga>, "<|-|>", [USB\ serial]),
+    edge(<rp>, <fpga>, "--|>", [SPI], label-side: right),
     edge(<fpga>, <sdram>, "<|-|>", [16 bit]),
     edge(<fpga>, <hdmi>, "-|>", [4 TMDS pairs, 750 Mb/s], label-side: left),
   )),
@@ -136,13 +138,14 @@
 #align(center, text(size: 13pt, diagram(
   spacing: (9mm, 11mm),
   node-inset: 6pt,
-  planned((0, 0), [SPI host\ link], name: <spi>),
+  built((0, 0), [USB serial\ link + FIFO], name: <spi>),
+  planned((0, -1), [SPI link\ (later)], name: <spi2>),
   built((1, 0), [command\ parser], name: <cmd>),
   built((2, 0), [vertex\ ring], name: <ring>),
   built((3, 0), [triangle\ setup], name: <setup>),
   built((4, 0), [traversal +\ iterators], name: <trav>),
   built((5, 0), [tile buffers\ colour + Z], name: <tile>),
-  built((0, 1), [test scene\ ROM], name: <rom>),
+  built((0, 1), [scene ROM\ (transactions)], name: <rom>),
   built((2, 1), [test-pattern\ fill], name: <fill>),
   built((4, 1), [SDRAM\ arbiter], name: <arb>),
   built((5, 1), [SDRAM\ controller], name: <ctl>),
@@ -151,7 +154,8 @@
   built((3, 2), [video timing +\ TMDS encoders], name: <enc>),
   built((2, 2), [TMDS gearbox\ + ODDRX2F], name: <gear>),
   chip((1, 2), [DVI], name: <dvi>),
-  edge(<spi>, <cmd>, "--|>"),
+  edge(<spi>, <cmd>, "-|>"),
+  edge(<spi2>, <cmd>, "--|>"),
   edge(<rom>, <cmd>, "-|>"),
   edge(<cmd>, <ring>, "-|>"),
   edge(<ring>, <setup>, "-|>"),
@@ -167,8 +171,8 @@
   edge(<gear>, <dvi>, "-|>"),
 )))
 #align(center, key)
-Everything runs on the one 75 MHz core clock. Only the serialisers and
-(later) the SPI link have clocks of their own.
+Everything runs on the one 75 MHz core clock, the UART included. Only the
+serialisers and (later) the SPI link have clocks of their own.
 
 == One source, two artefacts
 
@@ -321,7 +325,7 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 #align(center, text(size: 13pt, diagram(
   spacing: (11mm, 14mm),
   node-inset: 6pt,
-  built((0, 0), [packets\ (ROM; SPI later)], name: <pk>),
+  built((0, 0), [register writes\ (ROM or host)], name: <pk>),
   built((1, 0), [vertex ring\ 4 slots], name: <vr>),
   built((2, 0), [setup\ 99 cycles / triangle], name: <su>),
   built((3, 0), [traversal\ 8×8 blocks, 1 px/clk], name: <tr>),
@@ -340,8 +344,8 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
 - *Per block:* read its 64 depths (two runs); a pixel is drawn if covered and
   nearer; then one masked 32-word run per half block with a drawn pixel, for
   colour and for Z. Setup of the next triangle overlaps traversal of this one.
-- *Per frame:* a clear (colour and Z, 14,400 runs), the triangles, an end of
-  frame. The cube frame takes 1.10 M cycles (14.7 ms): 68 fps, about half
+- *Per frame:* a clear (colour and Z, 14,400 runs), the triangles, a
+  present. The cube frame takes 1.13 M cycles (15 ms): 66 fps, about half
   of it the clear.
 
 == Depth and triple buffering
@@ -356,22 +360,90 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     built((1, 1), [waiting], name: <wt>),
     built((2, 0), [shown], name: <sh>),
     built((1, -1), [spare], name: <sp>),
-    edge(<dr>, <wt>, "-|>", [end of frame], label-side: right),
+    edge(<dr>, <wt>, "-|>", [present], label-side: right),
     edge(<wt>, <sh>, "-|>", [frame start], label-side: right),
     edge(<sh>, <sp>, "-|>", [frame start], label-side: right),
-    edge(<sp>, <dr>, "-|>", [end of frame], label-side: right),
+    edge(<sp>, <dr>, "-|>", [present], label-side: right),
   )),
   [
     #set text(size: 15pt)
     - Three colour buffers (banks 0–2) take turns: one shown, one drawn, one
       finished and waiting or spare.
     - A finished frame is shown from the next frame start, so a frame is
-      never torn. If one is already waiting, the parser holds at the end of
-      frame.
+      never torn. If one is already waiting, the parser holds at the
+      present.
     - *Z:* 16 bits in bank 3, the iterator rounded and clamped; less-than
       test, cleared to 0xFFFF.
     - *Cube:* 32 frames a quarter turn, back faces culled, looping
       seamlessly; two triangles crossing in depth test the Z buffer.
+  ],
+)
+
+= The host interface
+
+== Registers, not packets
+
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1.2em,
+  [
+    #set text(size: 14pt)
+    A *transaction* is 72 bits: read/write, a 7-bit address, 64 bits of data.
+    #table(
+      columns: (auto, auto, 1fr),
+      [*Addr*], [*Register*], [*Holds*],
+      [0x00], [`ATTR0`], [RGBA, S′T′ (latched)],
+      [0x06], [`VERTEX_NOKICK`], [X, Y, Z, Q: 16 bits each],
+      [0x07–09], [`VERTEX_KICK_*`], [the same, and draw: strip 012, 021, fan],
+      [0x30], [`RENDER_MODE`], [cull, Z test, Z write, colour write],
+      [0x40], [`FRAME`], [present, clear colour, clear depth],
+      [0x7E], [`STATUS`], [frames, draw cycles, FIFO free],
+      [0x7F], [`ID`], [`0x5047533200010000`],
+    )
+  ],
+  [
+    #set text(size: 15pt)
+    - A vertex is one write; a triangle strip costs about one vertex and one
+      colour per triangle.
+    - One kick register per winding, so strips and fans need no flags.
+    - `FRAME` presents, then clears: one write ends a frame and starts the
+      next.
+    - Inspired by pico-gs's registers, not copied: only what this pipeline
+      can honour (ADR 0008, `docs/design/host-interface.md`).
+    - The built-in cube is the same transactions, in a 2,048-entry ROM.
+  ],
+)
+
+== The serial link
+
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1.2em,
+  text(size: 13pt, diagram(
+    spacing: (16mm, 12mm),
+    node-inset: 6pt,
+    chip((0, 0), [`gs-host` (Rust, PC)], name: <pc>),
+    chip((0, 1), [FT231X USB UART], name: <ft>),
+    built((0, 2), [UART + assembler\ 25 clocks a bit], name: <rx>),
+    built((0, 3), [FIFO\ 512 transactions], name: <fifo>),
+    built((1, 3), [command\ parser], name: <cmd>),
+    built((1, 2), [scene ROM], name: <rom>),
+    edge(<pc>, <ft>, "<|-|>", [USB], label-side: left),
+    edge(<ft>, <rx>, "<|-|>", [3 Mbaud each way], label-side: left),
+    edge(<rx>, <fifo>, "-|>"),
+    edge(<fifo>, <cmd>, "-|>"),
+    edge(<rom>, <cmd>, "-|>"),
+  )),
+  [
+    #set text(size: 15pt)
+    - A write is 9 bytes, a read 1; a read's reply is a tag and 8 bytes. Reads
+      go through the FIFO, so they fence the writes before them.
+    - *Credits:* the host starts with 512 and gets one byte back per 64
+      taken; there is no flow-control wire.
+    - *DTR\#* connects the host: the GPU leaves its ROM scene at the next
+      present, and goes back to it when the port closes.
+    - *On the board:* a live cube at 60.7 fps; 3,520 transactions/s, 11% of
+      the line. Credits, replies and the hand-over are twin-tested.
   ],
 )
 
@@ -524,15 +596,15 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [9512], [3841], [24288],
-      [flip-flops], [3391], [974], [24288],
-      [block RAM (DP16KD)], [26], [5], [56],
+      [logic cells], [10404], [3841], [24288],
+      [flip-flops], [3948], [974], [24288],
+      [block RAM (DP16KD)], [21], [5], [56],
       [multipliers], [2], [2], [28],
       [PLL], [1], [—], [2],
-      [I/O], [49], [—], [197],
+      [I/O], [52], [—], [197],
     )
-    _GPU_: today's bitstream, setup engine and rasteriser included; 16 of
-    its block RAMs are the 8,192-word scene ROM.
+    _GPU_: today's bitstream, setup engine, rasteriser and host link
+    included; the scene ROM takes 11 block RAMs, the link's FIFO 2.
     _Setup_: the engine placed and routed alone.
   ],
   [
@@ -540,8 +612,8 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [77.1 MHz], [75],
-      [`clk_sclk`], [320 MHz], [187.5],
+      [`clk_core`], [76–78 MHz], [75],
+      [`clk_sclk`], [328 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
     The brief's whole-design budget (estimate): about 11,000 LUTs (45%), 19
@@ -563,9 +635,13 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   [9], [setup engine: Rust models, microcode, scheduler, interpreter], done,
   [10], [setup engine in Sinter, cycle-exact against the interpreter], done,
   [11], [command parser, traversal, tile buffer: first triangles on screen], done,
-  [12], [Z buffer, clears, triple buffering, spinning cube: 68 fps], done,
-  [—], [SPI host link and RP2350 firmware], later,
-  [—], [textures and perspective correction], later,
+  [12], [Z buffer, clears, triple buffering, spinning cube], done,
+  [13], [register interface; USB serial host link; `gs-host`], done,
+  [14], [interface document for v1.0: serial and SPI; texture uploads], next,
+  [15–16], [textures: upload, cache, perspective correction], later,
+  [17], [alpha blending], later,
+  [18], [v1.0: interface frozen for games], later,
+  [—], [SPI from an RP2350; meshes kept in SDRAM], later,
 ))
 
 == Open issues
@@ -579,9 +655,11 @@ Everything runs on the one 75 MHz core clock. Only the serialisers and
   bits limit it.
 - *No formal overflow proof* for the setup program yet; ports and the
   accumulator are checked at run time over the test corpus.
-- *Frame rate:* 68 fps for the cube, but the full clear is about half of
+- *Link bandwidth:* 3 Mbaud carries about 550 transactions a frame at 60
+  fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
+- *Frame rate:* 66 fps for the cube, but the full clear is about half of
   it; a fast clear (per-block flags) is the first fix if scenes get busier.
-- *Core timing margin:* 77.1 MHz against 75 after adding Z. The critical
+- *Core timing margin:* 76–78 MHz against 75, varying with placement. The critical
   path is the depth test: Z iterator → round and clamp → compare → pixel
   mask; registering the depth a cycle earlier would buy it back.
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
