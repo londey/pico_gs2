@@ -75,9 +75,10 @@ registers return 0.
 **Render state goes with each triangle.** A triangle is drawn with
 `RENDER_MODE`, `TEX0_CFG`, `CC_MODE`, `CONST0` and `CONST1` as they were at
 its kick, however long it waits in the pipeline. A write to `TEX0_CFG` or
-`MEM_DATA` waits until the triangles before it are drawn (the texture
-cache is emptied then), so group triangles by texture: each change costs
-the pipeline's drain, about the time of one large triangle.
+`MEM_DATA` waits until the triangles before it are drawn, so group
+triangles by texture: each change costs the pipeline's drain, about the
+time of one large triangle. A `MEM_DATA` write also empties the texture
+cache, so the next textured triangle sees what was written.
 
 ## 4. Registers
 
@@ -197,9 +198,12 @@ other repeat reflected), 3 reserved (as `REPEAT`). The other bits are
 reserved: write 0, read 0. Field positions are pico-gs's. A `WIDTH_LOG2`
 or `HEIGHT_LOG2` below 2 is taken as 2, above 10 as 10.
 
-A write waits for the triangles before it to be drawn, then empties the
-texture cache, so it also makes a texture just uploaded to the same
-address visible. Upload with `MEM_DATA`, which does the same.
+A write waits for the triangles before it to be drawn. Switching textures
+keeps the texture cache, which is tagged by address; uploading with
+`MEM_DATA` empties it, so a texture uploaded again at the same address is
+seen. (Version 2's draft said a `TEX0_CFG` write empties the cache too;
+it doesn't need to, and a scene that switches textures every frame would
+start every frame cold.)
 
 ### 6.1 Texel formats
 
@@ -244,14 +248,50 @@ clamps them to the texture, `MIRROR` reflects every other repeat.
 - **Bilinear (Phase 18):** the four texels around (U − ½, V − ½), each wrapped,
   weighted by the fraction bits.
 
-The divide is a reciprocal of Q (a table and a Newton–Raphson step) and two
-multiplies. Its exact rounding is the reference renderer's
-(`models/setup/src/render.rs`), which the hardware matches bit for bit.
-Phase 16 measures its error against an exact divide, by how far a
-triangle's farthest vertex is against its nearest, and records it here.
+The divide is a reciprocal of Q (setup's 1,024-entry seed table and a
+Newton–Raphson step) and two multiplies. Its exact rounding is the
+reference renderer's (`models/setup/src/texture.rs`), which the hardware
+matches bit for bit. Its error against an exact divide of the same
+interpolated S′ and Q, for a 256-texel texture
+(`models/setup/tests/texture.rs`):
+
+| Q from | to | worst error, texels |
+|---|---|---|
+| 1 | 2 | 0.10 |
+| 1/64 | 1 | 0.0625 |
+| 1/256 | 1/64 | 0.125 |
+
+A sixteenth of a texel is the coordinate's 4 fraction bits, rounded down.
+With the nearest vertex's Q scaled to about 1, Q = 1/256 is a point 256
+times as far away. Near Q = 1 the reciprocal's 2^-15 shows on a triangle
+spanning many repeats. The vertices' own S′ and T′ (Q4.12) are coarser
+than this: at Q = 1/8 a step of S′ moves a 256-texel texture by half a
+texel, so a host should keep a triangle's range of Q modest.
 
 There is no mipmapping: a texture seen from far away shimmers; smaller
 textures for far objects are the host's choice.
+
+### 6.4 How it is built (Phase 16)
+
+For each 8 × 8 block of a triangle, the rasteriser's pixel pass (64
+cycles) steps S′, T′ and Q with the colour and depth, and a 12-stage
+pipeline turns each pixel's into its texel's address: the reciprocal (a
+leading-zero count, the seed, two multiplies), S′ and T′ times it (25 × 18
+bits), the shift to texels, saturation, the wrap, and the texel's tag,
+cache line and place in its block. Untextured, the block goes straight to
+its write-back as before; textured, a texel pass (64 cycles and 5 of
+latency, plus misses) looks each drawn pixel's texel up and writes texture
+× shade into the colour tile.
+
+The texture cache is direct-mapped: 256 lines of one 4 × 4 block each
+(4,096 texels, 4 DP16KD), line (block row mod 16, block column mod 16), so
+any 64 × 64-texel window of a texture fits; each line's tag is the block's
+whole address. A miss fetches the block as one 16-word run and looks the
+pixel up again: about 30 cycles. The tags are cleared (256 cycles) before
+the first triangle after a `MEM_DATA` write.
+
+The depth test moved a stage later in the pixel pass (the depth compared a
+cycle after it is rounded), which took it off the critical path.
 
 ## 7. The colour combiner (Phase 17)
 
@@ -595,23 +635,48 @@ and the twin tests compare against it pixel for pixel, as now.
   `MEM_ADDR` not moving on; `STATUS`'s buffers swapped. On the board,
   `gs-host --screenshot` compares the frame on screen with the reference
   renderer's built-in scene.
-- **16:** textured triangles in both formats, every wrap mode, textures
-  smaller and larger than the cache, a texture uploaded between two frames
-  (the cache emptied), steep perspective; the setup engine's S′, T′ and Q
-  gradients against the interpreter.
+- **16, as built (`texture.rs`):** once the ROM's first frame is up, a host
+  uploads textures and draws four frames, each pixel-exact against the
+  reference renderer: a floor in steep perspective (Q from 1 to 1/8, four
+  repeats of a 32 × 32 RGB565 texture), a triangle clamping S and
+  mirroring T, a 16 × 16 ARGB4444 texture multiplied by vertex colours,
+  and an untextured triangle crossing the floor in depth; the floor again
+  after its texture is uploaded again with different texels; a 128 × 32
+  texture, wider than the cache's window, across the screen; and the
+  textured cube `gs-host` streams. Recorded as `gpu.texture.csv` and
+  replayed with `--cosim`. The divide's accuracy and each step of
+  sampling are unit-tested in `models/setup`. The untextured scenes
+  (`frame.rs`, `host.rs`, `memory.rs`) stay pixel-exact with the new
+  colour rounding and depth stage. The two large textures are written
+  straight into the SDRAM model (and the reference's memory), keeping 4.6
+  million cycles of link time out of the recording. Mutations, each
+  caught: every lookup a hit; tags compared on their low bits only; no
+  flush after a memory write; mirror never reflecting; clamp repeating;
+  ARGB4444 read as RGB565; the shade not stretched to 256; no
+  Newton–Raphson step; the depth test reading the next pixel's depth;
+  undrawn pixels' misses fetched.
 - **17:** each combiner preset in §7 and every source; each alpha test; a
   cut-out in front of and behind other triangles.
 - **18:** bilinear against the reference, including at wrap edges.
 
 ## 16. Resources and timing
 
-As built (Phase 15): the GPU places and routes at 75.6 MHz (75 needed) in
-10,751 logic cells, 4,055 flip-flops, 21 DP16KD and 2 MULT18X18D, of 24,288,
-24,288, 56 and 28; memory access added 347 cells and 107 flip-flops. The
-command FIFO takes 2 DP16KD and the scene ROM 11. Phase 13 reached 76 to
-78 MHz in 10,404 cells. The critical path is still the depth test (the Z
-iterator rounded, clamped and compared, then the pixel mask); Phase 16
-reworks the pixel path for texturing and registers the depth there.
+As built (Phase 16): the GPU places and routes at 85.5 MHz (75 needed) in
+13,852 logic cells, 6,192 flip-flops, 27 DP16KD and 11 MULT18X18D, of
+24,288, 24,288, 56 and 28 (57%, 25%, 48%, 39%). Texturing added 3,101 cells,
+2,137 flip-flops (most of them the address pipeline's stages), 6 DP16KD
+(the cache's texels 4, its tags 1, the seed table 1) and 9 multipliers
+(the reciprocal 2, S′ and T′ × it 4, texture × shade 3). The critical path
+is now the SDRAM arbiter choosing a request, from scan-out's counters.
+
+Phase 15 placed at 75.6 MHz in 10,751 cells, 4,055 flip-flops and 21
+DP16KD; memory access added 347 cells and 107 flip-flops. The first
+Phase 16 build reached only 62 MHz. Splitting the address pipeline's last
+stages (the wrap; the shift, then saturation), decoding `TEX0_CFG` into
+registers, and giving texture × shade a stage of its own reached 80, but a
+later build of almost the same logic placed at 74; stretching the shade a
+stage earlier and registering the product before the colour tile's write
+gave 85.5.
 
 The setup engine brief's budget (an estimate, ±50%) for what v1.0 adds:
 
@@ -622,10 +687,15 @@ The setup engine brief's budget (an estimate, ±50%) for what v1.0 adds:
 | Combiner and alpha test | 1,500 | 6 | 0 |
 | **v1.0 total, with today's design** | **about 15,000 (60%)** | **about 17 (60%)** | **about 34 (60%)** |
 
-The cache would hold 4 to 8 DP16KD of texels (8 to 16 KB), banked so that
-bilinear filtering reads four texels a cycle. Each phase reports the real
-figures; the frame time of a textured scene, with its cache misses, is
-Phase 16's to measure.
+Texturing came in at 3,100 cells, 9 multipliers and 6 DP16KD against the
+brief's 2,900, 9 and 13 for the divide, cache and filter. Bilinear
+filtering (Phase 18) needs four texels a cycle, which this one-port cache
+doesn't give; it will need the cache banked by texel parity, or four
+cycles a pixel.
+
+**Textured cube (twin):** 381 blocks through the texel pass, 16,445
+lookups, 256 misses (each of the 64 × 64 texture's blocks once, the cache
+having been emptied by the upload): 98.4% hits.
 
 ## 17. On the board
 

@@ -11,11 +11,15 @@
 //   Raster  clears a frame (colour, depth or both), or copies a set-up
 //           triangle out of the engine's output buffer and walks its bounding
 //           box in 8x8 blocks: it reads a block's depths, steps the edge
-//           functions and the colour and depth planes one pixel per clock
-//           into tile buffers, depth-tests each pixel, and writes the block's
-//           colours and depths back, each half block with a drawn pixel as
-//           one masked 32-word SDRAM run, as the triangle's render mode
-//           allows.
+//           functions and the colour, depth and texture planes one pixel per
+//           clock into tile buffers, depth-tests each pixel, and for a
+//           textured triangle works out each pixel's texel address (a
+//           pipelined divide by Q); then, textured, it looks each drawn
+//           pixel's texel up in the texture cache (fetching a missing 4x4
+//           block from SDRAM) and multiplies it by the shade; and writes the
+//           block's colours and depths back, each half block with a drawn
+//           pixel as one masked 32-word SDRAM run, as the triangle's render
+//           mode allows.
 //
 // The golden model is models/setup's reference renderer (render.rs) on what
 // scene.rs's `interpret` makes of the same transactions; the frame tests
@@ -34,6 +38,7 @@ use root::setup::VertexWrite;
 const REG_ATTR0: u8 = 0x00;
 const REG_VERTEX_NOKICK: u8 = 0x06;
 const REG_VERTEX_KICK_FAN: u8 = 0x09;
+const REG_TEX0_CFG: u8 = 0x10;
 const REG_RENDER_MODE: u8 = 0x30;
 const REG_FRAME: u8 = 0x40;
 const REG_MEM_ADDR: u8 = 0x70;
@@ -60,6 +65,7 @@ const P_PRESENT: u4 = 5;
 const P_CLEAR: u4 = 6;
 const P_READ: u4 = 7;
 const P_MEM: u4 = 8;
+const P_TEX: u4 = 9;
 
 // A MEM_DATA access, in P_MEM: waiting for the pipeline to be idle, its run
 // waiting to be accepted, then its four words moving.
@@ -81,6 +87,21 @@ const R_NEXT: u4 = 6;
 const R_DECIDE: u4 = 7;
 const R_ZREAD: u4 = 8;
 const R_CLEAR: u4 = 9;
+const R_DRAIN: u4 = 10;
+const R_TEXEL: u4 = 11;
+const R_FLUSH: u4 = 12;
+
+// DRAIN: cycles after a block's last pixel until its depth test is done,
+// and until its texel address is (the texture pipeline's depth).
+const DRAIN_PLAIN: u4 = 0;
+const DRAIN_TEXTURED: u4 = 11;
+
+// The largest reciprocal of Q, so that it fits 17 bits.
+const R_MAX: u17 = 0x1FFFF;
+
+// A texel coordinate's range: 20 bits, signed (4 fraction bits).
+const COORD_MIN: i50 = -524288;
+const COORD_MAX: i50 = 524287;
 
 // How the edge and plane registers move this cycle.
 const M_INIT: u3 = 0;
@@ -92,7 +113,7 @@ const M_NEXT_ROW: u3 = 5;
 const M_HOLD: u3 = 6;
 
 // Output buffer slots copied, in order (see copy_slot).
-const COPY_SLOTS: u5 = 25;
+const COPY_SLOTS: u6 = 34;
 
 // The depth buffer's SDRAM bank (ADR 0003), and what a clear sets it to.
 const DEPTH_BANK: u2 = 3;
@@ -129,6 +150,11 @@ pub struct ParserOut {
     pub mem_wdata: u16,
     pub mem_addr: u22,
     pub mem_rdata: u64,
+    // TEX0_CFG, which changes only with the pipeline idle; and a pulse:
+    // the texture cache must be emptied before the next triangle (memory
+    // has been written).
+    pub tex: u64,
+    pub flush: u1,
 }
 
 pub struct Parser {
@@ -166,6 +192,8 @@ pub struct Parser {
     mem_i: u2 = 0,
     #[no_reset]
     mem_rdata: u64 = 0,
+    tex: u64 = 0,
+    flush: u1 = 0,
     // The registered outputs.
     load_valid: u1 = 0,
     start_valid: u1 = 0,
@@ -215,6 +243,8 @@ impl Parser {
             },
             mem_addr: self.mem_addr,
             mem_rdata: self.mem_rdata,
+            tex: self.tex,
+            flush: self.flush,
         }
     }
 
@@ -346,6 +376,8 @@ impl Parser {
                 P_FETCH
             } else if is_mem_data & (a[7:7] == 0 | self.from_host == 1) {
                 P_MEM
+            } else if a == REG_TEX0_CFG {
+                P_TEX
             } else if a[7:7] == 1 {
                 if self.from_host == 1 { P_READ } else { P_FETCH }
             } else if is_vertex {
@@ -367,6 +399,8 @@ impl Parser {
             if clearing { P_FETCH } else { P_CLEAR }
         } else if in_mem {
             if !mem_done { P_MEM } else if mem_read { P_READ } else { P_FETCH }
+        } else if st == P_TEX {
+            if clear_ok == 1 { P_FETCH } else { P_TEX }
         } else if replied {
             P_FETCH
         } else {
@@ -438,13 +472,24 @@ impl Parser {
                 self.mem_step
             },
             mem_i: if !in_mem { 0 } else if moved { (self.mem_i + 1) as u2 wrap } else { self.mem_i },
+            // TEX0_CFG waits for the triangles before it to be drawn.
+            tex: if host_gone {
+                0
+            } else if st == P_TEX & clear_ok == 1 {
+                self.t_data
+            } else {
+                self.tex
+            },
+            // The cache's tags are whole addresses, so only new memory
+            // contents make it stale, not a new texture.
+            flush: host_gone | (mem_done & !mem_read),
             mem_rdata: if in_mem & mem_read & got_word == 1 { word @ self.mem_rdata[63:16] } else { self.mem_rdata },
             load_valid: (st == P_WRITE),
             start_valid: starting,
             clear_valid: clearing,
             frame_done: presenting,
             load: VertexWrite { slot: self.s2, field: f, value: value },
-            start: Start { roles: roles, cull: cull, untextured: !self.mode[8:8] },
+            start: Start { roles: roles, cull: cull, untextured: !self.tex[0:0] },
             clear: ClearCmd { colour: self.t_data[31:16], colour_en: self.t_data[1:1], depth_en: self.t_data[2:2] },
             rom_addr: self.rom_addr.next(next_pc),
             rom_data: self.rom_data.next(next_pc),
@@ -500,7 +545,7 @@ pub struct Raster {
     state: u4 = 0,
     pending: u1 = 0,
     // COPY: the slot being addressed.
-    copy: u5 = 0,
+    copy: u6 = 0,
     // The bounding box (Q12.4 counts), its first and last blocks, and the
     // current block.
     #[no_reset]
@@ -535,8 +580,118 @@ pub struct Raster {
     pb: PlaneState,
     #[no_reset]
     pz: PlaneState,
+    #[no_reset]
+    ps: PlaneState,
+    #[no_reset]
+    pt: PlaneState,
+    #[no_reset]
+    pq: PlaneState,
     // PIXELS: the pixel (py @ px); WRITE and CLEAR: the word being sent.
     pix: u6 = 0,
+    // The depth test, a cycle after PIXELS: the pixel, whether it is
+    // covered, its depth and its shade (8 bits a channel).
+    zt_valid: u1 = 0,
+    #[no_reset]
+    zt_pix: u6 = 0,
+    #[no_reset]
+    zt_cov: u1 = 0,
+    #[no_reset]
+    zt_z: u16 = 0,
+    #[no_reset]
+    zt_shade: u24 = 0,
+    // DRAIN: cycles left.
+    drain: u4 = 0,
+    // TEX0_CFG decoded, a cycle behind it (it only changes while this unit
+    // is idle): textured; ARGB4444; log2 of the width and height (2 to 10)
+    // and each as a mask; the width's log2 less 2 (blocks across); the
+    // wrap modes; the base address over 16.
+    tc_textured: u1 = 0,
+    tc_argb: u1 = 0,
+    tc_lw: u4 = 2,
+    tc_lh: u4 = 2,
+    tc_wmask: u10 = 3,
+    tc_hmask: u10 = 3,
+    tc_bshift: u4 = 0,
+    tc_uwrap: u2 = 0,
+    tc_vwrap: u2 = 0,
+    tc_base: u20 = 0,
+    // The texel address pipeline, twelve stages from a pixel's S', T' and
+    // Q to its texel's place in memory and the cache.
+    #[no_reset]
+    tp1: TexStage,
+    #[no_reset]
+    tp2: TexStage,
+    #[no_reset]
+    tp3: TexStage,
+    #[no_reset]
+    tp4: TexStage,
+    #[no_reset]
+    tp5: TexStage,
+    #[no_reset]
+    tp6: TexStage,
+    #[no_reset]
+    tp7: TexStage,
+    #[no_reset]
+    tp8: TexStage,
+    #[no_reset]
+    tp9: TexStage,
+    #[no_reset]
+    tp10: TexStage,
+    #[no_reset]
+    tp11: TexStage,
+    #[no_reset]
+    tp12: TexStage,
+    // TEXEL: the next pixel to look up; then five stages: the address
+    // read, the cache read, the hit test (and the shade stretched to 0 to
+    // 256), texture x shade, and the colour tile's write.
+    tx_issue: u7 = 0,
+    tx1_valid: u1 = 0,
+    #[no_reset]
+    tx1_pix: u6 = 0,
+    tx2_valid: u1 = 0,
+    #[no_reset]
+    tx2_pix: u6 = 0,
+    #[no_reset]
+    tx2_addr: u32 = 0,
+    #[no_reset]
+    tx2_drawn: u1 = 0,
+    tx3_valid: u1 = 0,
+    #[no_reset]
+    tx3_pix: u6 = 0,
+    #[no_reset]
+    tx3_addr: u32 = 0,
+    #[no_reset]
+    tx3_drawn: u1 = 0,
+    #[no_reset]
+    tx3_tag: u21 = 0,
+    #[no_reset]
+    tx3_texel: u16 = 0,
+    #[no_reset]
+    tx3_shade: u24 = 0,
+    tx4_valid: u1 = 0,
+    #[no_reset]
+    tx4_pix: u6 = 0,
+    #[no_reset]
+    tx4_texel: u24 = 0,
+    #[no_reset]
+    tx4_shade: u27 = 0,
+    tx5_valid: u1 = 0,
+    #[no_reset]
+    tx5_pix: u6 = 0,
+    #[no_reset]
+    tx5_colour: u24 = 0,
+    // TEXEL: a missing block being fetched, the words of it so far, and
+    // which line and tag it goes to.
+    filling: u1 = 0,
+    fill_got: u5 = 0,
+    #[no_reset]
+    fill_tag: u20 = 0,
+    #[no_reset]
+    fill_line: u8 = 0,
+    // The cache must be emptied before the next triangle (as after reset,
+    // when its tags are unknown); FLUSH: the line being emptied.
+    need_flush: u1 = 1,
+    flush_line: u8 = 0,
     // Which of the block's pixels are drawn (covered and nearer).
     #[no_reset]
     mask: u64 = 0,
@@ -568,6 +723,60 @@ pub struct Raster {
     #[storage(lutram)]
     #[no_reset]
     ztile: mem<u16, 64> = 0,
+    // The block's shades and texel addresses (the texel's tag, cache line
+    // and place in its block), in raster order.
+    #[storage(lutram)]
+    #[no_reset]
+    stile: mem<u24, 64> = 0,
+    #[storage(lutram)]
+    #[no_reset]
+    atile: mem<u32, 64> = 0,
+    // The texture cache: 256 lines, each a 4x4 block of texels, line
+    // (by mod 16, bx mod 16); each line's tag is valid @ the block's word
+    // address over 16.
+    #[storage(bram)]
+    #[no_reset]
+    ctag: mem<u21, 256> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    cdata: mem<u16, 4096> = 0,
+    // 1 / x seeds for the divide by Q: setup's table.
+    #[storage(bram)]
+    #[no_reset]
+    seeds: rom<u18, 1024> = include_hex!("../build/gen/setup_seed.hex"),
+}
+
+// One stage of the texel address pipeline. Not every field means something
+// at every stage.
+struct TexStage {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    // S' and T' bits 31:7 (signed), and Q's low 32 bits.
+    sp: i25 = 0,
+    tp: i25 = 0,
+    q: u32 = 0,
+    // Q's leading zeros; its mantissa (UQ1.16); the seed; x * seed; the
+    // Newton-Raphson factor; the reciprocal.
+    lz: u5 = 0,
+    x: u17 = 0,
+    r0: u17 = 0,
+    p: u34 = 0,
+    c: u17 = 0,
+    r: u17 = 0,
+    // S' and T' times the reciprocal; the texel coordinates (4 fraction
+    // bits); the texel's tag @ line @ place.
+    us: i43 = 0,
+    vt: i43 = 0,
+    // The right shifts that scale them to texels, and the shifted values.
+    ru: u6 = 0,
+    rv: u6 = 0,
+    su: i50 = 0,
+    sv: i50 = 0,
+    u: i20 = 0,
+    v: i20 = 0,
+    tu: u10 = 0,
+    tv: u10 = 0,
+    entry: u32 = 0,
 }
 
 impl Raster {
@@ -586,6 +795,7 @@ impl Raster {
         (self.state == R_ZREAD & self.zreq != 2)
             | (self.state == R_WRITE & self.run_used() & self.requested == 0)
             | (self.state == R_CLEAR & self.requested == 0)
+            | (self.state == R_TEXEL & self.filling == 1 & self.requested == 0)
     }
 
     // The outputs, from the registers. `draw`: the colour buffer's bank.
@@ -597,6 +807,8 @@ impl Raster {
         } else if self.state == R_ZREAD {
             let addr = (base + (0_u13 @ self.zreq[0:0] @ 0_u5)) as u19 wrap;
             SdramReq { write: 0, addr: DEPTH_BANK @ 0_u3 @ addr, len: 32 }
+        } else if self.state == R_TEXEL {
+            SdramReq { write: 0, addr: self.fill_tag @ 0_u4, len: 16 }
         } else {
             let bank = if self.run[1:1] == 1 { DEPTH_BANK } else { draw };
             let addr = (base + (0_u13 @ self.run[0:0] @ 0_u5)) as u19 wrap;
@@ -623,7 +835,9 @@ impl Raster {
     // `kept_flags` are its write enables and depth test (RENDER_MODE's bits
     // 4 to 2). `rdata`: the output buffer slot addressed last cycle.
     // `clear`: clear the frame being drawn. `accepted`, `wtake`,
-    // `sdram_rdata`: the SDRAM controller's, for this unit's runs.
+    // `sdram_rdata`: the SDRAM controller's, for this unit's runs. `tex`:
+    // TEX0_CFG, which only changes while this unit is idle. `flush`: empty
+    // the texture cache before the next triangle.
     pub fn next(
         self,
         kept: u1,
@@ -633,8 +847,18 @@ impl Raster {
         accepted: u1,
         wtake: u1,
         sdram_rdata: Option<u16>,
+        tex: u64,
+        flush: u1,
     ) -> Self {
         let st = self.state;
+        // TEX0_CFG's fields, from their registers; sizes clamped to 4 to
+        // 1024 texels.
+        let lw_in = log2_size(tex[11:8]);
+        let lh_in = log2_size(tex[15:12]);
+        let textured = self.tc_textured == 1;
+        let argb = self.tc_argb;
+        let lw = self.tc_lw;
+        let lh = self.tc_lh;
         let (clearing, clear_in) = match clear {
             Some(c) => (1_u1, c),
             None => (0_u1, ClearCmd { colour: 0, colour_en: 0, depth_en: 0 }),
@@ -646,7 +870,7 @@ impl Raster {
 
         // ---- COPY: each slot arrives a cycle after its address. --------
         let got = st == R_COPY & self.copy != 0;
-        let k = (self.copy - 1) as u5 wrap;
+        let k = (self.copy - 1) as u6 wrap;
         let word = rdata as i36 wrap;
         let copy_done = st == R_COPY & self.copy == COPY_SLOTS;
 
@@ -666,15 +890,75 @@ impl Raster {
         let reading = st == R_ZREAD;
         let zread_done = reading & self.zgot == 64;
 
-        // ---- PIXELS: drawn if covered and (with the depth test) nearer
-        // than the depth there. -------------------------------------------
+        // ---- PIXELS: each pixel's coverage, depth and shade, then (a cycle
+        // later, in the depth test's stage) drawn if covered and (with the
+        // depth test) nearer than the depth there. -------------------------
         let stepping = st == R_PIXELS;
-        let z = depth(self.pz.pix);
-        let nearer = z < self.ztile.value() | self.flags[0:0] == 0;
-        let drawn = inside(self.e0) & inside(self.e1) & inside(self.e2) & nearer;
-        let colour = q5(self.pr.pix) @ q6(self.pg.pix) @ q5(self.pb.pix);
+        let covered = inside(self.e0) & inside(self.e1) & inside(self.e2);
+        let shade = s8(self.pr.pix) @ s8(self.pg.pix) @ s8(self.pb.pix);
+        let nearer = self.zt_z < self.ztile.value() | self.flags[0:0] == 0;
+        let drawn = self.zt_valid == 1 & self.zt_cov == 1 & nearer;
         let row_end = self.pix[2:0] == 7;
         let block_end = self.pix == 63;
+        let draining = st == R_DRAIN;
+        let drained = draining & self.drain == 0;
+
+        // ---- The texel address pipeline (PIXELS and DRAIN): S' / Q and
+        // T' / Q by a reciprocal (setup's seed and a Newton-Raphson step),
+        // scaled to texels, wrapped, then the texel's block and line. ----
+        let q_low = (self.pq.pix as u36 wrap)[31:0];
+        let t0 = TexStage {
+            valid: stepping,
+            pix: self.pix,
+            sp: (self.ps.pix as u36 wrap)[31:7] as i25 wrap,
+            tp: (self.pt.pix as u36 wrap)[31:7] as i25 wrap,
+            q: if q_low == 0 { 1 } else { q_low },
+            ..self.tp1
+        };
+        let t1 = self.tp1;
+        let t2 = self.tp2;
+        let t3 = self.tp3;
+        let t4 = self.tp4;
+        let t5 = self.tp5;
+        let t6 = self.tp6;
+        let t7 = self.tp7;
+        let t8 = self.tp8;
+        let t9 = self.tp9;
+        let t10 = self.tp10;
+        let t11 = self.tp11;
+        let t12 = self.tp12;
+        let normal = t2.q << t2.lz;
+        let rr = t6.r0 * t6.c;
+        let u_right = (41 - (0_u2 @ t7.lz) - (0_u3 @ lw)) as u6 wrap;
+        let v_right = (41 - (0_u2 @ t7.lz) - (0_u3 @ lh)) as u6 wrap;
+        let bxt = t11.tu[9:2];
+        let byt = t11.tv[9:2];
+        let block = ((0_u8 @ byt) << self.tc_bshift) | (0_u8 @ bxt);
+        let tag = (self.tc_base + (0_u4 @ block)) as u20 wrap;
+        let entry = tag @ byt[3:0] @ bxt[3:0] @ t11.tv[1:0] @ t11.tu[1:0];
+
+        // ---- TEXEL: each pixel's texel through the cache, in order: its
+        // address read; the cache and its shade read; then a hit, or a pixel
+        // not drawn, writes its colour, and a miss fetches the block and
+        // looks that pixel up again. ---------------------------------------
+        let texeling = st == R_TEXEL;
+        let pass = texeling & self.filling == 0;
+        let a1 = self.atile.value();
+        let hit = self.tx3_tag == (1_u1 @ self.tx3_addr[31:12]);
+        let tx_ok = pass & self.tx3_valid == 1 & (hit | self.tx3_drawn == 0);
+        let tx_miss = pass & self.tx3_valid == 1 & !hit & self.tx3_drawn == 1;
+        let tx_write = texeling & self.tx5_valid == 1;
+        let texel_done = tx_write & self.tx5_pix == 63;
+        let issuing = pass & !tx_miss & self.tx_issue != 64;
+        let combined = modulate(self.tx4_texel[23:16], self.tx4_shade[26:18])
+            @ modulate(self.tx4_texel[15:8], self.tx4_shade[17:9])
+            @ modulate(self.tx4_texel[7:0], self.tx4_shade[8:0]);
+        let fill_word = texeling & self.filling == 1 & zin == 1;
+        let fill_done = fill_word & self.fill_got == 15;
+
+        // ---- FLUSH: every cache line's tag cleared. ----------------------
+        let flushing = st == R_FLUSH;
+        let flush_done = flushing & self.flush_line == 255;
 
         // ---- WRITE: colours then depths, each half block with a drawn
         // pixel one run; CLEAR: every half block's colour and depth. ------
@@ -697,11 +981,19 @@ impl Raster {
         let state: u4 = if st == R_IDLE {
             if clearing == 1 {
                 R_CLEAR
+            } else if self.pending == 1 & self.need_flush == 1 {
+                R_FLUSH
             } else if self.pending == 1 {
                 R_COPY
             } else {
                 R_IDLE
             }
+        } else if flushing {
+            if flush_done { R_IDLE } else { R_FLUSH }
+        } else if draining {
+            if !drained { R_DRAIN } else if textured { R_TEXEL } else { R_WRITE }
+        } else if texeling {
+            if texel_done { R_WRITE } else { R_TEXEL }
         } else if st == R_CLEAR {
             if clear_done { R_IDLE } else { R_CLEAR }
         } else if st == R_COPY {
@@ -722,7 +1014,7 @@ impl Raster {
         } else if reading {
             if zread_done { R_PIXELS } else { R_ZREAD }
         } else if stepping {
-            if block_end { R_WRITE } else { R_PIXELS }
+            if block_end { R_DRAIN } else { R_PIXELS }
         } else if writing {
             if run_done & self.run == 3 { R_NEXT } else { R_WRITE }
         } else if last_col & last_row {
@@ -745,20 +1037,25 @@ impl Raster {
         } else {
             M_HOLD
         };
-        // The depth tile: filled by ZREAD, read a pixel ahead in PIXELS (a
-        // memory read takes a cycle) and written with each pixel's depth,
-        // read with the colours in WRITE.
-        let zraddr: u6 = if stepping { (self.pix + 1) as u6 wrap } else if writing { read_ptr } else { 0 };
-        let zwe = (reading & zin) | stepping;
-        let zwaddr: u6 = if reading { self.zgot[5:0] } else { self.pix };
-        let zwdata: u16 = if reading { zword } else { z };
+        // The depth tile: filled by ZREAD, read in PIXELS for the depth
+        // test a cycle later (a memory read takes a cycle) and written with
+        // each pixel's depth there, read with the colours in WRITE.
+        let zraddr: u6 = if stepping { self.pix } else if writing { read_ptr } else { 0 };
+        let zwe = (reading & zin) | self.zt_valid;
+        let zwaddr: u6 = if reading { self.zgot[5:0] } else { self.zt_pix };
+        let zwdata: u16 = if reading { zword } else { self.zt_z };
+        // The colour tile: each pixel's shade from the depth test's stage,
+        // then, textured, texture x shade from TEXEL's last.
+        let cwe = self.zt_valid | tx_write;
+        let cwaddr: u6 = if texeling { self.tx5_pix } else { self.zt_pix };
+        let cwdata: u24 = if texeling { self.tx5_colour } else { self.zt_shade };
 
         Self {
                 state: state,
                 pending: if kept == 1 { 1 } else if copy_done { 0 } else { self.pending },
                 pending_flags: if kept == 1 { kept_flags } else { self.pending_flags },
                 flags: if st == R_IDLE & clearing == 0 & self.pending == 1 { self.pending_flags } else { self.flags },
-                copy: if st == R_COPY { (self.copy + 1) as u5 wrap } else { 0 },
+                copy: if st == R_COPY { (self.copy + 1) as u6 wrap } else { 0 },
                 xs: if got & k == 9 { word as i16 wrap } else { self.xs },
                 ys: if got & k == 10 { word as i16 wrap } else { self.ys },
                 xmax: if got & k == 11 { word as i16 wrap } else { self.xmax },
@@ -789,6 +1086,82 @@ impl Raster {
                 pg: copy_plane(step_plane(self.pg, mode), got, k, word, 14, 18, 19),
                 pb: copy_plane(step_plane(self.pb, mode), got, k, word, 15, 20, 21),
                 pz: copy_plane(step_plane(self.pz, mode), got, k, word, 22, 23, 24),
+                ps: copy_plane(step_plane(self.ps, mode), got, k, word, 25, 26, 27),
+                pt: copy_plane(step_plane(self.pt, mode), got, k, word, 28, 29, 30),
+                pq: copy_plane(step_plane(self.pq, mode), got, k, word, 31, 32, 33),
+                zt_valid: stepping,
+                zt_pix: self.pix,
+                zt_cov: covered,
+                zt_z: depth(self.pz.pix),
+                zt_shade: shade,
+                drain: if stepping { if textured { DRAIN_TEXTURED } else { DRAIN_PLAIN } } else { (self.drain - 1) as u4 wrap },
+                tp1: t0,
+                tp2: TexStage { lz: lz32(t1.q), ..t1 },
+                tp3: TexStage { x: normal[31:15], ..t2 },
+                tp4: TexStage { r0: self.seeds.value()[16:0], ..t3 },
+                tp5: TexStage { p: t4.x * t4.r0, ..t4 },
+                tp6: TexStage { c: ((0x400000000_u35 - (0_u1 @ t5.p)) as u35 wrap)[33:17], ..t5 },
+                tp7: TexStage { r: if rr[33:33] == 1 { R_MAX } else { rr[32:16] }, ..t6 },
+                tp8: TexStage {
+                    us: t7.sp * ((0_u1 @ t7.r) as i18 wrap),
+                    vt: t7.tp * ((0_u1 @ t7.r) as i18 wrap),
+                    ru: u_right,
+                    rv: v_right,
+                    ..t7
+                },
+                tp9: TexStage { su: widen7(t8.us) >> t8.ru, sv: widen7(t8.vt) >> t8.rv, ..t8 },
+                tp10: TexStage { u: saturate20(t9.su), v: saturate20(t9.sv), ..t9 },
+                tp11: TexStage {
+                    tu: wrap_texel(t10.u, lw, self.tc_wmask, self.tc_uwrap),
+                    tv: wrap_texel(t10.v, lh, self.tc_hmask, self.tc_vwrap),
+                    ..t10
+                },
+                tp12: TexStage { entry: entry, ..t11 },
+                tc_textured: tex[0:0],
+                tc_argb: (tex[7:4] == 1),
+                tc_lw: lw_in,
+                tc_lh: lh_in,
+                tc_wmask: size_mask(lw_in),
+                tc_hmask: size_mask(lh_in),
+                tc_bshift: (lw_in - 2) as u4 wrap,
+                tc_uwrap: tex[17:16],
+                tc_vwrap: tex[19:18],
+                tc_base: tex[47:32] @ 0_u4,
+                tx_issue: if !texeling {
+                    0
+                } else if tx_miss {
+                    0_u1 @ self.tx3_pix
+                } else if issuing {
+                    (self.tx_issue + 1) as u7 wrap
+                } else {
+                    self.tx_issue
+                },
+                tx1_valid: issuing,
+                tx1_pix: self.tx_issue[5:0],
+                tx2_valid: pass & !tx_miss & self.tx1_valid == 1,
+                tx2_pix: self.tx1_pix,
+                tx2_addr: a1,
+                tx2_drawn: (self.mask >> self.tx1_pix)[0:0],
+                tx3_valid: pass & !tx_miss & self.tx2_valid == 1,
+                tx3_pix: self.tx2_pix,
+                tx3_addr: self.tx2_addr,
+                tx3_drawn: self.tx2_drawn,
+                tx3_tag: self.ctag.value(),
+                tx3_texel: self.cdata.value(),
+                tx3_shade: self.stile.value(),
+                tx4_valid: tx_ok,
+                tx4_pix: self.tx3_pix,
+                tx4_texel: decode(self.tx3_texel, argb),
+                tx4_shade: stretch(self.tx3_shade[23:16]) @ stretch(self.tx3_shade[15:8]) @ stretch(self.tx3_shade[7:0]),
+                tx5_valid: texeling & self.tx4_valid == 1,
+                tx5_pix: self.tx4_pix,
+                tx5_colour: combined,
+                filling: if tx_miss { 1 } else if fill_done { 0 } else { self.filling },
+                fill_got: if fill_done | !texeling { 0 } else if fill_word { (self.fill_got + 1) as u5 wrap } else { self.fill_got },
+                fill_tag: if tx_miss { self.tx3_addr[31:12] } else { self.fill_tag },
+                fill_line: if tx_miss { self.tx3_addr[11:4] } else { self.fill_line },
+                need_flush: flush | (self.need_flush & !flushing),
+                flush_line: if flushing { (self.flush_line + 1) as u8 wrap } else { 0 },
                 pix: if stepping {
                     (self.pix + 1) as u6 wrap
                 } else if run_done {
@@ -802,15 +1175,15 @@ impl Raster {
                 rejected: reject,
                 mask: if st == R_TEST {
                     0
-                } else if stepping {
-                    self.mask | ((0_u63 @ drawn) << self.pix)
+                } else if drawn {
+                    self.mask | ((0_u63 @ drawn) << self.zt_pix)
                 } else {
                     self.mask
                 },
                 zreq: if reading { (self.zreq + (want & accepted)) as u2 wrap } else { 0 },
                 zgot: if reading { (self.zgot + zin) as u7 wrap } else { 0 },
                 run: if run_done { next_run } else if writing { self.run } else { 0 },
-                requested: if (writing & !run_done) | (st == R_CLEAR & !clear_run_done) {
+                requested: if (writing & !run_done) | (st == R_CLEAR & !clear_run_done) | (texeling & self.filling == 1 & !fill_done) {
                     self.requested | (want & accepted)
                 } else {
                     0
@@ -835,8 +1208,18 @@ impl Raster {
                 } else {
                     self.clear_z
                 },
-                tile: self.tile.next(read_ptr, stepping, self.pix, colour),
+                tile: self.tile.next(read_ptr, cwe, cwaddr, cwdata[23:19] @ cwdata[15:10] @ cwdata[7:3]),
                 ztile: self.ztile.next(zraddr, zwe, zwaddr, zwdata),
+                stile: self.stile.next(self.tx1_pix, self.zt_valid, self.zt_pix, self.zt_shade),
+                atile: self.atile.next(self.tx_issue[5:0], t12.valid, t12.pix, t12.entry),
+                ctag: self.ctag.next(
+                    a1[11:4],
+                    fill_done | flushing,
+                    if flushing { self.flush_line } else { self.fill_line },
+                    if flushing { 0 } else { 1_u1 @ self.fill_tag },
+                ),
+                cdata: self.cdata.next(a1[11:0], fill_word, self.fill_line @ self.fill_got[3:0], zword),
+                seeds: self.seeds.next(normal[30:21]),
         }
     }
 }
@@ -844,20 +1227,40 @@ impl Raster {
 // The output buffer slot copied in COPY cycle c: E01, E12, E20 (0x00-0x02);
 // A01, B01, A12, B12, A20, B20 (0x20-0x25); xs, ys, xmax, ymax (0x26-0x29);
 // the R, G, B starts (0x2A-0x2C); R, G, B d/dx and d/dy (0x03-0x08); the Z
-// start (0x2E), d/dx and d/dy (0x0B, 0x0C).
-fn copy_slot(c: u5) -> u6 {
+// start (0x2E), d/dx and d/dy (0x0B, 0x0C); then S', T' and Q, each its
+// start (0x2F-0x31), d/dx and d/dy (0x0D-0x12). (The untextured program
+// leaves those last nine slots as they were; they go unused.)
+fn copy_slot(c: u6) -> u6 {
     if c < 3 {
-        0_u1 @ c
+        c
     } else if c < 16 {
-        (0x1D + (0_u1 @ c)) as u6 wrap
+        (0x1D + c) as u6 wrap
     } else if c < 22 {
-        ((0_u1 @ c) - 13) as u6 wrap
+        (c - 13) as u6 wrap
     } else if c == 22 {
         0x2E
     } else if c == 23 {
         0x0B
     } else if c == 24 {
         0x0C
+    } else if c == 25 {
+        0x2F
+    } else if c == 26 {
+        0x0D
+    } else if c == 27 {
+        0x0E
+    } else if c == 28 {
+        0x30
+    } else if c == 29 {
+        0x0F
+    } else if c == 30 {
+        0x10
+    } else if c == 31 {
+        0x31
+    } else if c == 32 {
+        0x11
+    } else if c == 33 {
+        0x12
     } else {
         0
     }
@@ -865,7 +1268,7 @@ fn copy_slot(c: u5) -> u6 {
 
 // An edge's registers after a COPY cycle: its value is slot `ei`, A slot
 // `ai`, B slot `bi`.
-fn copy_edge(e: EdgeState, got: u1, k: u5, word: i36, ei: u5, ai: u5, bi: u5) -> EdgeState {
+fn copy_edge(e: EdgeState, got: u1, k: u6, word: i36, ei: u6, ai: u6, bi: u6) -> EdgeState {
     EdgeState {
         a: if got & k == ai { word as i17 wrap } else { e.a },
         b: if got & k == bi { word as i17 wrap } else { e.b },
@@ -876,7 +1279,7 @@ fn copy_edge(e: EdgeState, got: u1, k: u5, word: i36, ei: u5, ai: u5, bi: u5) ->
 
 // A plane's registers after a COPY cycle: its start is slot `si`, d/dx
 // `xi`, d/dy `yi`.
-fn copy_plane(p: PlaneState, got: u1, k: u5, word: i36, si: u5, xi: u5, yi: u5) -> PlaneState {
+fn copy_plane(p: PlaneState, got: u1, k: u6, word: i36, si: u6, xi: u6, yi: u6) -> PlaneState {
     PlaneState {
         dx: if got & k == xi { word } else { p.dx },
         dy: if got & k == yi { word } else { p.dy },
@@ -974,16 +1377,16 @@ fn inside(e: EdgeState) -> u1 {
     e.pix > 0 | (e.pix == 0 & e.tie == 1)
 }
 
-// An 8-bit channel's iterator count as 5 bits: over 2^19, rounded half
-// up, clamped.
-fn q5(v: i36) -> u5 {
-    let q = (v + 262144) >> 19;
+// An 8-bit channel's iterator count as 8 bits: over 2^16, rounded half
+// up, clamped (models/setup/src/texture.rs `shade8`).
+fn s8(v: i36) -> u8 {
+    let q = (v + 32768) >> 16;
     if q < 0 {
         0
-    } else if q > 31 {
-        31
+    } else if q > 255 {
+        255
     } else {
-        (q as u18 wrap)[4:0]
+        (q as u21 wrap)[7:0]
     }
 }
 
@@ -1005,22 +1408,125 @@ fn depth(v: i36) -> u16 {
     }
 }
 
-// As 6 bits: over 2^18, rounded half up, clamped.
-fn q6(v: i36) -> u6 {
-    let q = (v + 131072) >> 18;
-    if q < 0 {
-        0
-    } else if q > 63 {
-        63
-    } else {
-        (q as u19 wrap)[5:0]
-    }
-}
-
 // A block's first word in the tiled framebuffer: (by * 80 + bx) * 64.
 fn block_base(bx: i10, by: i10) -> u19 {
     let x = (bx as u10 wrap)[6:0];
     let y = (by as u10 wrap)[5:0];
     let index = ((0_u1 @ y @ 0_u6) + (0_u3 @ y @ 0_u4) + (0_u6 @ x)) as u13 wrap;
     index @ 0_u6
+}
+
+// TEX0_CFG's WIDTH_LOG2 or HEIGHT_LOG2 as used: 2 to 10.
+fn log2_size(f: u4) -> u4 {
+    if f < 2 {
+        2
+    } else if f > 10 {
+        10
+    } else {
+        f
+    }
+}
+
+// The leading zeros of a nonzero 32-bit value.
+fn lz32(q: u32) -> u5 {
+    if q[31:16] == 0 {
+        if q[15:8] == 0 {
+            (24 + (0_u2 @ lz8(q[7:0]))) as u5 wrap
+        } else {
+            (16 + (0_u2 @ lz8(q[15:8]))) as u5 wrap
+        }
+    } else if q[31:24] == 0 {
+        (8 + (0_u2 @ lz8(q[23:16]))) as u5 wrap
+    } else {
+        0_u2 @ lz8(q[31:24])
+    }
+}
+
+// The leading zeros of a byte (7 for 0 or 1).
+fn lz8(b: u8) -> u3 {
+    if b[7:7] == 1 {
+        0
+    } else if b[6:6] == 1 {
+        1
+    } else if b[5:5] == 1 {
+        2
+    } else if b[4:4] == 1 {
+        3
+    } else if b[3:3] == 1 {
+        4
+    } else if b[2:2] == 1 {
+        5
+    } else if b[1:1] == 1 {
+        6
+    } else {
+        7
+    }
+}
+
+// A texture coordinate in texels (4 fraction bits) from S' (or T') times
+// the reciprocal: shifted left by 7 (here), then right by 0 to 39,
+// rounding down, then saturated to 20 bits (texture.rs `coordinate`).
+fn widen7(us: i43) -> i50 {
+    ((us as u43 wrap) @ 0_u7) as i50 wrap
+}
+
+// A shifted texture coordinate, saturated to 20 bits.
+fn saturate20(shifted: i50) -> i20 {
+    if shifted < COORD_MIN {
+        COORD_MIN as i20 wrap
+    } else if shifted > COORD_MAX {
+        COORD_MAX as i20 wrap
+    } else {
+        shifted as i20 wrap
+    }
+}
+
+// 2^log2 - 1: a size's mask.
+fn size_mask(log2: u4) -> u10 {
+    (((1_u11 << log2) as u11 wrap) - 1) as u10 wrap
+}
+
+// A texel coordinate's texel along it, by its wrap mode: 0 repeat,
+// 1 clamp to the edge, 2 mirror, 3 (reserved) repeat; the texture is
+// 2^log2 texels along it, `size_mask` being 2^log2 - 1 (texture.rs
+// `wrap`).
+fn wrap_texel(u: i20, log2: u4, size_mask: u10, mode: u2) -> u10 {
+    let ui = u >> 4;
+    let low = (ui as u16 wrap)[9:0];
+    let flipped = (((ui as u16 wrap) >> log2)[0:0]) == 1;
+    if mode == 1 {
+        if ui < 0 {
+            0
+        } else if ui > (0_u6 @ size_mask) as i16 wrap {
+            size_mask
+        } else {
+            low
+        }
+    } else if mode == 2 & flipped {
+        (low & size_mask) ^ size_mask
+    } else {
+        low & size_mask
+    }
+}
+
+// A texel as 8 bits a channel, R @ G @ B: RGB565 with each field's bits
+// repeated, or ARGB4444's colour with each nibble repeated (texture.rs
+// `decode`).
+fn decode(t: u16, argb: u1) -> u24 {
+    if argb == 1 {
+        t[11:8] @ t[11:8] @ t[7:4] @ t[7:4] @ t[3:0] @ t[3:0]
+    } else {
+        t[15:11] @ t[15:13] @ t[10:5] @ t[10:9] @ t[4:0] @ t[4:2]
+    }
+}
+
+// A channel stretched from 0 to 255 to 0 to 256, so that 255 is 1.
+fn stretch(c: u8) -> u9 {
+    ((0_u1 @ c) + (0_u8 @ c[7:7])) as u9 wrap
+}
+
+// a x c, c already stretched, rounded (texture.rs `modulate`).
+fn modulate(a: u8, c9: u9) -> u8 {
+    let product = a * c9;
+    ((product + 128) as u17 wrap)[15:8]
 }

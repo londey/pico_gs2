@@ -157,6 +157,16 @@ fn memory_reads_back() -> Result<(), Box<dyn Error>> {
             Stage::Written if bench.host.replies.len() == first_replies => {
                 let status = Status::from_bits(bench.host.replies[first_replies - 1]);
                 drawn = u32::from(status.drawn);
+                // Every field where it should be: the banks the core is
+                // using, no link errors, the FIFO empty behind the read.
+                let bank = |name: &str| bench.sim.register(name).and_then(|b| u8::try_from(b).ok());
+                assert_eq!(Some(status.drawn), bank("draw"), "STATUS drawn");
+                assert_eq!(Some(status.shown), bank("disp"), "STATUS shown");
+                assert!(
+                    !status.link_malformed && !status.link_overflow,
+                    "{status:?}"
+                );
+                assert_eq!(status.fifo_free, 512, "{status:?}");
                 println!("cycle {}: {status:?}", bench.cycle);
                 for &(bx, by) in &BLOCKS {
                     let word = pixel_word(bx * 8, by * 8);

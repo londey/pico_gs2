@@ -76,6 +76,7 @@ const LAST_SLOT: u8 = 191;
 const FRAME_SLOTS: u13 = 7200;
 
 // Register addresses a host can read (docs/design/host-interface.md §3).
+const REG_TEX0_CFG: u7 = 0x10;
 const REG_RENDER_MODE: u7 = 0x30;
 const REG_MEM_ADDR: u7 = 0x70;
 const REG_MEM_DATA: u7 = 0x71;
@@ -247,10 +248,14 @@ impl Gpu {
             Some(a) => Some(if a == REG_ID {
                 ID_VALUE
             } else if a == REG_STATUS {
-                0_u8 @ self.draw @ self.disp @ self.debug_link_errors[0:0] @ self.debug_link_errors[1:1]
+                // Drawn 55:54, a malformed byte 53, an overflow 52, shown
+                // 51:50 (debug_link_errors is overflow @ framing).
+                0_u8 @ self.draw @ self.debug_link_errors[0:0] @ self.debug_link_errors[1:1] @ self.disp
                     @ self.link_free @ self.debug_render_cycles @ self.debug_frames
             } else if a == REG_RENDER_MODE {
                 0_u55 @ pout.mode
+            } else if a == REG_TEX0_CFG {
+                pout.tex
             } else if a == REG_MEM_ADDR {
                 0_u42 @ pout.mem_addr
             } else if a == REG_MEM_DATA {
@@ -418,6 +423,8 @@ impl Gpu {
                     accepted_raster,
                     wtake_raster,
                     rdata_raster,
+                    pout.tex,
+                    pout.flush,
                 ),
                 tri_flags: if starting == 1 { pout.mode[4:2] } else { self.tri_flags },
                 link_free: lout.free,

@@ -12,7 +12,9 @@
 //! `FRAME` with both clears, an end of frame a `FRAME` with `PRESENT`, and
 //! an end of frame followed by a clear is one `FRAME` with all three.
 
-use gs_proto::{reg, Attr0, Cull, Frame as FrameReg, Kick, Position, RenderMode, Transaction};
+use gs_proto::{
+    reg, Attr0, Cull, Frame as FrameReg, Kick, Position, RenderMode, Tex0Cfg, Transaction,
+};
 
 use crate::formats::Coord;
 use crate::triangle::{CullMode, Triangle, Vertex};
@@ -107,7 +109,6 @@ impl Primitive {
     /// The render mode its triangles are drawn with.
     fn mode(&self) -> RenderMode {
         RenderMode {
-            textured: !self.untextured,
             cull: match self.cull {
                 CullMode::None => Cull::None,
                 CullMode::Back => Cull::Anticlockwise,
@@ -234,17 +235,22 @@ pub fn rom(cmds: &[Command]) -> Vec<(u8, u64)> {
 /// What the command parser makes of a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A triangle, its vertices in role order, drawn with a render mode.
-    Draw(Triangle, RenderMode),
+    /// A triangle, its vertices in role order, drawn with a render mode and
+    /// a texture.
+    Draw(Triangle, RenderMode, Tex0Cfg),
 
     /// A `FRAME` write.
     Frame(FrameReg),
+
+    /// A `MEM_DATA` write: 64 bits at a dword address.
+    Mem(u32, u64),
 }
 
-/// Interprets transactions as the GPU's command parser does: `ATTR0` and
-/// `RENDER_MODE` are latched; a vertex takes the latched `ATTR0`; a
-/// `VERTEX_NOKICK` after a kick starts a primitive; a kick draws once its
-/// primitive has three vertices. Reads and other registers do nothing.
+/// Interprets transactions as the GPU's command parser does: `ATTR0`,
+/// `RENDER_MODE` and `TEX0_CFG` are latched; a vertex takes the latched
+/// `ATTR0`; a `VERTEX_NOKICK` after a kick starts a primitive; a kick draws
+/// once its primitive has three vertices; `MEM_DATA` writes at `MEM_ADDR`
+/// and moves it on. Reads and other registers do nothing.
 ///
 /// # Arguments
 ///
@@ -257,6 +263,8 @@ pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
     let mut events = Vec::new();
     let mut attr = Attr0::default();
     let mut mode = RenderMode::default();
+    let mut tex = Tex0Cfg::default();
+    let mut mem_addr: u32 = 0;
     // The last vertex was a kick (as after reset), the primitive's vertices
     // so far (saturating at 3), its first, and the two before this one.
     let mut kicked = true;
@@ -296,7 +304,7 @@ pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
                     Kick::Fan => Some([first, back1, v]),
                 };
                 if let Some(tri) = tri {
-                    events.push(Event::Draw(tri, mode));
+                    events.push(Event::Draw(tri, mode, tex));
                 }
             }
             kicked = kick != Kick::None;
@@ -307,6 +315,12 @@ pub fn interpret(txns: &[Transaction]) -> Vec<Event> {
                 reg::ATTR0 => attr = Attr0::from_bits(data),
                 reg::RENDER_MODE => mode = RenderMode::from_bits(data),
                 reg::FRAME => events.push(Event::Frame(FrameReg::from_bits(data))),
+                reg::TEX0_CFG => tex = Tex0Cfg::from_bits(data),
+                reg::MEM_ADDR => mem_addr = u32::try_from(data & 0x3F_FFFF).unwrap_or(0),
+                reg::MEM_DATA => {
+                    events.push(Event::Mem(mem_addr, data));
+                    mem_addr = (mem_addr + 1) & 0x3F_FFFF;
+                }
                 _ => {}
             }
         }
@@ -542,11 +556,13 @@ type Face = ([[f32; 3]; 4], [[u8; 3]; 4]);
 /// # Arguments
 ///
 /// * `angle` - The turn, in radians.
+/// * `textured` - Give each face the whole texture, perspective-correct:
+///   S and T from 0 to 1 across it, Q = 4 / z.
 ///
 /// # Returns
 ///
 /// The faces, back faces culled.
-fn cube(angle: f32) -> Vec<Primitive> {
+fn cube(angle: f32, textured: bool) -> Vec<Primitive> {
     const TILT: f32 = -0.45;
     const SIDE: [[u8; 3]; 4] = [[255, 40, 40], [255, 230, 40], [40, 200, 80], [40, 80, 255]];
     const TOP: [u8; 3] = [230, 230, 240];
@@ -618,9 +634,28 @@ fn cube(angle: f32) -> Vec<Primitive> {
             // Facing the camera (at the origin): the normal points back at it.
             let facing = dot(normal, centre) < 0.0;
             let order = [0, 1, 3, 2];
+            // Texture coordinates of the corners, round the face.
+            const ST: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
             let strip: Vec<Vertex> = order
                 .iter()
-                .map(|&k| projected(world[k], colours[k]))
+                .map(|&k| {
+                    let v = projected(world[k], colours[k]);
+                    if textured {
+                        let q = 4.0 / world[k][2];
+                        let (s, t) = ST[k];
+                        // In range by construction: Q under 2, S′ and T′ under 2.
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let fixed = |f: f32, one: f32| (f * one).round() as i32;
+                        Vertex {
+                            q: u16::try_from(fixed(q, 32768.0)).unwrap_or(u16::MAX),
+                            s: i16::try_from(fixed(s * q, 4096.0)).unwrap_or(0),
+                            t: i16::try_from(fixed(t * q, 4096.0)).unwrap_or(0),
+                            ..v
+                        }
+                    } else {
+                        v
+                    }
+                })
                 .collect();
             let area = twice_area(&strip[0], &strip[1], &strip[2]);
             let strip = if (area > 0.0) == facing {
@@ -703,10 +738,68 @@ pub fn cube_frame(k: usize) -> Vec<Command> {
 /// The frame's commands.
 pub fn cube_at(angle: f32, background: u16) -> Vec<Command> {
     let mut cmds = vec![Command::Clear(background)];
-    cmds.extend(draws(cube(angle)));
+    cmds.extend(draws(cube(angle, false)));
     cmds.extend(draws(crossing()));
     cmds.push(Command::EndFrame);
     cmds
+}
+
+/// log₂ of the textured cube's texture's size: 64 × 64 texels.
+pub const CUBE_TEXTURE_LOG2: u8 = 6;
+
+/// The textured cube's texture, RGB565 in raster order: light tiles with
+/// dark mortar, and a diagonal stripe, so its perspective shows.
+///
+/// # Returns
+///
+/// `64 * 64` texels.
+pub fn cube_texture() -> Vec<u16> {
+    let size = 1_usize << CUBE_TEXTURE_LOG2;
+    let rgb = |r: usize, g: usize, b: usize| {
+        let c = |v: usize, bits: u32| u16::try_from(v.min(255) >> (8 - bits)).unwrap_or(0);
+        c(r, 5) << 11 | c(g, 6) << 5 | c(b, 5)
+    };
+    (0..size * size)
+        .map(|i| {
+            let (u, v) = (i % size, i / size);
+            let row = v / 16;
+            let shifted = if row.is_multiple_of(2) { u } else { u + 8 };
+            if v % 16 == 0 || shifted % 16 == 0 {
+                rgb(40, 40, 48)
+            } else if (u + v) % 32 < 4 {
+                rgb(255, 255, 255)
+            } else {
+                rgb(
+                    200 + (u * 3 + v * 5) % 56,
+                    200 + (u * 7) % 56,
+                    200 + (v * 3) % 56,
+                )
+            }
+        })
+        .collect()
+}
+
+/// A frame of the cube textured, as transactions: a clear, `TEX0_CFG` with
+/// the texture, the cube (each face's texture multiplied by its colours),
+/// texturing off, the two crossing triangles, and a present.
+///
+/// # Arguments
+///
+/// * `angle` - The turn, in radians.
+/// * `background` - The clear colour, RGB565.
+/// * `tex` - The texture's `TEX0_CFG` (enabled; [`cube_texture`] uploaded).
+///
+/// # Returns
+///
+/// The frame's transactions.
+pub fn textured_cube_at(angle: f32, background: u16, tex: Tex0Cfg) -> Vec<Transaction> {
+    let mut out = transactions(&[Command::Clear(background)]);
+    out.push(Transaction::write(reg::TEX0_CFG, tex.bits()));
+    out.extend(transactions(&draws(cube(angle, true))));
+    out.push(Transaction::write(reg::TEX0_CFG, Tex0Cfg::default().bits()));
+    out.extend(transactions(&draws(crossing())));
+    out.extend(transactions(&[Command::EndFrame]));
+    out
 }
 
 /// The spinning cube (ADR 0002): [`CUBE_FRAMES`] frames of a quarter turn,

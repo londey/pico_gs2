@@ -3,9 +3,10 @@
 //!
 //! It opens the serial port at 3 Mbaud, which asserts DTR# and so connects
 //! the link (the GPU hands over from its built-in scene at its next frame),
-//! reads `ID` and `STATUS`, streams a cube turned live over a dark blue
-//! background for a while, then reads `STATUS` again and reports the
-//! frames shown, the time a frame takes to draw and the link's throughput.
+//! reads `ID` and `STATUS`, uploads a texture and streams a textured cube
+//! turned live over a dark blue background for a while, then reads `STATUS`
+//! again and reports the frames shown, the time a frame takes to draw and
+//! the link's throughput. `--untextured` streams the plain cube instead.
 //! Closing the port releases DTR#, and the GPU goes back to its built-in
 //! scene.
 //!
@@ -30,12 +31,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use gs_proto::{
-    colour_buffer, mem_read, pixel_word, reg, unpack_words, Credits, Reply, ReplyDecoder, Status,
-    Transaction, BAUD, FB_HEIGHT, FB_WIDTH, ID_VALUE,
+    colour_buffer, host_memory, mem_read, mem_write, pixel_word, reg, texel_word, unpack_words,
+    Credits, Reply, ReplyDecoder, Status, Tex0Cfg, Transaction, BAUD, FB_HEIGHT, FB_WIDTH,
+    ID_VALUE,
 };
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
 use setup_model::render::{render, Frame};
-use setup_model::scene::{cube_at, cube_scene, transactions};
+use setup_model::scene::{
+    cube_at, cube_scene, cube_texture, textured_cube_at, transactions, CUBE_TEXTURE_LOG2,
+};
 
 /// The background the host draws on, RGB565: dark blue, unlike the built-in
 /// scene's grey, so it is plain which is showing.
@@ -61,6 +65,9 @@ struct Args {
 
     /// Save the frame on screen here, and stream nothing.
     screenshot: Option<String>,
+
+    /// Stream the cube without its texture.
+    untextured: bool,
 }
 
 /// Parses the command line.
@@ -78,6 +85,7 @@ fn parse_args() -> Result<Args> {
         seconds: 10.0,
         status_only: false,
         screenshot: None,
+        untextured: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -91,12 +99,13 @@ fn parse_args() -> Result<Args> {
                     .context("--seconds needs a number")?;
             }
             "--status" => args.status_only = true,
+            "--untextured" => args.untextured = true,
             "--screenshot" => {
                 args.screenshot = Some(it.next().context("--screenshot needs a file")?);
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png]"
+                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png] [--untextured]"
                 );
                 std::process::exit(0);
             }
@@ -343,6 +352,45 @@ fn save_png(path: &str, frame: &[u16]) -> Result<()> {
     Ok(())
 }
 
+/// Uploads the textured cube's texture to the host's memory in bank 0.
+///
+/// # Arguments
+///
+/// * `link` - The link, connected.
+///
+/// # Returns
+///
+/// Its `TEX0_CFG`, enabled.
+///
+/// # Errors
+///
+/// The link fails.
+fn upload_cube_texture(link: &mut Link) -> Result<Tex0Cfg> {
+    let texels = cube_texture();
+    let size = 1 << CUBE_TEXTURE_LOG2;
+    let mut tiled = vec![0; texels.len()];
+    for (i, &t) in texels.iter().enumerate() {
+        tiled[texel_word(i % size, i / size, CUBE_TEXTURE_LOG2)] = t;
+    }
+    let dword = host_memory(0);
+    let start = Instant::now();
+    let txns: Vec<Transaction> = mem_write(dword, &tiled).collect();
+    link.send(&txns)?;
+    // A read fences the upload.
+    link.read(reg::ID)?;
+    println!(
+        "uploaded a {size} x {size} texture in {:.2} s",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(Tex0Cfg {
+        enable: true,
+        width_log2: CUBE_TEXTURE_LOG2,
+        height_log2: CUBE_TEXTURE_LOG2,
+        base: u16::try_from(dword / 64)?,
+        ..Tex0Cfg::default()
+    })
+}
+
 /// Saves the frame on screen and compares it with the built-in scene's.
 ///
 /// # Arguments
@@ -469,14 +517,27 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("streaming a live cube for {} s ...", args.seconds);
+    let tex = if args.untextured {
+        None
+    } else {
+        Some(upload_cube_texture(&mut link)?)
+    };
+    println!(
+        "streaming a live {}cube for {} s ...",
+        if tex.is_some() { "textured " } else { "" },
+        args.seconds
+    );
     let start = Instant::now();
     let (sent0, bytes0) = (link.sent, link.bytes);
     let mut frames: u32 = 0;
     while start.elapsed().as_secs_f64() < args.seconds {
         let angle = std::f32::consts::TAU * f32::from(u16::try_from(frames % FRAMES_PER_TURN)?)
             / f32::from(u16::try_from(FRAMES_PER_TURN)?);
-        link.send(&transactions(&cube_at(angle, BACKGROUND)))?;
+        let txns = match tex {
+            Some(cfg) => textured_cube_at(angle, BACKGROUND, cfg),
+            None => transactions(&cube_at(angle, BACKGROUND)),
+        };
+        link.send(&txns)?;
         frames += 1;
     }
     // Everything sent has been taken once a read comes back.

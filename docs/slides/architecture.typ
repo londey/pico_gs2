@@ -91,9 +91,11 @@
 - *Today:* 1280×720 DVI from a tiled, triple-buffered 640×360 framebuffer
   in SDRAM: a spinning Gouraud-shaded cube, depth-tested against a 16-bit Z
   buffer, drawn by the setup engine and rasteriser at 66 frames per second,
-  shown at 60. A PC drives it with register writes over USB serial; with no
-  PC it plays a built-in scene. Pixel-exact against a reference renderer in
-  simulation, and on the board. Textures and the colour combiner are next.
+  shown at 60. Perspective-correct textures through an on-chip cache. A PC
+  drives it with register writes over USB serial, uploads textures and reads
+  frames back; with no PC it plays a built-in scene. Pixel-exact against a
+  reference renderer in simulation, and on the board. The colour combiner
+  and alpha test are next.
 
 #v(0.5em)
 #key
@@ -447,6 +449,32 @@ serialisers and (later) the SPI link have clocks of their own.
   ],
 )
 
+== Texturing
+
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1em,
+  stack(
+    spacing: 6pt,
+    image("images/texture-floor.png", height: 37%),
+    image("images/texture-cube.png", height: 37%),
+  ),
+  [
+    #set text(size: 14pt)
+    - *Per pixel:* S′, T′ and Q stepped with colour and depth; a 12-stage
+      pipeline: 1/Q (seed + Newton–Raphson), S′ and T′ × it, shift to
+      texels, wrap (repeat, clamp, mirror), the texel's block address.
+    - *Cache:* 256 lines of one 4×4 block, direct-mapped by block row and
+      column (any 64×64 window fits), tagged by address; a miss is one
+      16-word run. Emptied only after `MEM_DATA` writes.
+    - *Texel pass* per block: look up each drawn pixel, texture × shade into
+      the colour tile. RGB565 and ARGB4444.
+    - *Divide error:* within 1/8 texel down to Q = 1/256.
+    - *Cube:* 98.4% hits, every block fetched once.
+    - Left: the twin's frames, each pixel-exact against the reference.
+  ],
+)
+
 == In simulation
 
 #align(center, image("images/cube-sim.png", height: 80%))
@@ -596,15 +624,15 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [10404], [3841], [24288],
-      [flip-flops], [3948], [974], [24288],
-      [block RAM (DP16KD)], [21], [5], [56],
-      [multipliers], [2], [2], [28],
+      [logic cells], [13852], [3841], [24288],
+      [flip-flops], [6192], [974], [24288],
+      [block RAM (DP16KD)], [27], [5], [56],
+      [multipliers], [11], [2], [28],
       [PLL], [1], [—], [2],
       [I/O], [52], [—], [197],
     )
-    _GPU_: today's bitstream, setup engine, rasteriser and host link
-    included; the scene ROM takes 11 block RAMs, the link's FIFO 2.
+    _GPU_: today's bitstream, everything included; the scene ROM takes 11
+    block RAMs, the texture cache 5, the link's FIFO 2.
     _Setup_: the engine placed and routed alone.
   ],
   [
@@ -612,8 +640,8 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [76–78 MHz], [75],
-      [`clk_sclk`], [328 MHz], [187.5],
+      [`clk_core`], [85.5 MHz], [75],
+      [`clk_sclk`], [291 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
     The brief's whole-design budget (estimate): about 11,000 LUTs (45%), 19
@@ -637,15 +665,17 @@ serialisers and (later) the SPI link have clocks of their own.
   [11], [command parser, traversal, tile buffer: first triangles on screen], done,
   [12], [Z buffer, clears, triple buffering, spinning cube], done,
   [13], [register interface; USB serial host link; `gs-host`], done,
-  [14], [v1.0 interface document: textures, combiner, memory, SPI design], next,
-  [15], [memory access: uploads, reading frames back], later,
-  [16], [textures: cache, perspective-correct sampling], later,
-  [17], [colour combiner and alpha test], later,
+  [14], [v1.0 interface document: textures, combiner, memory, SPI design], done,
+  [15], [memory access: uploads, reading frames back], done,
+  [16], [textures: cache, perspective-correct sampling], done,
+  [17], [colour combiner and alpha test], next,
   [18–19], [bilinear filtering if it fits; v1.0 frozen for games], later,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
 == Open issues
+
+#set text(size: 15pt)
 
 - *Setup speed:* 99 cycles against the brief's 85. A 5-cycle multiplier
   misses 75 MHz; next options are overlapping triangles or a second
@@ -660,9 +690,10 @@ serialisers and (later) the SPI link have clocks of their own.
   fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
 - *Frame rate:* 66 fps for the cube, but the full clear is about half of
   it; a fast clear (per-block flags) is the first fix if scenes get busier.
-- *Core timing margin:* 76–78 MHz against 75, varying with placement. The critical
-  path is the depth test: Z iterator → round and clamp → compare → pixel
-  mask; registering the depth a cycle earlier would buy it back.
+- *Core timing margin:* 85.5 MHz against 75, but placement moves it by
+  several MHz from build to build (one Phase 16 build placed at 74).
+- *`just check` time:* 18 minutes, set by `sinter sim --cosim` replaying
+  12M-cycle stimulus at about 13,000 cycles a second in 7 GB (R11).
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
   `#[no_reset]` accepted on non-registers; power-of-two memory depths.
 - *Off spec but working:* 750 Mb/s DVI pins; a 75 MHz (not 74.25 MHz) pixel

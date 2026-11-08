@@ -36,7 +36,10 @@ pub mod reg {
     /// A vertex; draws (the primitive's first, one back, this one).
     pub const VERTEX_KICK_FAN: u8 = 0x09;
 
-    /// Cull mode, depth and colour write enables, and the setup program.
+    /// The texture: enable, format, size, filter, wrap modes, address.
+    pub const TEX0_CFG: u8 = 0x10;
+
+    /// Cull mode, depth test, depth and colour write enables.
     pub const RENDER_MODE: u8 = 0x30;
 
     /// Present the frame, and clear.
@@ -110,6 +113,22 @@ pub const fn colour_buffer(buffer: u32) -> u32 {
 /// Its word offset from the buffer's start.
 pub const fn pixel_word(x: usize, y: usize) -> usize {
     (y >> 3) * 5120 + (x >> 3) * 64 + (y & 7) * 8 + (x & 7)
+}
+
+/// The word, within a texture, that holds a texel: textures are tiled in
+/// 4 × 4 blocks, blocks in raster order (host-interface.md §6.2).
+///
+/// # Arguments
+///
+/// * `u` - The texel's column.
+/// * `v` - Its row.
+/// * `width_log2` - log₂ of the texture's width, 2 to 10.
+///
+/// # Returns
+///
+/// Its word offset from the texture's start.
+pub const fn texel_word(u: usize, v: usize, width_log2: u8) -> usize {
+    ((v >> 2) << (width_log2 - 2) | u >> 2) * 16 + (v & 3) * 4 + (u & 3)
 }
 
 /// Packs four 16-bit words as `MEM_DATA` holds them: the first (lowest
@@ -397,10 +416,6 @@ pub enum Cull {
 /// `RENDER_MODE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderMode {
-    /// Run the full (textured) setup program; else the untextured one, and
-    /// S′, T′ and Q are ignored.
-    pub textured: bool,
-
     /// Which winding to discard.
     pub cull: Cull,
 
@@ -415,11 +430,10 @@ pub struct RenderMode {
 }
 
 impl Default for RenderMode {
-    /// The reset value: untextured, no culling, depth tested and written,
-    /// colour written.
+    /// The reset value: no culling, depth tested and written, colour
+    /// written.
     fn default() -> RenderMode {
         RenderMode {
-            textured: false,
             cull: Cull::None,
             colour_write: true,
             z_write: true,
@@ -433,16 +447,14 @@ impl RenderMode {
     ///
     /// # Returns
     ///
-    /// `TEXTURED` in bit 8, `CULL` in 6:5, `COLOR_WRITE` 4, `Z_WRITE` 3,
-    /// `Z_TEST` 2.
+    /// `CULL` in 6:5, `COLOR_WRITE` 4, `Z_WRITE` 3, `Z_TEST` 2.
     pub fn bits(self) -> u64 {
         let cull = match self.cull {
             Cull::None => 0,
             Cull::Anticlockwise => 1,
             Cull::Clockwise => 2,
         };
-        u64::from(self.textured) << 8
-            | cull << 5
+        cull << 5
             | u64::from(self.colour_write) << 4
             | u64::from(self.z_write) << 3
             | u64::from(self.z_test) << 2
@@ -459,7 +471,6 @@ impl RenderMode {
     /// The fields; a `CULL` of 3 is none.
     pub fn from_bits(w: u64) -> RenderMode {
         RenderMode {
-            textured: w >> 8 & 1 == 1,
             cull: match w >> 5 & 3 {
                 1 => Cull::Anticlockwise,
                 2 => Cull::Clockwise,
@@ -468,6 +479,128 @@ impl RenderMode {
             colour_write: w >> 4 & 1 == 1,
             z_write: w >> 3 & 1 == 1,
             z_test: w >> 2 & 1 == 1,
+        }
+    }
+}
+
+/// How a texture coordinate outside the texture is brought back into it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Wrap {
+    /// Repeat the texture.
+    #[default]
+    Repeat,
+
+    /// Clamp to its edge texels.
+    ClampToEdge,
+
+    /// Repeat it, every other repeat reflected.
+    Mirror,
+}
+
+impl Wrap {
+    /// The field's value.
+    fn bits(self) -> u64 {
+        match self {
+            Wrap::Repeat => 0,
+            Wrap::ClampToEdge => 1,
+            Wrap::Mirror => 2,
+        }
+    }
+
+    /// The mode a field's value picks; the reserved 3 is `Repeat`.
+    fn from_bits(w: u64) -> Wrap {
+        match w & 3 {
+            1 => Wrap::ClampToEdge,
+            2 => Wrap::Mirror,
+            _ => Wrap::Repeat,
+        }
+    }
+}
+
+/// A texel format (host-interface.md §6.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TexFormat {
+    /// R[15:11] G[10:5] B[4:0], opaque.
+    #[default]
+    Rgb565,
+
+    /// A[15:12] R[11:8] G[7:4] B[3:0].
+    Argb4444,
+}
+
+/// `TEX0_CFG`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tex0Cfg {
+    /// Texture the triangles that follow.
+    pub enable: bool,
+
+    /// Bilinear filtering (Phase 18); else nearest.
+    pub bilinear: bool,
+
+    /// The texel format.
+    pub format: TexFormat,
+
+    /// The width is `2^width_log2` texels, 2 to 10.
+    pub width_log2: u8,
+
+    /// The height is `2^height_log2` texels, 2 to 10.
+    pub height_log2: u8,
+
+    /// The wrap mode for S.
+    pub u_wrap: Wrap,
+
+    /// The wrap mode for T.
+    pub v_wrap: Wrap,
+
+    /// The texture's address in units of 256 words (512 bytes).
+    pub base: u16,
+}
+
+impl Tex0Cfg {
+    /// The register's value.
+    ///
+    /// # Returns
+    ///
+    /// `BASE_ADDR` in bits 47:32, `V_WRAP` 19:18, `U_WRAP` 17:16,
+    /// `HEIGHT_LOG2` 15:12, `WIDTH_LOG2` 11:8, `FORMAT` 7:4, `FILTER` 3:2,
+    /// `ENABLE` 0.
+    pub fn bits(self) -> u64 {
+        u64::from(self.base) << 32
+            | self.v_wrap.bits() << 18
+            | self.u_wrap.bits() << 16
+            | u64::from(self.height_log2 & 0xF) << 12
+            | u64::from(self.width_log2 & 0xF) << 8
+            | u64::from(self.format == TexFormat::Argb4444) << 4
+            | u64::from(self.bilinear) << 2
+            | u64::from(self.enable)
+    }
+
+    /// The fields of a register value, as the GPU takes them: a size
+    /// below 4 texels is 4 and above 1024 is 1024; a reserved format is
+    /// RGB565, a reserved filter nearest.
+    ///
+    /// # Arguments
+    ///
+    /// * `w` - The value.
+    ///
+    /// # Returns
+    ///
+    /// The fields.
+    pub fn from_bits(w: u64) -> Tex0Cfg {
+        let log2 = |shift: u32| (byte(w, shift) & 0xF).clamp(2, 10);
+        Tex0Cfg {
+            enable: w & 1 == 1,
+            bilinear: w >> 2 & 3 == 1,
+            format: if w >> 4 & 0xF == 1 {
+                TexFormat::Argb4444
+            } else {
+                TexFormat::Rgb565
+            },
+            width_log2: log2(8),
+            height_log2: log2(12),
+            u_wrap: Wrap::from_bits(w >> 16),
+            v_wrap: Wrap::from_bits(w >> 18),
+            base: unsigned16(w, 32),
         }
     }
 }
@@ -798,7 +931,6 @@ mod tests {
         assert_eq!(p.bits() >> 48, 0xFFF0);
         for cull in [Cull::None, Cull::Anticlockwise, Cull::Clockwise] {
             let m = RenderMode {
-                textured: true,
                 cull,
                 colour_write: false,
                 z_write: true,
@@ -827,6 +959,27 @@ mod tests {
         assert_eq!(s.bits() >> 50, 0b10_10_01);
     }
 
+    /// `TEX0_CFG`'s fields at pico-gs's positions; sizes clamped to 4 to
+    /// 1024 texels.
+    #[test]
+    fn tex0_cfg_fields() {
+        let t = Tex0Cfg {
+            enable: true,
+            bilinear: false,
+            format: TexFormat::Argb4444,
+            width_log2: 6,
+            height_log2: 10,
+            u_wrap: Wrap::Mirror,
+            v_wrap: Wrap::ClampToEdge,
+            base: 0x1234,
+        };
+        assert_eq!(t.bits(), 0x1234_0006_A611);
+        assert_eq!(Tex0Cfg::from_bits(t.bits()), t);
+        let small = Tex0Cfg::from_bits(0x1F00 | 3 << 18);
+        assert_eq!((small.width_log2, small.height_log2), (10, 2));
+        assert_eq!(small.v_wrap, Wrap::Repeat);
+    }
+
     /// Memory words pack with the first in the low bits; a write is
     /// `MEM_ADDR` then a `MEM_DATA` per four words, the last padded.
     #[test]
@@ -840,6 +993,16 @@ mod tests {
         assert_eq!(w.next(), Some(Transaction::write(reg::MEM_DATA, 5)));
         assert_eq!(w.next(), None);
         assert_eq!(mem_read(colour_buffer(2), 3).count(), 4);
+    }
+
+    /// Texels are tiled in 4 × 4 blocks, blocks across the texture.
+    #[test]
+    fn texels_are_tiled() {
+        assert_eq!(texel_word(0, 0, 5), 0);
+        assert_eq!(texel_word(3, 1, 5), 7);
+        assert_eq!(texel_word(4, 0, 5), 16);
+        assert_eq!(texel_word(0, 4, 5), 8 * 16);
+        assert_eq!(texel_word(5, 6, 5), 9 * 16 + 2 * 4 + 1);
     }
 
     /// Pixels are tiled in 8 × 8 blocks: raster order within a block,

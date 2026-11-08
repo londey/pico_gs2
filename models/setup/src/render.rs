@@ -2,16 +2,24 @@
 //! Setup is the bit-exact model; coverage is the reference traversal
 //! (top-left rule); a pixel's colour and depth are each plane's start plus
 //! its gradients times the pixel's offset, modulo `2^36` as the
-//! rasteriser's stepping adders give it, then rounded and clamped (RGB565,
-//! and a 16-bit depth). With the render mode's depth test on, a pixel is
-//! drawn only if its depth is less than the depth buffer's; a drawn pixel
-//! writes its colour and depth where the mode's write enables say.
+//! rasteriser's stepping adders give it, then rounded and clamped (8 bits a
+//! colour channel, and a 16-bit depth). A textured triangle's colour is the
+//! texel (`texture.rs`, from GPU memory as `MEM_DATA` wrote it) times that
+//! shade; an untextured one's the shade. The colour is stored as RGB565 by
+//! keeping each channel's top bits. With the render mode's depth test on, a
+//! pixel is drawn only if its depth is less than the depth buffer's; a drawn
+//! pixel writes its colour and depth where the mode's write enables say.
 
-use gs_proto::{Cull, RenderMode, Transaction};
+use std::collections::HashMap;
+
+use gs_proto::{unpack_words, Cull, RenderMode, Tex0Cfg, Transaction};
 
 use crate::formats::{wrap, REG_BITS};
 use crate::scene::{interpret, Event};
 use crate::setup::setup;
+use crate::texture::{
+    coordinate, decode, modulate, reciprocal, rgb565, shade8, texel_addr, wrap as wrap_texel,
+};
 use crate::traverse::covered;
 use crate::triangle::{Attr, AttrSet, CullMode, Triangle};
 use crate::Plane;
@@ -26,7 +34,8 @@ pub const FB_HEIGHT: usize = 360;
 pub const FAR: u16 = 0xFFFF;
 
 /// A frame being drawn: colour and depth, each `FB_WIDTH * FB_HEIGHT`
-/// words in raster order.
+/// words in raster order; and the GPU memory the host has written, for
+/// textures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// RGB565 colours.
@@ -34,6 +43,10 @@ pub struct Frame {
 
     /// Depths, 0 nearest.
     pub depth: Vec<u16>,
+
+    /// GPU memory written with `MEM_DATA`, by word address; unwritten
+    /// words read 0.
+    pub memory: HashMap<u32, u16>,
 }
 
 impl Frame {
@@ -48,7 +61,36 @@ impl Frame {
     /// The frame.
     pub fn new(colour: Vec<u16>) -> Frame {
         let depth = vec![FAR; colour.len()];
-        Frame { colour, depth }
+        Frame {
+            colour,
+            depth,
+            memory: HashMap::new(),
+        }
+    }
+
+    /// A word of GPU memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `word` - Its address.
+    ///
+    /// # Returns
+    ///
+    /// The word, 0 if never written.
+    pub fn word(&self, word: u32) -> u16 {
+        self.memory.get(&(word & 0xFF_FFFF)).copied().unwrap_or(0)
+    }
+
+    /// Writes 64 bits of GPU memory, as `MEM_DATA` does.
+    ///
+    /// # Arguments
+    ///
+    /// * `dword` - The dword address.
+    /// * `data` - The four words, the first in bits 15:0.
+    pub fn write_dword(&mut self, dword: u32, data: u64) {
+        for (k, w) in (0..).zip(unpack_words(data)) {
+            self.memory.insert((dword << 2 | k) & 0xFF_FFFF, w);
+        }
     }
 }
 
@@ -59,24 +101,6 @@ fn value(p: &Plane, i: i64, j: i64) -> i64 {
         p.start.to_count() + p.dx.to_count() * i + p.dy.to_count() * j,
         REG_BITS,
     )
-}
-
-/// An 8-bit channel's iterator value as a `bits`-wide RGB565 field: the
-/// value over `2^(24 - bits)` (8 integer bits down to `bits`, and the 16
-/// fraction bits), rounded half up, clamped.
-///
-/// # Arguments
-///
-/// * `v` - The iterator count.
-/// * `bits` - 5 or 6.
-///
-/// # Returns
-///
-/// The field, `0` to `2^bits - 1`.
-pub fn quantise(v: i64, bits: u32) -> u16 {
-    let shift = 24 - bits;
-    let q = (v + (1 << (shift - 1))) >> shift;
-    u16::try_from(q.clamp(0, (1 << bits) - 1)).expect("in range")
 }
 
 /// The depth iterator's value as a 16-bit depth: rounded half up, clamped.
@@ -98,14 +122,14 @@ pub fn depth(v: i64) -> u16 {
 ///
 /// * `frame` - The frame.
 /// * `tri` - The vertices, in role order.
-/// * `mode` - The render mode: cull mode, program, depth test and write
-///   enables.
+/// * `mode` - The render mode: cull mode, depth test and write enables.
+/// * `tex` - The texture, which also picks the setup program.
 ///
 /// # Returns
 ///
 /// Whether setup kept the triangle.
-pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode) -> bool {
-    let attrs = if mode.textured {
+pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode, tex: &Tex0Cfg) -> bool {
+    let attrs = if tex.enable {
         AttrSet::FULL
     } else {
         AttrSet::UNTEXTURED
@@ -137,13 +161,43 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, mode: RenderMode) -> bool {
                 frame.depth[index] = d;
             }
             if mode.colour_write {
-                frame.colour[index] = quantise(value(&r, i, j), 5) << 11
-                    | quantise(value(&g, i, j), 6) << 5
-                    | quantise(value(&b, i, j), 5);
+                let shade = [r, g, b].map(|p| shade8(value(&p, i, j)));
+                let colour = if tex.enable {
+                    let texel = sample(frame, &s, tex, i, j);
+                    [0, 1, 2].map(|c| modulate(texel[c], shade[c]))
+                } else {
+                    shade
+                };
+                frame.colour[index] = rgb565(colour);
             }
         }
     }
     true
+}
+
+/// The texel a textured triangle's pixel takes (nearest sampling).
+///
+/// # Arguments
+///
+/// * `frame` - The frame, for the texture's memory.
+/// * `s` - The triangle's setup, with its S′, T′ and Q planes.
+/// * `tex` - The texture.
+/// * `i`, `j` - The pixel's offset from the planes' start point.
+///
+/// # Returns
+///
+/// The texel's R, G, B and A.
+fn sample(frame: &Frame, s: &crate::Setup, tex: &Tex0Cfg, i: i64, j: i64) -> [u8; 4] {
+    let plane = |a: Attr| s.planes[a.index()].expect("the full program computes S, T and Q");
+    let recip = reciprocal(value(&plane(Attr::Q), i, j));
+    let u = coordinate(value(&plane(Attr::S), i, j), recip, tex.width_log2);
+    let v = coordinate(value(&plane(Attr::T), i, j), recip, tex.height_log2);
+    let addr = texel_addr(
+        wrap_texel(u, tex.width_log2, tex.u_wrap),
+        wrap_texel(v, tex.height_log2, tex.v_wrap),
+        tex,
+    );
+    decode(frame.word(addr.word), tex.format)
 }
 
 /// Runs what the command parser makes of a scene on a frame.
@@ -173,7 +227,8 @@ pub fn run(frame: &mut Frame, events: &[Event]) -> (Vec<Vec<u16>>, usize) {
                     frame.depth.fill(FAR);
                 }
             }
-            Event::Draw(tri, mode) => kept += usize::from(draw(frame, tri, *mode)),
+            Event::Draw(tri, mode, tex) => kept += usize::from(draw(frame, tri, *mode, tex)),
+            Event::Mem(dword, data) => frame.write_dword(*dword, *data),
         }
     }
     (frames, kept)

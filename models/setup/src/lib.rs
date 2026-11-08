@@ -45,6 +45,7 @@ pub mod render;
 pub mod scene;
 mod schedule;
 mod setup;
+pub mod texture;
 pub mod traverse;
 mod triangle;
 
