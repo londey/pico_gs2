@@ -3,9 +3,10 @@
 //! (top-left rule); a pixel's colour and depth are each plane's start plus
 //! its gradients times the pixel's offset, modulo `2^36` as the
 //! rasteriser's stepping adders give it, then rounded and clamped (8 bits a
-//! colour channel, and a 16-bit depth). A textured triangle's colour is the
-//! texel (`texture.rs`, from GPU memory as `MEM_DATA` wrote it) times that
-//! shade; an untextured one's the shade. The colour is stored as RGB565 by
+//! colour channel, and a 16-bit depth). The colour combiner takes that
+//! shade and, on a textured triangle, the texture's sample (`texture.rs`:
+//! nearest or bilinear, from GPU memory as `MEM_DATA` wrote it); an
+//! untextured one's sample is white. The colour is stored as RGB565 by
 //! keeping each channel's top bits. With the render mode's depth test on, a
 //! pixel is drawn only if its depth is less than the depth buffer's; a drawn
 //! pixel writes its colour and depth where the mode's write enables say.
@@ -18,8 +19,7 @@ use crate::formats::{wrap, REG_BITS};
 use crate::scene::{interpret, DrawState, Event};
 use crate::setup::setup;
 use crate::texture::{
-    combine, coordinate, decode, reciprocal, rgb565, shade8, texel_addr, wrap as wrap_texel,
-    CcInputs,
+    combine, coordinate, decode, filter, reciprocal, rgb565, shade8, taps, texel_addr, CcInputs,
 };
 use crate::traverse::covered;
 use crate::triangle::{Attr, AttrSet, CullMode, Triangle};
@@ -182,7 +182,8 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, state: &DrawState) -> bool {
     true
 }
 
-/// The texel a textured triangle's pixel takes (nearest sampling).
+/// The colour a textured triangle's pixel samples: its texel, nearest,
+/// or the bilinear blend of four (host-interface.md §6.3).
 ///
 /// # Arguments
 ///
@@ -193,18 +194,23 @@ pub fn draw(frame: &mut Frame, tri: &Triangle, state: &DrawState) -> bool {
 ///
 /// # Returns
 ///
-/// The texel's R, G, B and A.
+/// The sample's R, G, B and A.
 fn sample(frame: &Frame, s: &crate::Setup, tex: &Tex0Cfg, i: i64, j: i64) -> [u8; 4] {
     let plane = |a: Attr| s.planes[a.index()].expect("the full program computes S, T and Q");
     let recip = reciprocal(value(&plane(Attr::Q), i, j));
     let u = coordinate(value(&plane(Attr::S), i, j), recip, tex.width_log2);
     let v = coordinate(value(&plane(Attr::T), i, j), recip, tex.height_log2);
-    let addr = texel_addr(
-        wrap_texel(u, tex.width_log2, tex.u_wrap),
-        wrap_texel(v, tex.height_log2, tex.v_wrap),
-        tex,
-    );
-    decode(frame.word(addr.word), tex.format)
+    let tu = taps(u, tex.width_log2, tex.u_wrap, tex.bilinear);
+    let tv = taps(v, tex.height_log2, tex.v_wrap, tex.bilinear);
+    let texel = |u: u32, v: u32| decode(frame.word(texel_addr(u, v, tex).word), tex.format);
+    filter(
+        [
+            [texel(tu.first, tv.first), texel(tu.second, tv.first)],
+            [texel(tu.first, tv.second), texel(tu.second, tv.second)],
+        ],
+        tu.weight,
+        tv.weight,
+    )
 }
 
 /// Runs what the command parser makes of a scene on a frame.

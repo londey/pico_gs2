@@ -171,6 +171,14 @@ struct Gpu {
     // Half blocks the display has finished with, and the ring slot of the
     // first half block of the row it is showing.
     freed: u13 = 0,
+    // Scan-out wants a load (loading, not every half block of the frame
+    // requested, and a ring slot free), and the next load's word address
+    // in the bank: functions of the registers above, kept as registers of
+    // their own (from the next state) to keep the subtract, the compare and
+    // the add off the arbiter's path.
+    scan_wants: u1 = 0,
+    #[no_reset]
+    scan_addr: u18 = 0,
     show_slot: u8 = 0,
     // 192 half blocks, slot s holding pixel (px, py) at word s @ py @ px:
     // slots 0 to 127 in `ring_lo`, 128 to 191 in `ring_hi` (a memory's
@@ -241,9 +249,8 @@ impl Gpu {
         // SDRAM requests: the fill's writes, then half-block loads while
         // the ring has a free slot. Half block (bx, row) is the top
         // (row even) or bottom half of block (bx, row / 2).
-        let in_use = (self.issued - self.freed) as u13 wrap;
-        let reading = self.loading & self.issued != FRAME_SLOTS & in_use < RING;
-        let load_addr = (self.load_rowbase + (0_u5 @ self.load_bx @ self.load_row[0:0] @ 0_u5)) as u18 wrap;
+        let reading = self.scan_wants;
+        let load_addr = self.scan_addr;
         // The triangle pipeline's outputs, from its registers.
         let pout = self.parser.out();
         let rout = self.raster.out(self.draw);
@@ -364,6 +371,14 @@ impl Gpu {
         } else {
             self.load_rowbase
         };
+        // Scan-out's next state, and what it will want then.
+        let n_loading = if frame_end { !self.filling } else { self.loading };
+        let n_issued: u13 = if frame_end { 0 } else if took { (self.issued + 1) as u13 wrap } else { self.issued };
+        let n_load_bx: u7 = if frame_end { 0 } else { load_bx };
+        let n_load_row: u7 = if frame_end { 0 } else if row_done { (self.load_row + 1) as u7 wrap } else { self.load_row };
+        let n_load_rowbase: u18 = if frame_end { 0 } else { load_rowbase };
+        let n_freed: u13 = if frame_end { 0 } else if next_row { (self.freed + ROW_SLOTS) as u13 wrap } else { self.freed };
+        let n_in_use = (n_issued - n_freed) as u13 wrap;
 
         // Words arriving go to the ring in order, a slot per 32.
         let (got, word) = match rdata_scan {
@@ -471,15 +486,17 @@ impl Gpu {
                 fill_py: if next_py { (self.fill_py + 1) as u3 wrap } else { self.fill_py },
                 fill_bx: fill_bx,
                 fill_by: if next_by { (self.fill_by + 1) as u6 wrap } else { self.fill_by },
-                loading: if frame_end { !self.filling } else { self.loading },
-                issued: if frame_end { 0 } else if took { (self.issued + 1) as u13 wrap } else { self.issued },
-                load_bx: if frame_end { 0 } else { load_bx },
-                load_row: if frame_end { 0 } else if row_done { (self.load_row + 1) as u7 wrap } else { self.load_row },
-                load_rowbase: if frame_end { 0 } else { load_rowbase },
+                loading: n_loading,
+                issued: n_issued,
+                load_bx: n_load_bx,
+                load_row: n_load_row,
+                load_rowbase: n_load_rowbase,
+                scan_wants: n_loading & n_issued != FRAME_SLOTS & n_in_use < RING,
+                scan_addr: (n_load_rowbase + (0_u5 @ n_load_bx @ n_load_row[0:0] @ 0_u5)) as u18 wrap,
                 received: if frame_end { 0 } else if slot_done { (self.received + 1) as u13 wrap } else { self.received },
                 recv_word: if frame_end { 0 } else if got { (self.recv_word + 1) as u5 wrap } else { self.recv_word },
                 recv_slot: if frame_end { 0 } else { recv_slot },
-                freed: if frame_end { 0 } else if next_row { (self.freed + ROW_SLOTS) as u13 wrap } else { self.freed },
+                freed: n_freed,
                 show_slot: if frame_end { 0 } else if next_row { next_show } else { self.show_slot },
                 ring_lo: self.ring_lo.next(
                     slot[6:0] @ beam.y[2:1] @ beam.x[3:1],

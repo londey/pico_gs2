@@ -461,17 +461,19 @@ serialisers and (later) the SPI link have clocks of their own.
   ),
   [
     #set text(size: 14pt)
-    - *Per pixel:* S′, T′ and Q stepped with colour and depth; a 12-stage
+    - *Per pixel:* S′, T′ and Q stepped with colour and depth; a 13-stage
       pipeline: 1/Q (seed + Newton–Raphson), S′ and T′ × it, shift to
-      texels, wrap (repeat, clamp, mirror), the texel's block address.
+      texels, two columns and rows, wrap (repeat, clamp, mirror), tags.
     - *Cache:* 256 lines of one 4×4 block, direct-mapped by block row and
       column (any 64×64 window fits), tagged by address; a miss is one
       16-word run. Emptied only after `MEM_DATA` writes.
-    - *Texel pass* per block: look up each drawn pixel, texture × shade into
-      the colour tile. RGB565 and ARGB4444.
+    - *Bilinear:* the cache's texels in four banks by column and row
+      parity, its tags in four by block parity, so a pixel's four texels
+      and up to four blocks are read and tested at once; blended by shifts
+      and adds. Free in time; nearest misses only on its one block.
     - *Divide error:* within 1/8 texel down to Q = 1/256.
-    - *Cube:* 98.4% hits, every block fetched once. On the board: 64.3
-      fps drawn (66.4 untextured), read back pixel-exact.
+    - *Cube:* every block fetched once, nearest or bilinear. On the board
+      (nearest): 64.3 fps drawn, read back pixel-exact.
     - Left: the twin's frames, each pixel-exact against the reference.
   ],
 )
@@ -651,15 +653,16 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [15201], [3841], [24288],
-      [flip-flops], [6891], [974], [24288],
-      [block RAM (DP16KD)], [27], [5], [56],
+      [logic cells], [17894], [3841], [24288],
+      [flip-flops], [8136], [974], [24288],
+      [block RAM (DP16KD)], [34], [5], [56],
       [multipliers], [12], [2], [28],
       [PLL], [1], [—], [2],
       [I/O], [52], [—], [197],
     )
     _GPU_: today's bitstream, everything included; the scene ROM takes 11
-    block RAMs, the texture cache 5, the link's FIFO 2.
+    block RAMs, the texture cache 8 and its pixels' addresses 4, the
+    link's FIFO 2.
     _Setup_: the engine placed and routed alone.
   ],
   [
@@ -667,7 +670,7 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [82.4 MHz], [75],
+      [`clk_core`], [81.8 MHz], [75],
       [`clk_sclk`], [291 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
@@ -696,8 +699,8 @@ serialisers and (later) the SPI link have clocks of their own.
   [15], [memory access: uploads, reading frames back], done,
   [16], [textures: cache, perspective-correct sampling], done,
   [17], [colour combiner and alpha test], done,
-  [18], [bilinear filtering, if it fits], next,
-  [19], [v1.0 frozen for games], later,
+  [18], [bilinear filtering: a banked texture cache], done,
+  [19], [v1.0 frozen for games], next,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
@@ -718,7 +721,7 @@ serialisers and (later) the SPI link have clocks of their own.
   fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
 - *Frame rate:* 66 fps for the cube, but the full clear is about half of
   it; a fast clear (per-block flags) is the first fix if scenes get busier.
-- *Core timing margin:* 82.4 MHz against 75, but placement moves it by
+- *Core timing margin:* 81.8 MHz against 75, but placement moves it by
   several MHz from build to build (one Phase 16 build placed at 74).
 - *`just check` time:* 20–45 minutes, set by `sinter sim --cosim` replaying
   12M-cycle stimulus at about 13,000 cycles a second in 7 GB (R11).

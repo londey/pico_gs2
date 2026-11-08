@@ -71,8 +71,9 @@ sim/target/release/gs-host --port /dev/ttyUSB0 --combiner                     # 
 ```
 
 While the port is open the GPU draws what the host sends: the tool uploads
-a brick texture and its textured cube turns all the way round, over a dark
-blue background (`--untextured` for the plain cube). When it closes, the
+a brick texture and its textured cube, filtered bilinear, turns all the
+way round, over a dark blue background (`--nearest` samples the texture
+nearest, `--untextured` draws the plain cube). When it closes, the
 GPU goes back to its built-in scene. The tool reports the frames shown,
 how long a frame took to draw and the link's throughput. `--screenshot`
 reads the frame on screen back over the link (about 2 s), saves it as a

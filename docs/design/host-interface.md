@@ -27,7 +27,7 @@ Phase 19, with what the phases between actually built.
 | 15 | `phase-15-memory` | `MEM_ADDR` and `MEM_DATA`, write and read (§9); `STATUS` and `ID` version 2; `gs-host` uploads, reads back and saves the frame on screen | Twin tests; on the board, a frame read back over the link matches the twin's frame pixel for pixel |
 | 16 | `phase-16-textures` | `TEX0_CFG` (§6); RGB565 and ARGB4444; the texture cache; perspective-correct nearest sampling; the wrap modes; texture × shade | Pixel-exact against the reference renderer; a textured cube on the board; frame time and cache hit rate measured |
 | 17 | `phase-17-combiner` | `CC_MODE`, `CONST0`, `CONST1` (§7); alpha test (§8); `RENDER_MODE` version 2 | Pixel-exact; a scene with cut-out alpha and the combiner's presets on the board |
-| 18 | `phase-18-bilinear` | Bilinear filtering, if it fits the ECP5-25K and 75 MHz; if not, `FILTER` = 1 samples nearest and the document says so | Pixel-exact; resources and timing |
+| 18 | `phase-18-bilinear` | Bilinear filtering (§6.3): a banked texture cache reading four texels a cycle; `gs-host` filters its cube | Pixel-exact; resources and timing; the filtered cube on the board |
 | 19 | `phase-19-v1` | Resources, timing and performance figures; this document frozen as v1.0 | Approved |
 
 After v1.0, in an order to be decided: the SPI link (§11) and RP2350
@@ -174,7 +174,7 @@ since its first vertex reuses slot 0.
 appears on the screen (Y down), in the order its kick names the vertices.
 `RENDER_MODE.CULL` discards one winding (§8).
 
-## 6. Texturing (Phase 16)
+## 6. Texturing (Phases 16 and 18, built)
 
 One texture unit, `TEX0`. A triangle is textured if `TEX0_CFG.ENABLE` was
 set at its kick; then the setup engine runs its full program (99 cycles a
@@ -192,7 +192,7 @@ reset combiner (texture × shade) draws the shade alone.
 | 15:12 | `HEIGHT_LOG2`: height is 2^n texels, n from 2 to 10 | 0 |
 | 11:8 | `WIDTH_LOG2`: width is 2^n texels, n from 2 to 10 | 0 |
 | 7:4 | `FORMAT`: 0 RGB565, 1 ARGB4444; others reserved | 0 |
-| 3:2 | `FILTER`: 0 nearest, 1 bilinear (Phase 18; nearest until then); others reserved | 0 |
+| 3:2 | `FILTER`: 0 nearest, 1 bilinear; others reserved (as nearest) | 0 |
 | 0 | `ENABLE`: texture the triangles that follow | 0 |
 
 Wrap modes, as pico-gs: 0 `REPEAT`, 1 `CLAMP_TO_EDGE`, 2 `MIRROR` (every
@@ -243,12 +243,29 @@ s = S′ / Q,   t = T′ / Q            (the texture coordinates, perspective-co
 U = s × width,   V = t × height     (in texels, with 4 fraction bits)
 ```
 
-then wraps U and V: `REPEAT` takes them modulo the size, `CLAMP_TO_EDGE`
-clamps them to the texture, `MIRROR` reflects every other repeat.
+then takes texels along each axis, each brought into the texture by its
+wrap mode: `REPEAT` takes the index modulo the size, `CLAMP_TO_EDGE`
+clamps it to the texture, `MIRROR` reflects every other repeat.
 
-- **Nearest:** the texel ⌊U⌋, ⌊V⌋ after wrapping.
-- **Bilinear (Phase 18):** the four texels around (U − ½, V − ½), each wrapped,
-  weighted by the fraction bits.
+- **Nearest:** the texel ⌊U⌋, ⌊V⌋.
+- **Bilinear:** with U′ = U − ½ and V′ = V − ½ (still 4 fraction bits),
+  the texels at columns ⌊U′⌋ and ⌊U′⌋ + 1 and rows ⌊V′⌋ and ⌊V′⌋ + 1, each
+  wrapped on its own, weighted by f = U′'s fraction and g = V′'s, in
+  sixteenths. At a clamped or mirrored edge both columns (or rows) can be
+  the same texel, which is then simply taken twice.
+
+The texels are decoded to 8 bits a channel (§6.1) and each channel
+blended across, then down, rounding once at the end:
+
+```
+row0 = 16·t00 + (t01 − t00)·f        (12 bits: 4 fraction bits)
+row1 = 16·t10 + (t11 − t10)·f
+out  = (16·row0 + (row1 − row0)·g + 128) >> 8
+```
+
+with t01 the second column's texel in the first row. Nearest is the same
+sum with f = g = 0, which is t00 exactly; so is any blend of four equal
+texels.
 
 The divide is a reciprocal of Q (setup's 1,024-entry seed table and a
 Newton–Raphson step) and two multiplies. Its exact rounding is the
@@ -273,24 +290,39 @@ texel, so a host should keep a triangle's range of Q modest.
 There is no mipmapping: a texture seen from far away shimmers; smaller
 textures for far objects are the host's choice.
 
-### 6.4 How it is built (Phase 16)
+### 6.4 How it is built (Phases 16 and 18)
 
 For each 8 × 8 block of a triangle, the rasteriser's pixel pass (64
-cycles) steps S′, T′ and Q with the colour and depth, and a 12-stage
-pipeline turns each pixel's into its texel's address: the reciprocal (a
+cycles) steps S′, T′ and Q with the colour and depth, and a 13-stage
+pipeline turns each pixel's into its texels' addresses: the reciprocal (a
 leading-zero count, the seed, two multiplies), S′ and T′ times it (25 × 18
-bits), the shift to texels, saturation, the wrap, and the texel's tag,
-cache line and place in its block. Untextured, the block goes straight to
-its write-back as before; textured, a texel pass (64 cycles and 5 of
-latency, plus misses) looks each drawn pixel's texel up and writes texture
-× shade into the colour tile.
+bits), the shift to texels, saturation, the two columns and rows and
+their weights, the four wraps, and the tags of the up to four 4 × 4
+blocks the texels are in. Every block then goes through a texel pass (64
+cycles and 11 of latency, plus misses): each drawn pixel's texels are
+looked up in the cache, blended (four stages) and passed to the combiner
+(§7). Untextured, the lookup is skipped and the texels are white.
 
 The texture cache is direct-mapped: 256 lines of one 4 × 4 block each
-(4,096 texels, 4 DP16KD), line (block row mod 16, block column mod 16), so
-any 64 × 64-texel window of a texture fits; each line's tag is the block's
-whole address. A miss fetches the block as one 16-word run and looks the
-pixel up again: about 30 cycles. The tags are cleared (256 cycles) before
-the first triangle after a `MEM_DATA` write.
+(4,096 texels), line (block row mod 16, block column mod 16), so any
+64 × 64-texel window of a texture fits; each line's tag is the block's
+whole address. So that a pixel's four texels are read in one cycle, the
+texels are kept in four banks (one DP16KD each) by the parity of their
+column and row: any two neighbouring columns differ in parity, and so
+do a texture's last column and its first, the sizes being even. The tags
+are kept the same way, in four banks by the parity of the block's column
+and row, so the up to four blocks are tested at once. A second column
+(or row) with no weight is not needed, so nearest sampling misses only on
+its one block. A miss fetches the first missing block as one 16-word run
+and looks the pixel up again: about 30 cycles, up to four times for a
+pixel whose texels straddle four blocks not yet cached. The tags are
+cleared (64 cycles, a tag of each bank at a time) before the first
+triangle after a `MEM_DATA` write.
+
+Bilinear filtering costs no time: the four texels come in the same cycle
+as nearest's one, and a texture's blocks are fetched once either way
+while it fits the cache (the textured cube misses on each of its 256
+blocks once with either filter).
 
 The depth test moved a stage later in the pixel pass (the depth compared a
 cycle after it is rounded), which took it off the critical path.
@@ -670,11 +702,41 @@ and the twin tests compare against it pixel for pixel, as now.
   drawn; no alpha broadcast; no clamp at 0; alpha taking colour's
   inputs; no alpha plane; `CONST1` read as `CONST0`; C not stretched; a
   `CC_MODE` write not waiting for the pipeline.
-- **18:** bilinear against the reference, including at wrap edges.
+- **18, as built (`texture.rs`):** the texture test's triangles now mix
+  the filters: the floor nearest (frames 1 and 2); the clamped and
+  mirrored triangle bilinear, so its samples at those edges take one texel
+  twice; the ARGB4444 triangle bilinear, mirrored and repeating; the
+  128 × 32 texture in perspective bilinear, its samples' texels often in
+  two or four blocks missed together; and the cube bilinear. Every frame
+  pixel-exact against the reference renderer (`texture::taps` and
+  `texture::filter`, unit-tested). The other scenes, all nearest or
+  untextured, stay pixel-exact through the banked cache. Mutations, each
+  caught: no weight; no half-texel offset; the second column always
+  repeating; the second row blending the first row's texels; the blend not
+  rounded; the second column, or row, never missing; a miss in the second
+  column fetching the first's block; the texel banks ignoring row parity;
+  the tag banks ignoring column parity; a flush leaving one tag bank; a
+  fetched word written to the wrong bank.
 
 ## 16. Resources and timing
 
-As built (Phase 17): the GPU places and routes at 82.4 MHz (75 needed) in
+As built (Phase 18): the GPU places and routes at 81.8 MHz (75 needed) in
+17,894 logic cells, 8,136 flip-flops, 34 DP16KD and 12 MULT18X18D (74%,
+33%, 61%, 43%). Bilinear filtering added about 2,700 cells, 1,250
+flip-flops and 7 DP16KD (three more tag banks, the texel addresses' two
+tiles), and no multiplier: its twelve blends are 4-bit weights, done by
+shifts and adds. The first build, with the texel addresses in LUT RAM,
+placed at 71 MHz, its critical path the SDRAM arbiter's (mostly routing,
+in a fuller device). Moving those tiles to block RAM gave 76.8; registering
+scan-out's request (whether it wants a load, and its address, computed
+from scan-out's next state) took the subtract, compare and add off the
+arbiter's path, giving 81.8. Lint (`just lint`) had been failing since
+Phase 16 on pipeline registers no later stage read; each pipeline stage
+now holds only what a later one reads, and the SDRAM controller's `wtake`
+is a register (the same function of its state), which ends Verilator's
+false combinational loop through it.
+
+Phase 17 placed at 82.4 MHz (75 needed) in
 15,201 logic cells, 6,891 flip-flops, 27 DP16KD and 12 MULT18X18D, of
 24,288, 24,288, 56 and 28 (62%, 28%, 48%, 43%). The combiner and alpha test
 added 1,349 cells, 699 flip-flops and one multiplier (four (A − B) × C
@@ -711,13 +773,19 @@ The setup engine brief's budget (an estimate, ±50%) for what v1.0 adds:
 
 Texturing came in at 3,100 cells, 9 multipliers and 6 DP16KD against the
 brief's 2,900, 9 and 13 for the divide, cache and filter. Bilinear
-filtering (Phase 18) needs four texels a cycle, which this one-port cache
-doesn't give; it will need the cache banked by texel parity, or four
-cycles a pixel.
+filtering (Phase 18) needs four texels a cycle, which the one-port cache
+didn't give; the cache is now banked by texel parity (§6.4). All that v1.0
+added (texturing, the combiner, filtering) came to about 7,100 cells, 10
+multipliers and 13 DP16KD, against the brief's 4,400 LUT4, 15 and 13:
+more logic, fewer multipliers. The whole GPU, 17,894 cells, 12
+multipliers and 34 DP16KD, against the brief's 15,000, 17 and 34.
 
-**Textured cube (twin):** 381 blocks through the texel pass, 16,445
-lookups, 256 misses (each of the 64 × 64 texture's blocks once, the cache
-having been emptied by the upload): 98.4% hits.
+**Textured cube (twin):** Phase 16, nearest: 381 blocks through the
+texel pass, 16,445 lookups, 256 misses (each of the 64 × 64 texture's
+blocks once, the cache having been emptied by the upload): 98.4% hits.
+Phase 18, bilinear, with every block of the frame now through the pass
+(the crossing triangles' too): 1,275 blocks, 59,756 lookups, the same
+256 misses: 99.6% hits.
 
 ## 17. On the board
 

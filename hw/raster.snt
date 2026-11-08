@@ -102,7 +102,7 @@ const R_FLUSH: u4 = 12;
 // DRAIN: cycles after a block's last pixel until its depth test is done,
 // and until its texel address is (the texture pipeline's depth).
 const DRAIN_PLAIN: u4 = 0;
-const DRAIN_TEXTURED: u4 = 11;
+const DRAIN_TEXTURED: u4 = 12;
 
 // The largest reciprocal of Q, so that it fits 17 bits.
 const R_MAX: u17 = 0x1FFFF;
@@ -646,10 +646,11 @@ pub struct Raster {
     // DRAIN: cycles left.
     drain: u4 = 0,
     // TEX0_CFG decoded, a cycle behind it (it only changes while this unit
-    // is idle): textured; ARGB4444; log2 of the width and height (2 to 10)
+    // is idle): textured; bilinear; ARGB4444; log2 of the width and height (2 to 10)
     // and each as a mask; the width's log2 less 2 (blocks across); the
     // wrap modes; the base address over 16.
     tc_textured: u1 = 0,
+    tc_bilinear: u1 = 0,
     tc_argb: u1 = 0,
     tc_lw: u4 = 2,
     tc_lh: u4 = 2,
@@ -663,35 +664,37 @@ pub struct Raster {
     tc_cc: u32 = 0x73717371,
     tc_const0: u32 = 0xFFFFFFFF,
     tc_const1: u32 = 0xFFFFFFFF,
-    // The texel address pipeline, twelve stages from a pixel's S', T' and
-    // Q to its texel's place in memory and the cache.
+    // The texel address pipeline, thirteen stages from a pixel's S', T'
+    // and Q to its four texels' places in memory and the cache.
     #[no_reset]
-    tp1: TexStage,
+    tp1: Tp1,
     #[no_reset]
-    tp2: TexStage,
+    tp2: Tp2,
     #[no_reset]
-    tp3: TexStage,
+    tp3: Tp3,
     #[no_reset]
-    tp4: TexStage,
+    tp4: Tp4,
     #[no_reset]
-    tp5: TexStage,
+    tp5: Tp5,
     #[no_reset]
-    tp6: TexStage,
+    tp6: Tp6,
     #[no_reset]
-    tp7: TexStage,
+    tp7: Tp7,
     #[no_reset]
-    tp8: TexStage,
+    tp8: Tp8,
     #[no_reset]
-    tp9: TexStage,
+    tp9: Tp9,
     #[no_reset]
-    tp10: TexStage,
+    tp10: Tp10,
     #[no_reset]
-    tp11: TexStage,
+    tp11: Tp11,
     #[no_reset]
-    tp12: TexStage,
-    // TEXEL: the next pixel to look up; then five stages: the address
-    // read, the cache read, the hit test (and the shade stretched to 0 to
-    // 256), texture x shade, and the colour tile's write.
+    tp12: Tp12,
+    #[no_reset]
+    tp13: Tp13,
+    // TEXEL: the next pixel to look up; then the address read, the cache
+    // read (each bank's tag and texel routed to the block and texel it
+    // serves), and the hit test.
     tx_issue: u7 = 0,
     tx1_valid: u1 = 0,
     #[no_reset]
@@ -700,22 +703,50 @@ pub struct Raster {
     #[no_reset]
     tx2_pix: u6 = 0,
     #[no_reset]
-    tx2_addr: u32 = 0,
+    tx2_addr: u64 = 0,
+    #[no_reset]
+    tx2_addr2: u48 = 0,
     #[no_reset]
     tx2_drawn: u1 = 0,
     tx3_valid: u1 = 0,
     #[no_reset]
     tx3_pix: u6 = 0,
     #[no_reset]
-    tx3_addr: u32 = 0,
+    tx3_addr: u64 = 0,
+    #[no_reset]
+    tx3_addr2: u48 = 0,
     #[no_reset]
     tx3_drawn: u1 = 0,
+    // The tags of the blocks holding the four texels: (first row, first
+    // column), (first, second), (second, first), (second, second).
     #[no_reset]
-    tx3_tag: u21 = 0,
+    tx3_tag00: u21 = 0,
     #[no_reset]
-    tx3_texel: u16 = 0,
+    tx3_tag01: u21 = 0,
+    #[no_reset]
+    tx3_tag10: u21 = 0,
+    #[no_reset]
+    tx3_tag11: u21 = 0,
+    // The four texels, in the same order from the top.
+    #[no_reset]
+    tx3_texel: u64 = 0,
     #[no_reset]
     tx3_shade: u32 = 0,
+    // Then the filter: the texels decoded, with each row's second less
+    // its first; each row blended across; the second row less the first;
+    // the rows blended down.
+    f1_valid: u1 = 0,
+    f2_valid: u1 = 0,
+    f3_valid: u1 = 0,
+    f4_valid: u1 = 0,
+    #[no_reset]
+    f1: Filt1,
+    #[no_reset]
+    f2: Filt2,
+    #[no_reset]
+    f3: Filt3,
+    #[no_reset]
+    f4: Filt4,
     // Then the combiner: its inputs; A, B, C (stretched to 0 to 256) and D
     // for each channel; (A - B) x C, and D; the result; and the alpha test
     // with the colour tile's write. Channels R, G, B, A from the top.
@@ -724,13 +755,13 @@ pub struct Raster {
     tx6_valid: u1 = 0,
     tx7_valid: u1 = 0,
     #[no_reset]
-    tx4: CombStage,
+    tx4: Comb4,
     #[no_reset]
-    tx5: CombStage,
+    tx5: Comb5,
     #[no_reset]
-    tx6: CombStage,
+    tx6: Comb6,
     #[no_reset]
-    tx7: CombStage,
+    tx7: Comb7,
     // TEXEL: a missing block being fetched, the words of it so far, and
     // which line and tag it goes to.
     filling: u1 = 0,
@@ -740,7 +771,8 @@ pub struct Raster {
     #[no_reset]
     fill_line: u8 = 0,
     // The cache must be emptied before the next triangle (as after reset,
-    // when its tags are unknown); FLUSH: the line being emptied.
+    // when its tags are unknown); FLUSH: the tag being cleared in each
+    // bank.
     need_flush: u1 = 1,
     flush_line: u8 = 0,
     // Which of the block's pixels are drawn (covered and nearer).
@@ -774,87 +806,269 @@ pub struct Raster {
     #[storage(lutram)]
     #[no_reset]
     ztile: mem<u16, 64> = 0,
-    // The block's shades and texel addresses (the texel's tag, cache line
-    // and place in its block), in raster order.
+    // The block's shades, and its pixels' texel addresses, in raster
+    // order: the tags of the blocks of the four texels a pixel takes, then
+    // the texels' columns and rows (low 6 bits; first, second), and the
+    // weights of the second column and row (`atile`: tags 00 and 01, then
+    // the columns and rows; `btile`: tags 10 and 11, then the weights).
     #[storage(lutram)]
     #[no_reset]
     stile: mem<u32, 64> = 0,
-    #[storage(lutram)]
+    #[storage(bram)]
     #[no_reset]
-    atile: mem<u32, 64> = 0,
+    atile: mem<u64, 64> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    btile: mem<u48, 64> = 0,
     // The texture cache: 256 lines, each a 4x4 block of texels, line
-    // (by mod 16, bx mod 16); each line's tag is valid @ the block's word
+    // (by mod 16, bx mod 16). The texels are in four banks by the parity
+    // of their column and row (bank v[0] @ u[0], at line @ v[1] @ u[1]),
+    // so that the four a bilinear sample takes are read at once; the tags
+    // in four by the parity of the block's column and row (bank by[0] @
+    // bx[0], at by[3:1] @ bx[3:1]), so that the up to four blocks those
+    // texels are in are tested at once. A tag is valid @ the block's word
     // address over 16.
     #[storage(bram)]
     #[no_reset]
-    ctag: mem<u21, 256> = 0,
+    ctag0: mem<u21, 64> = 0,
     #[storage(bram)]
     #[no_reset]
-    cdata: mem<u16, 4096> = 0,
+    ctag1: mem<u21, 64> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    ctag2: mem<u21, 64> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    ctag3: mem<u21, 64> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    cdata0: mem<u16, 1024> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    cdata1: mem<u16, 1024> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    cdata2: mem<u16, 1024> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    cdata3: mem<u16, 1024> = 0,
     // 1 / x seeds for the divide by Q: setup's table.
     #[storage(bram)]
     #[no_reset]
-    seeds: rom<u18, 1024> = include_hex!("../build/gen/setup_seed.hex"),
+    seeds: rom<u17, 1024> = include_hex!("../build/gen/setup_seed.hex"),
 }
 
-// One stage of the combiner's pipeline, after the texel pass's hit test
-// (each stage's valid bit is a register of its own). Not every field means
-// something at every stage.
-struct CombStage {
+// The pipelines' stages. Each holds only what a later stage reads, so
+// that every register is used (`-Wall`). Every stage has its pixel; the
+// texel address pipeline's stages carry their valid bit, the filter's and
+// the combiner's have theirs in registers of their own (reset).
+
+// The texel address pipeline, 1 to 7: S' and T' bits 31:7 (signed), Q's
+// low 32 bits; then Q's leading zeros; its mantissa (UQ1.16); the seed; x
+// x seed; the Newton-Raphson factor; the reciprocal.
+struct Tp1 {
+    valid: u1 = 0,
     pix: u6 = 0,
-    // The pixel was drawn by the depth test.
+    sp: i25 = 0,
+    tp: i25 = 0,
+    q: u32 = 0,
+}
+
+struct Tp2 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    q: u32 = 0,
+    lz: u5 = 0,
+}
+
+struct Tp3 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    lz: u5 = 0,
+    x: u17 = 0,
+}
+
+struct Tp4 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    lz: u5 = 0,
+    x: u17 = 0,
+    r0: u17 = 0,
+}
+
+struct Tp5 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    lz: u5 = 0,
+    r0: u17 = 0,
+    p: u34 = 0,
+}
+
+struct Tp6 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    lz: u5 = 0,
+    r0: u17 = 0,
+    c: u17 = 0,
+}
+
+struct Tp7 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    sp: i25 = 0,
+    tp: i25 = 0,
+    lz: u5 = 0,
+    r: u17 = 0,
+}
+
+// 8: S' and T' times the reciprocal, and the right shifts that scale them
+// to texels; 9: shifted.
+struct Tp8 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    us: i43 = 0,
+    vt: i43 = 0,
+    ru: u6 = 0,
+    rv: u6 = 0,
+}
+
+struct Tp9 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    su: i50 = 0,
+    sv: i50 = 0,
+}
+
+// 10: the texel coordinates (4 fraction bits).
+struct Tp10 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    u: i20 = 0,
+    v: i20 = 0,
+}
+
+// 11: the first column and row a sample takes (whole texels, before
+// wrapping), the next ones, and the next ones' weights (sixteenths).
+struct Tp11 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    ui0: i17 = 0,
+    ui1: i17 = 0,
+    vi0: i17 = 0,
+    vi1: i17 = 0,
+    fu: u4 = 0,
+    fv: u4 = 0,
+}
+
+// 12: the four wrapped.
+struct Tp12 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    tu: u10 = 0,
+    tu1: u10 = 0,
+    tv: u10 = 0,
+    tv1: u10 = 0,
+    fu: u4 = 0,
+    fv: u4 = 0,
+}
+
+// 13: the texel addresses, `atile`'s and `btile`'s entries.
+struct Tp13 {
+    valid: u1 = 0,
+    pix: u6 = 0,
+    entry: u64 = 0,
+    entry2: u48 = 0,
+}
+
+// The filter, after the texel pass's hit test, channels R, G, B, A from
+// the top of each field. 1: the pixel drawn by the depth test, its shade;
+// the second column's and row's weights; each row's first texel
+// (RGBA8888), and its second less its first (9 bits a channel, signed).
+struct Filt1 {
+    pix: u6 = 0,
     drawn: u1 = 0,
-    // The inputs, RGBA8888: texel and shade.
+    shade: u32 = 0,
+    fu: u4 = 0,
+    fv: u4 = 0,
+    b0: u32 = 0,
+    b1: u32 = 0,
+    d0: u36 = 0,
+    d1: u36 = 0,
+}
+
+// 2: each row blended across (12 bits a channel, 4 fraction bits).
+struct Filt2 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
+    shade: u32 = 0,
+    fv: u4 = 0,
+    r0: u48 = 0,
+    r1: u48 = 0,
+}
+
+// 3: the second row less the first (13 bits a channel, signed).
+struct Filt3 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
+    shade: u32 = 0,
+    fv: u4 = 0,
+    r0: u48 = 0,
+    dv: u52 = 0,
+}
+
+// 4: the sample, RGBA8888.
+struct Filt4 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
+    shade: u32 = 0,
+    out: u32 = 0,
+}
+
+// The combiner. 4: its inputs, RGBA8888, texel and shade; 5: A - B for
+// each channel (9 bits, signed), C stretched (9 bits a channel), and D;
+// 6: (A - B) x C for each channel, and D; 7: the result, RGBA8888.
+struct Comb4 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
     tex: u32 = 0,
     shade: u32 = 0,
-    // A - B for each channel (9 bits, signed), D (RGBA8888), and C
-    // stretched, 9 bits a channel.
+}
+
+struct Comb5 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
     dr: i9 = 0,
     dg: i9 = 0,
     db: i9 = 0,
     da: i9 = 0,
     c: u36 = 0,
     d: u32 = 0,
-    // (A - B) x C for each channel.
+}
+
+struct Comb6 {
+    pix: u6 = 0,
+    drawn: u1 = 0,
     pr: i20 = 0,
     pg: i20 = 0,
     pb: i20 = 0,
     pa: i20 = 0,
-    // The result, RGBA8888.
-    out: u32 = 0,
+    d: u32 = 0,
 }
 
-// One stage of the texel address pipeline. Not every field means something
-// at every stage.
-struct TexStage {
-    valid: u1 = 0,
+struct Comb7 {
     pix: u6 = 0,
-    // S' and T' bits 31:7 (signed), and Q's low 32 bits.
-    sp: i25 = 0,
-    tp: i25 = 0,
-    q: u32 = 0,
-    // Q's leading zeros; its mantissa (UQ1.16); the seed; x * seed; the
-    // Newton-Raphson factor; the reciprocal.
-    lz: u5 = 0,
-    x: u17 = 0,
-    r0: u17 = 0,
-    p: u34 = 0,
-    c: u17 = 0,
-    r: u17 = 0,
-    // S' and T' times the reciprocal; the texel coordinates (4 fraction
-    // bits); the texel's tag @ line @ place.
-    us: i43 = 0,
-    vt: i43 = 0,
-    // The right shifts that scale them to texels, and the shifted values.
-    ru: u6 = 0,
-    rv: u6 = 0,
-    su: i50 = 0,
-    sv: i50 = 0,
-    u: i20 = 0,
-    v: i20 = 0,
-    tu: u10 = 0,
-    tv: u10 = 0,
-    entry: u32 = 0,
+    drawn: u1 = 0,
+    out: u32 = 0,
 }
 
 impl Raster {
@@ -988,13 +1202,12 @@ impl Raster {
         // T' / Q by a reciprocal (setup's seed and a Newton-Raphson step),
         // scaled to texels, wrapped, then the texel's block and line. ----
         let q_low = (self.pq.pix as u36 wrap)[31:0];
-        let t0 = TexStage {
+        let t0 = Tp1 {
             valid: stepping,
             pix: self.pix,
             sp: (self.ps.pix as u36 wrap)[31:7] as i25 wrap,
             tp: (self.pt.pix as u36 wrap)[31:7] as i25 wrap,
             q: if q_low == 0 { 1 } else { q_low },
-            ..self.tp1
         };
         let t1 = self.tp1;
         let t2 = self.tp2;
@@ -1008,25 +1221,60 @@ impl Raster {
         let t10 = self.tp10;
         let t11 = self.tp11;
         let t12 = self.tp12;
+        let t13 = self.tp13;
         let normal = t2.q << t2.lz;
         let rr = t6.r0 * t6.c;
         let u_right = (41 - (0_u2 @ t7.lz) - (0_u3 @ lw)) as u6 wrap;
         let v_right = (41 - (0_u2 @ t7.lz) - (0_u3 @ lh)) as u6 wrap;
-        let bxt = t11.tu[9:2];
-        let byt = t11.tv[9:2];
-        let block = ((0_u8 @ byt) << self.tc_bshift) | (0_u8 @ bxt);
-        let tag = (self.tc_base + (0_u4 @ block)) as u20 wrap;
-        let entry = tag @ byt[3:0] @ bxt[3:0] @ t11.tv[1:0] @ t11.tu[1:0];
+        // The tags of the four texels' blocks: row (first or second) then
+        // column.
+        let bs = self.tc_bshift;
+        let tag00 = block_tag(self.tc_base, t12.tv[9:2], t12.tu[9:2], bs);
+        let tag01 = block_tag(self.tc_base, t12.tv[9:2], t12.tu1[9:2], bs);
+        let tag10 = block_tag(self.tc_base, t12.tv1[9:2], t12.tu[9:2], bs);
+        let tag11 = block_tag(self.tc_base, t12.tv1[9:2], t12.tu1[9:2], bs);
+        let entry = tag00 @ tag01 @ t12.tu[5:0] @ t12.tu1[5:0] @ t12.tv[5:0] @ t12.tv1[5:0];
+        let entry2 = tag10 @ tag11 @ t12.fu @ t12.fv;
 
-        // ---- TEXEL: each pixel's texel through the cache, in order: its
-        // address read; the cache and its shade read; then a hit, or a pixel
-        // not drawn, writes its colour, and a miss fetches the block and
-        // looks that pixel up again. ---------------------------------------
+        // ---- TEXEL: each pixel's texels through the cache, in order: its
+        // addresses read; the cache's banks and its shade read, each bank's
+        // tag and texel routed to the block and texel it serves; then a
+        // hit, or a pixel not drawn, goes on to the filter, and a miss
+        // fetches the first missing block and looks that pixel up again. A
+        // second column or row with no weight is not needed. ---------------
         let texeling = st == R_TEXEL;
         let pass = texeling & self.filling == 0;
         let a1 = self.atile.value();
+        let b1 = self.btile.value();
+        let e2 = self.tx2_addr;
+        let e3 = self.tx3_addr;
+        let e3b = self.tx3_addr2;
+        let m00 = self.tx3_tag00 != (1_u1 @ e3[63:44]);
+        let m01 = e3b[7:4] != 0 & self.tx3_tag01 != (1_u1 @ e3[43:24]);
+        let m10 = e3b[3:0] != 0 & self.tx3_tag10 != (1_u1 @ e3b[47:28]);
+        let m11 = e3b[7:4] != 0 & e3b[3:0] != 0 & self.tx3_tag11 != (1_u1 @ e3b[27:8]);
         // Untextured, every lookup is a hit (on opaque white).
-        let hit = !textured | self.tx3_tag == (1_u1 @ self.tx3_addr[31:12]);
+        let hit = !textured | !(m00 | m01 | m10 | m11);
+        let miss_tag = if m00 { e3[63:44] } else if m01 { e3[43:24] } else if m10 { e3b[47:28] } else { e3b[27:8] };
+        let miss_line = if m00 {
+            e3[11:8] @ e3[23:20]
+        } else if m01 {
+            e3[11:8] @ e3[17:14]
+        } else if m10 {
+            e3[5:2] @ e3[23:20]
+        } else {
+            e3[5:2] @ e3[17:14]
+        };
+        // The texels decoded (white untextured): row then column.
+        let x3 = self.tx3_texel;
+        let d00: u32 = if textured { decode(x3[63:48], argb) } else { 0xFFFFFFFF };
+        let d01: u32 = if textured { decode(x3[47:32], argb) } else { 0xFFFFFFFF };
+        let d10: u32 = if textured { decode(x3[31:16], argb) } else { 0xFFFFFFFF };
+        let d11: u32 = if textured { decode(x3[15:0], argb) } else { 0xFFFFFFFF };
+        let f1 = self.f1;
+        let f2 = self.f2;
+        let f3 = self.f3;
+        let f4 = self.f4;
         let tx_ok = pass & self.tx3_valid == 1 & (hit | self.tx3_drawn == 0);
         let tx_miss = pass & self.tx3_valid == 1 & !hit & self.tx3_drawn == 1;
         let issuing = pass & !tx_miss & self.tx_issue != 64;
@@ -1070,7 +1318,7 @@ impl Raster {
 
         // ---- FLUSH: every cache line's tag cleared. ----------------------
         let flushing = st == R_FLUSH;
-        let flush_done = flushing & self.flush_line == 255;
+        let flush_done = flushing & self.flush_line == 63;
 
         // ---- WRITE: colours then depths, each half block with a drawn
         // pixel one run; CLEAR: every half block's colour and depth. ------
@@ -1158,6 +1406,14 @@ impl Raster {
         let zwdata: u16 = if reading { zword } else { self.zt_z };
         // The colour tile: each pixel's shade from the depth test's stage,
         // then, textured, texture x shade from TEXEL's last.
+        // The cache's writes: a fetched block's words, each to its texel's
+        // bank; its tag when the last arrives; or, in FLUSH, a tag of each
+        // bank cleared each cycle.
+        let data_bank = self.fill_got[2:2] @ self.fill_got[0:0];
+        let data_waddr = self.fill_line @ self.fill_got[3:3] @ self.fill_got[1:1];
+        let tag_bank = self.fill_line[4:4] @ self.fill_line[0:0];
+        let tag_waddr = if flushing { self.flush_line[5:0] } else { self.fill_line[7:5] @ self.fill_line[3:1] };
+        let tag_wdata: u21 = if flushing { 0 } else { 1_u1 @ self.fill_tag };
         let cwe = self.zt_valid | tx_write;
         let cwaddr: u6 = if texeling { c7.pix } else { self.zt_pix };
         let cwdata: u24 = if texeling { c7.out[31:8] } else { self.zt_shade[31:8] };
@@ -1209,28 +1465,60 @@ impl Raster {
                 zt_shade: shade,
                 drain: if stepping { if textured { DRAIN_TEXTURED } else { DRAIN_PLAIN } } else { (self.drain - 1) as u4 wrap },
                 tp1: t0,
-                tp2: TexStage { lz: lz32(t1.q), ..t1 },
-                tp3: TexStage { x: normal[31:15], ..t2 },
-                tp4: TexStage { r0: self.seeds.value()[16:0], ..t3 },
-                tp5: TexStage { p: t4.x * t4.r0, ..t4 },
-                tp6: TexStage { c: ((0x400000000_u35 - (0_u1 @ t5.p)) as u35 wrap)[33:17], ..t5 },
-                tp7: TexStage { r: if rr[33:33] == 1 { R_MAX } else { rr[32:16] }, ..t6 },
-                tp8: TexStage {
+                tp2: Tp2 { valid: t1.valid, pix: t1.pix, sp: t1.sp, tp: t1.tp, q: t1.q, lz: lz32(t1.q) },
+                tp3: Tp3 { valid: t2.valid, pix: t2.pix, sp: t2.sp, tp: t2.tp, lz: t2.lz, x: normal[31:15] },
+                tp4: Tp4 { valid: t3.valid, pix: t3.pix, sp: t3.sp, tp: t3.tp, lz: t3.lz, x: t3.x, r0: self.seeds.value() },
+                tp5: Tp5 { valid: t4.valid, pix: t4.pix, sp: t4.sp, tp: t4.tp, lz: t4.lz, r0: t4.r0, p: t4.x * t4.r0 },
+                tp6: Tp6 {
+                    valid: t5.valid,
+                    pix: t5.pix,
+                    sp: t5.sp,
+                    tp: t5.tp,
+                    lz: t5.lz,
+                    r0: t5.r0,
+                    c: ((0x400000000_u35 - (0_u1 @ t5.p)) as u35 wrap)[33:17],
+                },
+                tp7: Tp7 {
+                    valid: t6.valid,
+                    pix: t6.pix,
+                    sp: t6.sp,
+                    tp: t6.tp,
+                    lz: t6.lz,
+                    r: if rr[33:33] == 1 { R_MAX } else { rr[32:16] },
+                },
+                tp8: Tp8 {
+                    valid: t7.valid,
+                    pix: t7.pix,
                     us: t7.sp * ((0_u1 @ t7.r) as i18 wrap),
                     vt: t7.tp * ((0_u1 @ t7.r) as i18 wrap),
                     ru: u_right,
                     rv: v_right,
-                    ..t7
                 },
-                tp9: TexStage { su: widen7(t8.us) >> t8.ru, sv: widen7(t8.vt) >> t8.rv, ..t8 },
-                tp10: TexStage { u: saturate20(t9.su), v: saturate20(t9.sv), ..t9 },
-                tp11: TexStage {
-                    tu: wrap_texel(t10.u, lw, self.tc_wmask, self.tc_uwrap),
-                    tv: wrap_texel(t10.v, lh, self.tc_hmask, self.tc_vwrap),
-                    ..t10
+                tp9: Tp9 { valid: t8.valid, pix: t8.pix, su: widen7(t8.us) >> t8.ru, sv: widen7(t8.vt) >> t8.rv },
+                tp10: Tp10 { valid: t9.valid, pix: t9.pix, u: saturate20(t9.su), v: saturate20(t9.sv) },
+                tp11: Tp11 {
+                    valid: t10.valid,
+                    pix: t10.pix,
+                    ui0: first_index(t10.u, self.tc_bilinear),
+                    ui1: next_index(t10.u, self.tc_bilinear),
+                    vi0: first_index(t10.v, self.tc_bilinear),
+                    vi1: next_index(t10.v, self.tc_bilinear),
+                    fu: weight(t10.u, self.tc_bilinear),
+                    fv: weight(t10.v, self.tc_bilinear),
                 },
-                tp12: TexStage { entry: entry, ..t11 },
+                tp12: Tp12 {
+                    valid: t11.valid,
+                    pix: t11.pix,
+                    tu: wrap_texel(t11.ui0, lw, self.tc_wmask, self.tc_uwrap),
+                    tu1: wrap_texel(t11.ui1, lw, self.tc_wmask, self.tc_uwrap),
+                    tv: wrap_texel(t11.vi0, lh, self.tc_hmask, self.tc_vwrap),
+                    tv1: wrap_texel(t11.vi1, lh, self.tc_hmask, self.tc_vwrap),
+                    fu: t11.fu,
+                    fv: t11.fv,
+                },
+                tp13: Tp13 { valid: t12.valid, pix: t12.pix, entry: entry, entry2: entry2 },
                 tc_textured: tex[0:0],
+                tc_bilinear: (tex[3:2] == 1),
                 tc_argb: (tex[7:4] == 1),
                 tc_lw: lw_in,
                 tc_lh: lh_in,
@@ -1257,52 +1545,83 @@ impl Raster {
                 tx2_valid: pass & !tx_miss & self.tx1_valid == 1,
                 tx2_pix: self.tx1_pix,
                 tx2_addr: a1,
+                tx2_addr2: b1,
                 tx2_drawn: (self.mask >> self.tx1_pix)[0:0],
                 tx3_valid: pass & !tx_miss & self.tx2_valid == 1,
                 tx3_pix: self.tx2_pix,
-                tx3_addr: self.tx2_addr,
+                tx3_addr: e2,
+                tx3_addr2: self.tx2_addr2,
                 tx3_drawn: self.tx2_drawn,
-                tx3_tag: self.ctag.value(),
-                tx3_texel: self.cdata.value(),
+                tx3_tag00: pick21(e2[8:8] @ e2[20:20], self.ctag0.value(), self.ctag1.value(), self.ctag2.value(), self.ctag3.value()),
+                tx3_tag01: pick21(e2[8:8] @ e2[14:14], self.ctag0.value(), self.ctag1.value(), self.ctag2.value(), self.ctag3.value()),
+                tx3_tag10: pick21(e2[2:2] @ e2[20:20], self.ctag0.value(), self.ctag1.value(), self.ctag2.value(), self.ctag3.value()),
+                tx3_tag11: pick21(e2[2:2] @ e2[14:14], self.ctag0.value(), self.ctag1.value(), self.ctag2.value(), self.ctag3.value()),
+                tx3_texel: pick16(e2[6:6] @ e2[18:18], self.cdata0.value(), self.cdata1.value(), self.cdata2.value(), self.cdata3.value())
+                    @ pick16(e2[6:6] @ e2[12:12], self.cdata0.value(), self.cdata1.value(), self.cdata2.value(), self.cdata3.value())
+                    @ pick16(e2[0:0] @ e2[18:18], self.cdata0.value(), self.cdata1.value(), self.cdata2.value(), self.cdata3.value())
+                    @ pick16(e2[0:0] @ e2[12:12], self.cdata0.value(), self.cdata1.value(), self.cdata2.value(), self.cdata3.value()),
                 tx3_shade: self.stile.value(),
-                tx4_valid: tx_ok,
+                f1_valid: tx_ok,
+                f2_valid: texeling & self.f1_valid == 1,
+                f3_valid: texeling & self.f2_valid == 1,
+                f4_valid: texeling & self.f3_valid == 1,
+                f1: Filt1 {
+                    pix: self.tx3_pix,
+                    drawn: self.tx3_drawn,
+                    shade: self.tx3_shade,
+                    fu: e3b[7:4],
+                    fv: e3b[3:0],
+                    b0: d00,
+                    b1: d10,
+                    d0: differences(d01, d00),
+                    d1: differences(d11, d10),
+                },
+                f2: Filt2 {
+                    pix: f1.pix,
+                    drawn: f1.drawn,
+                    shade: f1.shade,
+                    fv: f1.fv,
+                    r0: rows(f1.b0, f1.d0, f1.fu),
+                    r1: rows(f1.b1, f1.d1, f1.fu),
+                },
+                f3: Filt3 { pix: f2.pix, drawn: f2.drawn, shade: f2.shade, fv: f2.fv, r0: f2.r0, dv: row_differences(f2.r1, f2.r0) },
+                f4: Filt4 { pix: f3.pix, drawn: f3.drawn, shade: f3.shade, out: blend(f3.r0, f3.dv, f3.fv) },
+                tx4_valid: texeling & self.f4_valid == 1,
                 tx5_valid: texeling & self.tx4_valid == 1,
                 tx6_valid: texeling & self.tx5_valid == 1,
                 tx7_valid: texeling & self.tx6_valid == 1,
-                tx4: CombStage {
-                    pix: self.tx3_pix,
-                    drawn: self.tx3_drawn,
-                    tex: if textured { decode(self.tx3_texel, argb) } else { 0xFFFFFFFF },
-                    shade: self.tx3_shade,
-                    ..self.tx4
-                },
-                tx5: CombStage {
+                tx4: Comb4 { pix: f4.pix, drawn: f4.drawn, tex: f4.out, shade: f4.shade },
+                tx5: Comb5 {
+                    pix: c4.pix,
+                    drawn: c4.drawn,
                     dr: difference(op_a[31:24], op_b[31:24]),
                     dg: difference(op_a[23:16], op_b[23:16]),
                     db: difference(op_a[15:8], op_b[15:8]),
                     da: difference(op_a[7:0], op_b[7:0]),
                     c: op_c,
                     d: op_d,
-                    ..c4
                 },
-                tx6: CombStage {
+                tx6: Comb6 {
+                    pix: c5.pix,
+                    drawn: c5.drawn,
                     pr: product(c5.dr, c5.c[35:27]),
                     pg: product(c5.dg, c5.c[26:18]),
                     pb: product(c5.db, c5.c[17:9]),
                     pa: product(c5.da, c5.c[8:0]),
-                    ..c5
+                    d: c5.d,
                 },
-                tx7: CombStage {
+                tx7: Comb7 {
+                    pix: c6.pix,
+                    drawn: c6.drawn,
                     out: finish(c6.pr, c6.d[31:24])
                         @ finish(c6.pg, c6.d[23:16])
                         @ finish(c6.pb, c6.d[15:8])
                         @ finish(c6.pa, c6.d[7:0]),
-                    ..c6
                 },
                 filling: if tx_miss { 1 } else if fill_done { 0 } else { self.filling },
                 fill_got: if fill_done | !texeling { 0 } else if fill_word { (self.fill_got + 1) as u5 wrap } else { self.fill_got },
-                fill_tag: if tx_miss { self.tx3_addr[31:12] } else { self.fill_tag },
-                fill_line: if tx_miss { self.tx3_addr[11:4] } else { self.fill_line },
+                fill_tag: if tx_miss { miss_tag } else { self.fill_tag },
+                fill_line: if tx_miss { miss_line } else { self.fill_line },
                 need_flush: flush | (self.need_flush & !flushing),
                 flush_line: if flushing { (self.flush_line + 1) as u8 wrap } else { 0 },
                 pix: if stepping {
@@ -1358,14 +1677,16 @@ impl Raster {
                 tile: self.tile.next(read_ptr, cwe, cwaddr, cwdata[23:19] @ cwdata[15:10] @ cwdata[7:3]),
                 ztile: self.ztile.next(zraddr, zwe, zwaddr, zwdata),
                 stile: self.stile.next(self.tx1_pix, self.zt_valid, self.zt_pix, self.zt_shade),
-                atile: self.atile.next(self.tx_issue[5:0], t12.valid, t12.pix, t12.entry),
-                ctag: self.ctag.next(
-                    a1[11:4],
-                    fill_done | flushing,
-                    if flushing { self.flush_line } else { self.fill_line },
-                    if flushing { 0 } else { 1_u1 @ self.fill_tag },
-                ),
-                cdata: self.cdata.next(a1[11:0], fill_word, self.fill_line @ self.fill_got[3:0], zword),
+                atile: self.atile.next(self.tx_issue[5:0], t13.valid, t13.pix, t13.entry),
+                btile: self.btile.next(self.tx_issue[5:0], t13.valid, t13.pix, t13.entry2),
+                ctag0: self.ctag0.next(tag_index(0, a1), (fill_done & tag_bank == 0) | flushing, tag_waddr, tag_wdata),
+                ctag1: self.ctag1.next(tag_index(1, a1), (fill_done & tag_bank == 1) | flushing, tag_waddr, tag_wdata),
+                ctag2: self.ctag2.next(tag_index(2, a1), (fill_done & tag_bank == 2) | flushing, tag_waddr, tag_wdata),
+                ctag3: self.ctag3.next(tag_index(3, a1), (fill_done & tag_bank == 3) | flushing, tag_waddr, tag_wdata),
+                cdata0: self.cdata0.next(bank_addr(0, a1), fill_word & data_bank == 0, data_waddr, zword),
+                cdata1: self.cdata1.next(bank_addr(1, a1), fill_word & data_bank == 1, data_waddr, zword),
+                cdata2: self.cdata2.next(bank_addr(2, a1), fill_word & data_bank == 2, data_waddr, zword),
+                cdata3: self.cdata3.next(bank_addr(3, a1), fill_word & data_bank == 3, data_waddr, zword),
                 seeds: self.seeds.next(normal[30:21]),
         }
     }
@@ -1639,18 +1960,46 @@ fn size_mask(log2: u4) -> u10 {
     (((1_u11 << log2) as u11 wrap) - 1) as u10 wrap
 }
 
-// A texel coordinate's texel along it, by its wrap mode: 0 repeat,
-// 1 clamp to the edge, 2 mirror, 3 (reserved) repeat; the texture is
-// 2^log2 texels along it, `size_mask` being 2^log2 - 1 (texture.rs
-// `wrap`).
-fn wrap_texel(u: i20, log2: u4, size_mask: u10, mode: u2) -> u10 {
-    let ui = u >> 4;
-    let low = (ui as u16 wrap)[9:0];
-    let flipped = (((ui as u16 wrap) >> log2)[0:0]) == 1;
+// The first column (or row) a sample takes, whole texels before
+// wrapping, from the coordinate (4 fraction bits): nearest, the one it is
+// in; bilinear, the one half a texel before it is in (texture.rs `taps`).
+fn first_index(u: i20, bilinear: u1) -> i17 {
+    if bilinear == 1 {
+        (((u as i21 wrap) - 8) as i21 wrap) >> 4
+    } else {
+        (u as i21 wrap) >> 4
+    }
+}
+
+// The column (or row) after it, before wrapping.
+fn next_index(u: i20, bilinear: u1) -> i17 {
+    if bilinear == 1 {
+        (((u as i21 wrap) + 8) as i21 wrap) >> 4
+    } else {
+        (((u as i21 wrap) + 16) as i21 wrap) >> 4
+    }
+}
+
+// The next column's (or row's) weight, sixteenths: bilinear, the fraction
+// of the coordinate less half a texel; nearest, none.
+fn weight(u: i20, bilinear: u1) -> u4 {
+    if bilinear == 1 {
+        (u as u20 wrap)[3:0] ^ 8
+    } else {
+        0
+    }
+}
+
+// A texel index's texel along it, by its wrap mode: 0 repeat, 1 clamp to
+// the edge, 2 mirror, 3 (reserved) repeat; the texture is 2^log2 texels
+// along it, `size_mask` being 2^log2 - 1 (texture.rs `wrap_index`).
+fn wrap_texel(ui: i17, log2: u4, size_mask: u10, mode: u2) -> u10 {
+    let low = (ui as u17 wrap)[9:0];
+    let flipped = (((ui as u17 wrap) >> log2)[0:0]) == 1;
     if mode == 1 {
         if ui < 0 {
             0
-        } else if ui > (0_u6 @ size_mask) as i16 wrap {
+        } else if ui > (0_u7 @ size_mask) as i17 wrap {
             size_mask
         } else {
             low
@@ -1660,6 +2009,111 @@ fn wrap_texel(u: i20, log2: u4, size_mask: u10, mode: u2) -> u10 {
     } else {
         low & size_mask
     }
+}
+
+// The cache tag of the block at block row `by` and column `bx`: the
+// texture's base plus its block number, the row shifted by the width in
+// blocks' log2.
+fn block_tag(base: u20, by: u8, bx: u8, bshift: u4) -> u20 {
+    (base + (0_u4 @ (((0_u8 @ by) << bshift) | (0_u8 @ bx)))) as u20 wrap
+}
+
+// Tag bank k's read address for a pixel's texel addresses (an `atile`
+// entry): the line of whichever of the pixel's blocks is in that bank (by
+// the parity of its column and row).
+fn tag_index(k: u2, e: u64) -> u6 {
+    let u = if e[20:20] == k[0:0] { e[23:18] } else { e[17:12] };
+    let v = if e[8:8] == k[1:1] { e[11:6] } else { e[5:0] };
+    v[5:3] @ u[5:3]
+}
+
+// Texel bank k's read address for an `atile` entry: whichever of the
+// pixel's texels is in that bank (by the parity of its column and row).
+fn bank_addr(k: u2, e: u64) -> u10 {
+    let u = if e[18:18] == k[0:0] { e[23:18] } else { e[17:12] };
+    let v = if e[6:6] == k[1:1] { e[11:6] } else { e[5:0] };
+    v[5:2] @ u[5:2] @ v[1:1] @ u[1:1]
+}
+
+// Bank k's value of four.
+fn pick21(k: u2, a: u21, b: u21, c: u21, d: u21) -> u21 {
+    if k == 0 {
+        a
+    } else if k == 1 {
+        b
+    } else if k == 2 {
+        c
+    } else {
+        d
+    }
+}
+
+fn pick16(k: u2, a: u16, b: u16, c: u16, d: u16) -> u16 {
+    if k == 0 {
+        a
+    } else if k == 1 {
+        b
+    } else if k == 2 {
+        c
+    } else {
+        d
+    }
+}
+
+// Each channel of b less a, 9 bits signed.
+fn differences(b: u32, a: u32) -> u36 {
+    (difference(b[31:24], a[31:24]) as u9 wrap)
+        @ (difference(b[23:16], a[23:16]) as u9 wrap)
+        @ (difference(b[15:8], a[15:8]) as u9 wrap)
+        @ (difference(b[7:0], a[7:0]) as u9 wrap)
+}
+
+// d x f, f 0 to 15, by shifts and adds (|d| x 15 fits 17 bits).
+fn times4(d: i13, f: u4) -> i17 {
+    let w = d as i17 wrap;
+    let a: i17 = if f[0:0] == 1 { w } else { 0 };
+    let b: i17 = if f[1:1] == 1 { ((w as u17 wrap)[15:0] @ 0_u1) as i17 wrap } else { 0 };
+    let c: i17 = if f[2:2] == 1 { ((w as u17 wrap)[14:0] @ 0_u2) as i17 wrap } else { 0 };
+    let e: i17 = if f[3:3] == 1 { ((w as u17 wrap)[13:0] @ 0_u3) as i17 wrap } else { 0 };
+    (a + b + c + e) as i17 wrap
+}
+
+// 16 x a + d x f: a blended towards a + d by f sixteenths (texture.rs
+// `lerp16`), which is never negative nor over 16 bits here.
+fn lerp16(a16: u16, d: i13, f: u4) -> u16 {
+    (((0_u2 @ a16) as i18 wrap) + (times4(d, f) as i18 wrap)) as u16 wrap
+}
+
+// One channel of a row blended across: 12 bits, 4 fraction bits.
+fn row(a: u8, d: u9, f: u4) -> u12 {
+    lerp16(0_u4 @ a @ 0_u4, (d as i9 wrap) as i13 wrap, f)[11:0]
+}
+
+// Each channel of a row blended across.
+fn rows(a: u32, d: u36, f: u4) -> u48 {
+    row(a[31:24], d[35:27], f) @ row(a[23:16], d[26:18], f) @ row(a[15:8], d[17:9], f) @ row(a[7:0], d[8:0], f)
+}
+
+// One channel of the second row less the first, 13 bits signed.
+fn row_difference(r1: u12, r0: u12) -> u13 {
+    (((0_u1 @ r1) as i13 wrap) - ((0_u1 @ r0) as i13 wrap)) as u13 wrap
+}
+
+fn row_differences(r1: u48, r0: u48) -> u52 {
+    row_difference(r1[47:36], r0[47:36])
+        @ row_difference(r1[35:24], r0[35:24])
+        @ row_difference(r1[23:12], r0[23:12])
+        @ row_difference(r1[11:0], r0[11:0])
+}
+
+// One channel of the rows blended down, rounded to 8 bits.
+fn blend1(r0: u12, dv: u13, f: u4) -> u8 {
+    ((lerp16(r0 @ 0_u4, dv as i13 wrap, f) + 128) as u16 wrap)[15:8]
+}
+
+// The sample: the rows blended down, each channel (texture.rs `filter`).
+fn blend(r0: u48, dv: u52, f: u4) -> u32 {
+    blend1(r0[47:36], dv[51:39], f) @ blend1(r0[35:24], dv[38:26], f) @ blend1(r0[23:12], dv[25:13], f) @ blend1(r0[11:0], dv[12:0], f)
 }
 
 // A texel as 8 bits a channel, R @ G @ B @ A: RGB565 with each field's

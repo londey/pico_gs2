@@ -141,6 +141,11 @@ pub struct SdramController {
     dq_out: u16 = 0,
     // A request was taken last cycle.
     accepted: u1 = 0,
+    // A word of write data is taken this cycle: free, in ACCESS, writing.
+    // A function of the other registers, kept as a register of its own so
+    // that the output depends on no input, even through the generated
+    // Verilog's one `always_comb` (which `wdata` is read in).
+    wtake: u1 = 0,
     dq_oe: u1 = 0,
     // Refreshes still to do in the power-up sequence.
     init_refreshes: u4 = INIT_REFRESHES,
@@ -173,7 +178,7 @@ impl SdramController {
         };
         let idle = free & self.state == State::Idle;
         let accepted = idle & !refresh_due & valid;
-        let wtake = free & self.state == State::Access & self.write;
+        let wtake = self.wtake;
 
         // What every cycle does unless a command is issued: a NOP, the
         // waits and counters moving on, DQ registered.
@@ -294,6 +299,14 @@ impl SdramController {
             wtake: wtake,
             rdata: if self.rd_pipe[READ_CAPTURE:READ_CAPTURE] == 1 { Some(self.dq_q) } else { None },
         };
-        (Self { rd_pipe: self.rd_pipe[3:0] @ (next.cmd == CMD_READ), accepted: accepted, ..next }, out)
+        (
+            Self {
+                rd_pipe: self.rd_pipe[3:0] @ (next.cmd == CMD_READ),
+                accepted: accepted,
+                wtake: next.delay == 0 & next.state == State::Access & next.write == 1,
+                ..next
+            },
+            out,
+        )
     }
 }

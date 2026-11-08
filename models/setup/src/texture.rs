@@ -89,7 +89,21 @@ pub fn coordinate(s_count: i64, recip: (u64, u32), log2: u8) -> i64 {
 ///
 /// The texel's column (or row), `0` to `2^log2 - 1`.
 pub fn wrap(u: i64, log2: u8, wrap: Wrap) -> u32 {
-    let ui = u >> 4;
+    wrap_index(u >> 4, log2, wrap)
+}
+
+/// A texel index brought into the texture by a wrap mode.
+///
+/// # Arguments
+///
+/// * `ui` - The index, whole texels.
+/// * `log2` - log₂ of the texture's size along it.
+/// * `wrap` - The wrap mode.
+///
+/// # Returns
+///
+/// The texel's column (or row), `0` to `2^log2 - 1`.
+pub fn wrap_index(ui: i64, log2: u8, wrap: Wrap) -> u32 {
     let size = 1_i64 << log2;
     let w = match wrap {
         Wrap::Repeat => ui & (size - 1),
@@ -98,6 +112,88 @@ pub fn wrap(u: i64, log2: u8, wrap: Wrap) -> u32 {
         Wrap::Mirror => ui & (size - 1),
     };
     u32::try_from(w).expect("in the texture")
+}
+
+/// The texels a sample takes along one axis: the first, the one after it
+/// (each wrapped), and the second's weight in sixteenths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Taps {
+    /// The first texel's column (or row).
+    pub first: u32,
+
+    /// The next texel's column (or row), wrapped on its own: equal to
+    /// `first` at a clamped or mirrored edge.
+    pub second: u32,
+
+    /// The second texel's weight, 0 to 15 sixteenths; always 0 sampling
+    /// nearest.
+    pub weight: u8,
+}
+
+/// The texels a sample takes along one axis (host-interface.md §6.3):
+/// nearest, `⌊U⌋` with no weight on the next; bilinear, the two around
+/// `U − ½`, weighted by its fraction.
+///
+/// # Arguments
+///
+/// * `u` - The coordinate, 4 fraction bits.
+/// * `log2` - log₂ of the texture's size along it.
+/// * `wrap` - The wrap mode.
+/// * `bilinear` - Bilinear filtering, else nearest.
+///
+/// # Returns
+///
+/// The taps.
+pub fn taps(u: i64, log2: u8, wrap: Wrap, bilinear: bool) -> Taps {
+    let u = if bilinear { u - 8 } else { u };
+    let ui = u >> 4;
+    Taps {
+        first: wrap_index(ui, log2, wrap),
+        second: wrap_index(ui + 1, log2, wrap),
+        weight: if bilinear {
+            u8::try_from(u & 0xF).expect("4 bits")
+        } else {
+            0
+        },
+    }
+}
+
+/// Two values blended in sixteenths: `16·a + (b − a)·f`, 4 more fraction
+/// bits than its inputs.
+///
+/// # Arguments
+///
+/// * `a` - The first value.
+/// * `b` - The second.
+/// * `f` - The second's weight, 0 to 15.
+///
+/// # Returns
+///
+/// The blend, `a·(16 − f) + b·f`.
+fn lerp16(a: i64, b: i64, f: u8) -> i64 {
+    16 * a + (b - a) * i64::from(f)
+}
+
+/// The bilinear blend of four texels, each channel separately: across in
+/// U along each row (12 bits), then down in V, rounded to 8 bits. With
+/// both weights 0 it is `t[0][0]` exactly.
+///
+/// # Arguments
+///
+/// * `t` - The texels, `t[row][column]`: (first U, first V), (second U,
+///   first V); then the second row.
+/// * `fu` - The second column's weight, sixteenths.
+/// * `fv` - The second row's weight, sixteenths.
+///
+/// # Returns
+///
+/// R, G, B and A.
+pub fn filter(t: [[[u8; 4]; 2]; 2], fu: u8, fv: u8) -> [u8; 4] {
+    std::array::from_fn(|c| {
+        let row = |r: usize| lerp16(i64::from(t[r][0][c]), i64::from(t[r][1][c]), fu);
+        let v = (lerp16(row(0), row(1), fv) + 128) >> 8;
+        u8::try_from(v).expect("a blend of bytes is a byte")
+    })
 }
 
 /// Where a texel is: its word address, and its place in the texture cache.
@@ -375,5 +471,90 @@ mod tests {
         }
         assert_eq!(rgb565([255, 255, 255]), 0xFFFF);
         assert_eq!(rgb565([0x84, 0x82, 0x08]), 0x8401);
+    }
+
+    /// Bilinear taps sit around `U − ½`; nearest takes `⌊U⌋` with no
+    /// weight; at a clamped or mirrored edge both taps are the same texel.
+    #[test]
+    fn taps_by_mode() {
+        // U = 5.25 texels: nearest 5; bilinear 4 and 5, 0.75 of the second.
+        assert_eq!(
+            taps(84, 4, Wrap::Repeat, false),
+            Taps {
+                first: 5,
+                second: 6,
+                weight: 0
+            }
+        );
+        assert_eq!(
+            taps(84, 4, Wrap::Repeat, true),
+            Taps {
+                first: 4,
+                second: 5,
+                weight: 12
+            }
+        );
+        // U = 0.25 of a 16-texel texture: the taps are -1 and 0.
+        assert_eq!(
+            taps(4, 4, Wrap::Repeat, true),
+            Taps {
+                first: 15,
+                second: 0,
+                weight: 12
+            }
+        );
+        assert_eq!(
+            taps(4, 4, Wrap::ClampToEdge, true),
+            Taps {
+                first: 0,
+                second: 0,
+                weight: 12
+            }
+        );
+        assert_eq!(
+            taps(4, 4, Wrap::Mirror, true),
+            Taps {
+                first: 0,
+                second: 0,
+                weight: 12
+            }
+        );
+        // At the far edge: 15 and 16.
+        assert_eq!(
+            taps(16 * 16 - 4, 4, Wrap::Mirror, true),
+            Taps {
+                first: 15,
+                second: 15,
+                weight: 4
+            }
+        );
+        assert_eq!(
+            taps(16 * 16 - 4, 4, Wrap::Repeat, true),
+            Taps {
+                first: 15,
+                second: 0,
+                weight: 4
+            }
+        );
+    }
+
+    /// The blend: corners exact, equal texels exact, midpoints rounded.
+    #[test]
+    fn filter_blends() {
+        let t = |a: u8, b: u8, c: u8, d: u8| [[[a; 4], [b; 4]], [[c; 4], [d; 4]]];
+        assert_eq!(filter(t(10, 200, 30, 255), 0, 0), [10; 4]);
+        assert_eq!(filter(t(77, 77, 77, 77), 9, 13), [77; 4]);
+        assert_eq!(filter(t(255, 255, 255, 255), 15, 15), [255; 4]);
+        // Halfway across: (0 + 255) / 2 rounded half up.
+        assert_eq!(filter(t(0, 255, 0, 255), 8, 0), [128; 4]);
+        // Three quarters across, a quarter down: the rows are
+        // 0·4 + 255·12 = 3060 and 100·16 = 1600.
+        let row0 = 3060;
+        let row1 = 16 * 100;
+        let expect = (16 * row0 + (row1 - row0) * 4 + 128) >> 8;
+        assert_eq!(
+            filter(t(0, 255, 100, 100), 12, 4),
+            [u8::try_from(expect).expect("byte"); 4]
+        );
     }
 }

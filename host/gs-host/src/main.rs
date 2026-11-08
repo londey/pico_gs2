@@ -6,7 +6,8 @@
 //! reads `ID` and `STATUS`, uploads a texture and streams a textured cube
 //! turned live over a dark blue background for a while, then reads `STATUS`
 //! again and reports the frames shown, the time a frame takes to draw and
-//! the link's throughput. `--untextured` streams the plain cube instead;
+//! the link's throughput. The texture is filtered bilinear; `--nearest`
+//! samples it nearest, and `--untextured` streams the plain cube instead;
 //! `--combiner` shows the colour combiner and alpha test demonstration
 //! (`setup_model::demo`), each of its frames for a few seconds.
 //! Closing the port releases DTR#, and the GPU goes back to its built-in
@@ -21,7 +22,8 @@
 //! scene's frames.
 //!
 //! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]
-//! [--screenshot file.png] [--untextured | --combiner]` (`--status` reads
+//! [--screenshot file.png] [--nearest | --untextured | --combiner]`
+//! (`--status` reads
 //! `ID` and `STATUS` and streams nothing).
 
 #![deny(unsafe_code)]
@@ -75,6 +77,9 @@ struct Args {
     /// Save the frame on screen here, and stream nothing.
     screenshot: Option<String>,
 
+    /// Sample the cube's texture nearest, not bilinear.
+    nearest: bool,
+
     /// Stream the cube without its texture.
     untextured: bool,
 
@@ -97,6 +102,7 @@ fn parse_args() -> Result<Args> {
         seconds: 10.0,
         status_only: false,
         screenshot: None,
+        nearest: false,
         untextured: false,
         combiner: false,
     };
@@ -112,6 +118,7 @@ fn parse_args() -> Result<Args> {
                     .context("--seconds needs a number")?;
             }
             "--status" => args.status_only = true,
+            "--nearest" => args.nearest = true,
             "--untextured" => args.untextured = true,
             "--combiner" => args.combiner = true,
             "--screenshot" => {
@@ -119,7 +126,7 @@ fn parse_args() -> Result<Args> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png] [--untextured | --combiner]"
+                    "usage: gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status] [--screenshot file.png] [--nearest | --untextured | --combiner]"
                 );
                 std::process::exit(0);
             }
@@ -414,15 +421,17 @@ fn save_png(path: &str, frame: &[u16]) -> Result<()> {
 /// # Arguments
 ///
 /// * `link` - The link, connected.
+/// * `nearest` - Sample it nearest rather than bilinear.
 ///
 /// # Returns
 ///
-/// Its `TEX0_CFG`, enabled, and the transactions that uploaded it.
+/// Its `TEX0_CFG`, enabled, filtered bilinear unless `nearest`, and the
+/// transactions that uploaded it.
 ///
 /// # Errors
 ///
 /// The link fails.
-fn upload_cube_texture(link: &mut Link) -> Result<(Tex0Cfg, Vec<Transaction>)> {
+fn upload_cube_texture(link: &mut Link, nearest: bool) -> Result<(Tex0Cfg, Vec<Transaction>)> {
     let texels = cube_texture();
     let size = 1 << CUBE_TEXTURE_LOG2;
     let mut tiled = vec![0; texels.len()];
@@ -444,6 +453,7 @@ fn upload_cube_texture(link: &mut Link) -> Result<(Tex0Cfg, Vec<Transaction>)> {
         width_log2: CUBE_TEXTURE_LOG2,
         height_log2: CUBE_TEXTURE_LOG2,
         base: u16::try_from(dword / 64)?,
+        bilinear: !nearest,
         ..Tex0Cfg::default()
     };
     Ok((cfg, txns))
@@ -637,7 +647,7 @@ fn main() -> Result<()> {
     let (tex, upload) = if args.untextured {
         (None, Vec::new())
     } else {
-        let (cfg, upload) = upload_cube_texture(&mut link)?;
+        let (cfg, upload) = upload_cube_texture(&mut link, args.nearest)?;
         (Some(cfg), upload)
     };
     println!(

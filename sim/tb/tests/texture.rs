@@ -5,15 +5,19 @@
 //! textures with `MEM_DATA` and draws four frames of its own:
 //!
 //! 1. A floor in steep perspective (Q from 1 down to 1/8, four repeats of a
-//!    32 × 32 RGB565 texture); a triangle clamping S and mirroring T,
-//!    affine; a 16 × 16 ARGB4444 texture on a triangle whose vertex colours
-//!    it is multiplied by; and an untextured triangle crossing the floor in
-//!    depth.
+//!    32 × 32 RGB565 texture), sampled nearest; a triangle clamping S and
+//!    mirroring T, affine, filtered bilinear (so its samples at the clamped
+//!    and mirrored edges take one texel twice); a 16 × 16 ARGB4444 texture,
+//!    bilinear, mirrored in S and repeating in T, on a triangle whose
+//!    vertex colours it is multiplied by; and an untextured triangle
+//!    crossing the floor in depth.
 //! 2. The floor again, after the 32 × 32 texture is uploaded again with
 //!    different texels: the cache must not keep the old ones.
 //! 3. A 128 × 32 texture, wider than the cache's 64 × 64-texel window,
-//!    across most of the screen.
-//! 4. The textured cube `gs-host` streams (`scene::textured_cube_at`).
+//!    across most of the screen in perspective, bilinear (its samples'
+//!    four texels are often in two or four blocks, missed together).
+//! 4. The textured cube `gs-host` streams (`scene::textured_cube_at`),
+//!    bilinear.
 //!
 //! Every frame shown is whole and pixel-exact against the reference
 //! renderer on the same transactions: the ROM's, then the host's in order.
@@ -124,13 +128,14 @@ impl Texture {
         }
     }
 
-    /// `TEX0_CFG` with wrap modes.
-    fn select(&self, u_wrap: Wrap, v_wrap: Wrap) -> Transaction {
+    /// `TEX0_CFG` with wrap modes and a filter.
+    fn select(&self, u_wrap: Wrap, v_wrap: Wrap, bilinear: bool) -> Transaction {
         Transaction::write(
             reg::TEX0_CFG,
             Tex0Cfg {
                 u_wrap,
                 v_wrap,
+                bilinear,
                 ..self.cfg
             }
             .bits(),
@@ -289,11 +294,12 @@ fn host_transactions() -> (Vec<Transaction>, Vec<Texture>) {
     txns.extend(b.upload());
     txns.push(frame(false));
 
-    // 1. The floor; a clamped and mirrored triangle; a modulated ARGB4444
-    // triangle; an untextured triangle through the floor.
-    txns.push(a.select(Wrap::Repeat, Wrap::Repeat));
+    // 1. The floor; a clamped and mirrored triangle, filtered; a modulated
+    // ARGB4444 triangle, filtered; an untextured triangle through the
+    // floor.
+    txns.push(a.select(Wrap::Repeat, Wrap::Repeat, false));
     txns.extend(floor(4.0, 3000));
-    txns.push(a.select(Wrap::ClampToEdge, Wrap::Mirror));
+    txns.push(a.select(Wrap::ClampToEdge, Wrap::Mirror, true));
     let affine = |x: f64, y: f64, s: f64, t: f64| V {
         x,
         y,
@@ -308,7 +314,7 @@ fn host_transactions() -> (Vec<Transaction>, Vec<Texture>) {
         affine(630.0, 10.0, 1.5, -1.0),
         affine(630.0, 110.0, 1.5, 1.75),
     ]));
-    txns.push(b.select(Wrap::Mirror, Wrap::Repeat));
+    txns.push(b.select(Wrap::Mirror, Wrap::Repeat, true));
     let tinted = |x: f64, y: f64, s: f64, t: f64, rgb: [u8; 3]| V {
         x,
         y,
@@ -336,13 +342,14 @@ fn host_transactions() -> (Vec<Transaction>, Vec<Texture>) {
 
     // 2. The floor after the texture is uploaded again.
     txns.extend(a2.upload());
-    txns.push(a.select(Wrap::Repeat, Wrap::Repeat));
+    txns.push(a.select(Wrap::Repeat, Wrap::Repeat, false));
     txns.extend(floor(4.0, 3000));
     txns.push(frame(true));
 
-    // 3. A texture wider than the cache's window, across the screen.
+    // 3. A texture wider than the cache's window, across the screen,
+    // filtered.
     let mut preloaded = Vec::new();
-    txns.push(c.select(Wrap::Repeat, Wrap::Repeat));
+    txns.push(c.select(Wrap::Repeat, Wrap::Repeat, true));
     let big = |x: f64, y: f64, q: f64, s: f64, t: f64| V {
         x,
         y,
@@ -374,7 +381,14 @@ fn host_transactions() -> (Vec<Transaction>, Vec<Texture>) {
     );
     preloaded.push(c);
     preloaded.push(cube);
-    txns.extend(textured_cube_at(0.3, HOST_BACKGROUND, preloaded[1].cfg));
+    txns.extend(textured_cube_at(
+        0.3,
+        HOST_BACKGROUND,
+        Tex0Cfg {
+            bilinear: true,
+            ..preloaded[1].cfg
+        },
+    ));
     (txns, preloaded)
 }
 
