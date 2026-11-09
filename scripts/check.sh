@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Type-check the design, run its directed stimulus tests and the board-level
-# testbenches, then format check, lint and test the Rust workspace. Run via
+# Type-check and lint the design, run its directed stimulus tests and the
+# board-level testbenches, then format check, lint and test the Rust
+# workspace. Run via
 # `just check`, which builds first.
 #
 # The slow parts are independent runs (co-simulations, test binaries, the
@@ -43,11 +44,11 @@ parallel() {
 }
 
 # How many `sinter sim --cosim` runs of the recorded stimulus fit in memory
-# at once: each holds about 8 GB for the longest files.
+# at once: the longest (16 million cycles) holds about 11 GB.
 cosim_slots() {
     local avail
     avail=$(awk '/MemAvailable/ { print $2 }' /proc/meminfo)
-    local slots=$((avail / (8 * 1024 * 1024)))
+    local slots=$((avail / (12 * 1024 * 1024)))
     echo $((slots < 1 ? 1 : slots))
 }
 
@@ -68,17 +69,29 @@ for line in sys.stdin:
 echo "==> sinter check hw/gpu.snt"
 sinter check hw/gpu.snt
 
-# Runs a stimulus file, <root>.<case>.csv, against hw/<root>.snt in the
-# simulator and, with --cosim, in the generated Verilog under Verilator,
-# failing on any expectation or any difference between the two.
+scripts/lint.sh
+
+# The design a stimulus file, <root>.<case>.csv, drives: hw/<root>.snt.
+root_of() {
+    local name
+    name=$(basename "$1" .csv)
+    echo "hw/${name%%.*}.snt"
+}
+
+# Runs a stimulus file against its design in the compiled simulator and,
+# with --cosim, in the generated Verilog under Verilator, failing on any
+# expectation or any difference between the two. Each run builds its own
+# simulator, in build/sim/<case>/: sinter sim writes the stimulus to a fixed
+# file in its --sim-dir, so runs sharing one would overwrite each other's
+# (docs/sinter-requirements.md R12).
 cosim() {
     local csv=$1
     local name root
     name=$(basename "$csv" .csv)
-    root="hw/${name%%.*}.snt"
+    root=$(root_of "$csv")
     echo "==> sinter sim $root --stimulus $csv --cosim"
-    RUST_LOG=warn sinter sim "$root" --stimulus "$csv" \
-        --cosim --cosim-dir "build/cosim/$name" > /dev/null
+    RUST_LOG=warn sinter sim "$root" --stimulus "$csv" --quiet \
+        --sim-dir "build/sim/$name" --cosim --cosim-dir "build/cosim/$name" > /dev/null
 }
 
 # Directed tests: hw/tests/<root>.<case>.csv.
@@ -93,7 +106,7 @@ done | parallel directed
 # long clk_core-to-symbol delays. (Verilator wrongly reports the
 # testbench's task and function locals as unused, so that one warning is
 # off for the testbench only; board/*.sv itself is linted with all of
-# them by `just lint`.)
+# them by lint.sh, above.)
 echo "==> verilator board/tb/tmds_gearbox_tb.sv"
 tb=build/verilator/tmds_gearbox_tb
 verilator --binary --timing -Wall -Wno-UNUSEDSIGNAL --top-module tmds_gearbox_tb \

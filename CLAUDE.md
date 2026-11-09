@@ -68,7 +68,7 @@ bitstreams all live in `build/`.
 |---|---|
 | `just gen` | `setup-gen` (micro-ROMs into `build/gen/`), then `sinter build` of `hw/gpu.snt` into `build/sinter` and `hw/setup_tb.snt` into `build/sinter-setup` |
 | `just build` | `gen`, then `cargo build` in `sim/` |
-| `just check` | `build`, then `sinter check`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, then the stimulus the Rust tests recorded in `build/stimulus/`; every stimulus file runs with `--cosim` (simulator vs Verilator) |
+| `just check` | `build`, then `sinter check`, `just lint`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, then the stimulus the Rust tests recorded in `build/stimulus/`; every stimulus file runs with `--cosim` (simulator vs Verilator) |
 | `just lint` | Verilator `--lint-only -Wall` over `board/*.sv` and the generated `.sv` |
 | `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
 | `just setup-report` | place and route the setup engine alone at 75 MHz; resources, Fmax, critical path |
@@ -85,7 +85,7 @@ bitstreams all live in `build/`.
 
 Sinter is new; don't guess at it. The book (user guide + language
 reference) is at
-`https://github.com/sinter-lang/sinter-lang/tree/v1.0.0-rc.2/docs/book/src`
+`https://github.com/sinter-lang/sinter-lang/tree/v1.0.0-rc.3/docs/book/src`
 (start with `tutorial/`, `reference/state.md`, `reference/hierarchy.md`,
 `reference/expressions.md`, `reference/clock-domains.md`). The generated
 interfaces are in `docs/generated-verilog.md` and `docs/generated-rust.md`,
@@ -132,7 +132,12 @@ v1.0.0-rc.2 added `#[no_reset]`, `#[storage(regs|lutram|bram)]` on memories,
 `-D NAME=VALUE` constant overrides, `#[params(..)]` on `#[verilog]` bindings,
 ECP5 LPF output (unused: `board/top.sv` is the top level) and
 `sinter sim --cosim`, which `just check` runs on every stimulus file (ADR
-0005). Known gaps: `--faults` doesn't work with
+0005). v1.0.0-rc.3 (pinned) compiles `sinter sim`: it builds the design's
+Rust simulator with cargo in `--sim-dir` and runs that, about 90× faster than
+rc.2's interpreter on the GPU (`--interpret` keeps the interpreter); `--quiet`
+drops the per-cycle table. Runs sharing a `--sim-dir` overwrite each other's
+stimulus there, so give concurrent runs their own (`check.sh` does). Known
+gaps: `--faults` doesn't work with
 `#[module]`; a `#[module]` in a child source module (`video::TmdsEncoder`)
 gets a simulator crate and type named `video__…`, which rustc warns about
 (harmless, in the generated crate); `async_fifo`'s write side recomputes its

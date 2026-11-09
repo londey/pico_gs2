@@ -49,7 +49,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
     && just --version
 
 # --- sinter (pinned static binary, checksum-verified) ------------------------
-ARG SINTER_VERSION=v1.0.0-rc.2
+ARG SINTER_VERSION=v1.0.0-rc.3
 RUN cd /tmp \
     && base="https://github.com/sinter-lang/sinter-lang/releases/download/${SINTER_VERSION}" \
     && asset="sinter-${SINTER_VERSION}-x86_64-unknown-linux-musl.tar.gz" \

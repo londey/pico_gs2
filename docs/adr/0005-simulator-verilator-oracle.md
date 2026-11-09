@@ -22,3 +22,7 @@ the twin, not only on random inputs.
 
 - Sinter compiler bugs show up as mismatches in CI, not on the board.
 - `just check` gets slower by a Verilator build per root and the replays.
+  Under rc.2's interpreted simulator (about 26,000 cycles a second on the
+  GPU) the replays took most of a 45-minute check; rc.3 compiles the
+  simulator (about 2.3 million cycles a second), and the whole check takes
+  under 3 minutes.
