@@ -20,6 +20,10 @@ clean:
 check: build
     scripts/check.sh
 
+# Performance figures: draw times of a set of scenes, measured on the twin.
+perf: build
+    scripts/perf.sh
+
 # Verilator lint of board/ plus the generated Verilog.
 lint: gen
     scripts/lint.sh

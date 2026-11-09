@@ -69,6 +69,7 @@ bitstreams all live in `build/`.
 | `just gen` | `setup-gen` (micro-ROMs into `build/gen/`), then `sinter build` of `hw/gpu.snt` into `build/sinter` and `hw/setup_tb.snt` into `build/sinter-setup` |
 | `just build` | `gen`, then `cargo build` in `sim/` |
 | `just check` | `build`, then `sinter check`, `just lint`, the `hw/tests/*.csv` stimulus tests, the `board/tb` testbenches, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, then the stimulus the Rust tests recorded in `build/stimulus/`; every stimulus file runs with `--cosim` (simulator vs Verilator) |
+| `just perf` | the performance figures (host-interface §15): `sim/tb/examples/perf.rs`, in release mode, draws a set of scenes on the twin and prints their draw times |
 | `just lint` | Verilator `--lint-only -Wall` over `board/*.sv` and the generated `.sv` |
 | `just bitstream` | Yosys + nextpnr + ecppack into `build/fpga/top.bit`; fails if timing isn't met, including the clock crossings in `board/top.sv` that nextpnr reports but doesn't check |
 | `just setup-report` | place and route the setup engine alone at 75 MHz; resources, Fmax, critical path |

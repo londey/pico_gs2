@@ -643,7 +643,7 @@ serialisers and (later) the SPI link have clocks of their own.
   the same models; it reports the time to draw a frame.
 - Tests are checked by mutation: break the design on purpose, see them fail.
 
-== Resources and timing today
+== Resources and timing at v1.0
 
 #grid(
   columns: (1fr, 1fr),
@@ -671,18 +671,54 @@ serialisers and (later) the SPI link have clocks of their own.
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
       [`clk_core`], [81.8 MHz], [75],
-      [`clk_sclk`], [291 MHz], [187.5],
+      [`clk_sclk`], [317 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
-    The brief's whole-design budget (estimate): about 11,000 LUTs (45%), 19
-    multipliers, 27 block RAMs. Datapath registers are `#[no_reset]`: only
+    The brief's v1.0 budget (estimate, ±50%): about 15,000 cells, 17
+    multipliers, 34 block RAMs. Datapath registers are `#[no_reset]`: only
     control state is on the core reset (191 flip-flops at Phase 11).
+  ],
+)
+
+== Performance at v1.0
+
+#grid(
+  columns: (1.15fr, 1fr),
+  gutter: 1.2em,
+  [
+    #set text(size: 13pt)
+    #table(
+      columns: (1fr, auto, auto),
+      [*Scene (twin, `just perf`)*], [*ms*], [*Beyond the clear*],
+      [clear colour and depth], [9.1], [],
+      [clear depth only], [4.5], [],
+      [the screen, untextured], [32.1], [7.5 cycles/pixel],
+      [the screen, 64×64 texture], [32.8], [7.7 cycles/pixel],
+      [the screen, 256×256 minified], [64.5], [18 cycles/pixel],
+      [320 triangles of 8×8 px], [11.3], [522 cycles each],
+      [120 triangles of 32×32 px], [16.5], [4,661 cycles each],
+      [the cube, untextured], [16.7], [],
+      [the cube, nearest or bilinear], [16.8], [],
+    )
+  ],
+  [
+    #set text(size: 14pt)
+    - A 60 fps frame is 16.5 ms. Drawing costs about *460 cycles per 8×8
+      block* a triangle touches: depth read 90, pixels 64, texels and
+      combiner 75, colour and depth written 225, one after another.
+    - So after a full clear, about 1,200 blocks a frame at 60 fps: a third
+      of the screen. Small triangles: about 1,000, more than the link
+      carries.
+    - Bilinear is free; minifying a large texture more than doubles the
+      cost (no mipmaps).
+    - After v1.0: overlap each block's writes with the next block's reads,
+      and a fast clear.
   ],
 )
 
 == Status by phase
 
-#text(size: 12.5pt, table(
+#text(size: 11.5pt, table(
   columns: (auto, 1fr, auto),
   [*Phase*], [*Work*], [*Status*],
   [2–3], [toolchain, CI; 640×480 colour bars], done,
@@ -700,7 +736,7 @@ serialisers and (later) the SPI link have clocks of their own.
   [16], [textures: cache, perspective-correct sampling], done,
   [17], [colour combiner and alpha test], done,
   [18], [bilinear filtering: a banked texture cache], done,
-  [19], [v1.0 frozen for games], next,
+  [19], [v1.0 frozen for games: performance figures], done,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
@@ -709,8 +745,7 @@ serialisers and (later) the SPI link have clocks of their own.
 #set text(size: 15pt)
 
 - *Setup speed:* 99 cycles against the brief's 85. A 5-cycle multiplier
-  misses 75 MHz; next options are overlapping triangles or a second
-  multiplier, if traversal shows setup is the bottleneck.
+  misses 75 MHz. Not the bottleneck at v1.0: a block's SDRAM traffic is.
 - *Setup size:* 3,841 logic cells against the brief's 1,500, mostly the
   four-read-port register banks (four copies each in LUT RAM).
 - *Accuracy on slivers:* 16-bit attributes reach 0.5 LSB; the reciprocal's 22
@@ -719,13 +754,16 @@ serialisers and (later) the SPI link have clocks of their own.
   accumulator are checked at run time over the test corpus.
 - *Link bandwidth:* 3 Mbaud carries about 550 transactions a frame at 60
   fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
-- *Frame rate:* 66 fps for the cube, but the full clear is about half of
-  it; a fast clear (per-block flags) is the first fix if scenes get busier.
+- *Drawing speed:* about 460 cycles per 8×8 block, its SDRAM reads, pixels
+  and writes one after another, and a 9.1 ms clear in a 16.5 ms frame.
+  Overlapping blocks and a fast clear (per-block flags) are the first work
+  after v1.0.
 - *Core timing margin:* 81.8 MHz against 75, but placement moves it by
   several MHz from build to build (one Phase 16 build placed at 74).
-- *`just check` time:* 20–45 minutes, set by `sinter sim --cosim` replaying
-  12M-cycle stimulus at about 13,000 cycles a second in 7 GB (R11).
+- *`just check` time:* about 3 minutes since Sinter rc.3 compiles
+  `sinter sim` (45 before); a 16M-cycle cosim still holds 11 GB (R11).
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
-  `#[no_reset]` accepted on non-registers; power-of-two memory depths.
+  `#[no_reset]` accepted on non-registers; power-of-two memory depths;
+  concurrent `sinter sim` runs sharing a `--sim-dir` (R12).
 - *Off spec but working:* 750 Mb/s DVI pins; a 75 MHz (not 74.25 MHz) pixel
   clock.

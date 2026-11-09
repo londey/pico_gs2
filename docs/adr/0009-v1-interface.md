@@ -1,6 +1,7 @@
 # 0009: The v1.0 interface
 
-**Status:** Accepted (2026-11-08)
+**Status:** Accepted (2026-11-08). Built in Phases 15 to 18, all of it,
+bilinear included; frozen as v1.0 at Phase 19 (2026-11-09).
 
 ## Context
 
@@ -45,5 +46,8 @@ v1.0 (docs/design/host-interface.md, interface version 2) has:
   texture.
 - Frames read back over the link let the board be compared with the twin
   pixel for pixel, for the first time.
+- Drawing, not only the link, limits scenes: about 460 cycles for each
+  8 × 8 block a triangle touches, and a 9.1 ms clear (host-interface §15).
+  Faster drawing changes no register.
 - After v1.0, at reserved places: alpha blending and other depth tests,
   `ATTR1`'s second colour, a second combiner pass, SPI, meshes in GPU memory.

@@ -18,7 +18,8 @@ The setup plan is in [docs/setup.md](docs/setup.md).
 ## Building
 
 ```sh
-just check       # generate, build and run every test
+just check       # generate, build, lint and run every test
+just perf        # draw times of a set of scenes, on the twin
 just bitstream   # build/fpga/top.bit, failing if timing isn't met
 just flash       # load it onto a connected ICEpi Zero
 just ci          # everything CI runs

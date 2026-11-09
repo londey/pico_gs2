@@ -218,7 +218,7 @@ pub fn mem_read(dword: u32, n: usize) -> impl Iterator<Item = Transaction> {
     )
 }
 
-/// The serial link's line rate: 3 Mbaud, 8N1 (host-interface.md §5).
+/// The serial link's line rate: 3 Mbaud, 8N1 (host-interface.md §10).
 pub const BAUD: u32 = 3_000_000;
 
 /// Transactions the GPU's command FIFO holds: the host's starting credits.

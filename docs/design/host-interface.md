@@ -12,11 +12,12 @@ field means the same thing. ADR [0008](../adr/0008-register-host-interface.md)
 records the register interface and ADR
 [0009](../adr/0009-v1-interface.md) its v1.0 scope.
 
-**Status:** interface version 2, the v1.0 draft (Phase 14), approved 2026-11-08.
-Each register and field is marked *built* (in the design now) or with the
-phase that builds it. Version 1 (Phase 13) is built and works on the board;
-§14 lists what version 2 changes. The document is frozen as v1.0 at
-Phase 19, with what the phases between actually built.
+**Status:** v1.0, interface version 2, frozen at Phase 19 (2026-11-09).
+Everything here is built and works on the board except what is marked
+*after v1.0* (the SPI link, §11, and reserved fields and codes). Version 1
+(Phase 13) was the first; §14 lists what version 2 changes. A later change
+to the interface gets a new interface version in `ID` and its own list of
+changes.
 
 ## 1. Phases
 
@@ -28,7 +29,10 @@ Phase 19, with what the phases between actually built.
 | 16 | `phase-16-textures` | `TEX0_CFG` (§6); RGB565 and ARGB4444; the texture cache; perspective-correct nearest sampling; the wrap modes; texture × shade | Pixel-exact against the reference renderer; a textured cube on the board; frame time and cache hit rate measured |
 | 17 | `phase-17-combiner` | `CC_MODE`, `CONST0`, `CONST1` (§7); alpha test (§8); `RENDER_MODE` version 2 | Pixel-exact; a scene with cut-out alpha and the combiner's presets on the board |
 | 18 | `phase-18-bilinear` | Bilinear filtering (§6.3): a banked texture cache reading four texels a cycle; `gs-host` filters its cube | Pixel-exact; resources and timing; the filtered cube on the board |
-| 19 | `phase-19-v1` | Resources, timing and performance figures; this document frozen as v1.0 | Approved |
+| 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); this document frozen as v1.0 | Approved |
+
+Phases 15 to 18 each passed their gate: §16 lists their tests and §18 their
+runs on the board.
 
 After v1.0, in an order to be decided: the SPI link (§11) and RP2350
 firmware; alpha blending (`ALPHA_BLEND`, `DST_COLOR`); `ATTR1`'s second
@@ -92,22 +96,22 @@ cache, so the next textured triangle sees what was written.
 | 0x07 | `VERTEX_KICK_012` | W | a vertex; draws (two back, one back, this one) | built |
 | 0x08 | `VERTEX_KICK_021` | W | a vertex; draws (two back, this one, one back): the other winding | built |
 | 0x09 | `VERTEX_KICK_FAN` | W | a vertex; draws (the primitive's first, one back, this one) | built |
-| 0x10 | `TEX0_CFG` | R/W | the texture: enable, format, size, filter, wrap, address | 16 |
-| 0x18 | `CC_MODE` | R/W | the colour combiner's inputs | 17 |
-| 0x19 | `CONST0` | R/W | a constant colour for the combiner | 17 |
-| 0x1B | `CONST1` | R/W | a second constant colour | 17 |
-| 0x30 | `RENDER_MODE` | R/W | cull mode, depth test and writes, alpha test | built; version 2 in 17 |
+| 0x10 | `TEX0_CFG` | R/W | the texture: enable, format, size, filter, wrap, address | built |
+| 0x18 | `CC_MODE` | R/W | the colour combiner's inputs | built |
+| 0x19 | `CONST0` | R/W | a constant colour for the combiner | built |
+| 0x1B | `CONST1` | R/W | a second constant colour | built |
+| 0x30 | `RENDER_MODE` | R/W | cull mode, depth test and writes, alpha test | built |
 | 0x40 | `FRAME` | W | present the frame, and clear | built |
-| 0x70 | `MEM_ADDR` | R/W | the memory address `MEM_DATA` reads and writes | 15 |
-| 0x71 | `MEM_DATA` | R/W | 64 bits of GPU memory, then the next | 15 |
-| 0x7E | `STATUS` | R | frames shown, the last frame's cycles, FIFO space, the buffers shown and drawn, link errors | built; version 2 in 15 |
+| 0x70 | `MEM_ADDR` | R/W | the memory address `MEM_DATA` reads and writes | built |
+| 0x71 | `MEM_DATA` | R/W | 64 bits of GPU memory, then the next | built |
+| 0x7E | `STATUS` | R | frames shown, the last frame's cycles, FIFO space, the buffers shown and drawn, link errors | built |
 | 0x7F | `ID` | R | identification and interface version | built |
 
 pico-gs's `FB_CONFIG`, `FB_DISPLAY`, `MEM_FILL`, `PALETTEn`, `Z_RANGE` and
 `PERF_TIMESTAMP` have no counterpart: the GPU owns its buffers (§9.2),
 `FRAME` clears, and `STATUS` times frames.
 
-## 5. Vertices and primitives (built)
+## 5. Vertices and primitives
 
 ### 0x00 `ATTR0`
 
@@ -174,7 +178,7 @@ since its first vertex reuses slot 0.
 appears on the screen (Y down), in the order its kick names the vertices.
 `RENDER_MODE.CULL` discards one winding (§8).
 
-## 6. Texturing (Phases 16 and 18, built)
+## 6. Texturing
 
 One texture unit, `TEX0`. A triangle is textured if `TEX0_CFG.ENABLE` was
 set at its kick; then the setup engine runs its full program (99 cycles a
@@ -290,7 +294,7 @@ texel, so a host should keep a triangle's range of Q modest.
 There is no mipmapping: a texture seen from far away shimmers; smaller
 textures for far objects are the host's choice.
 
-### 6.4 How it is built (Phases 16 and 18)
+### 6.4 How it is built
 
 For each 8 × 8 block of a triangle, the rasteriser's pixel pass (64
 cycles) steps S′, T′ and Q with the colour and depth, and a 13-stage
@@ -327,7 +331,7 @@ blocks once with either filter).
 The depth test moved a stage later in the pixel pass (the depth compared a
 cycle after it is rounded), which took it off the critical path.
 
-## 7. The colour combiner (Phase 17, built)
+## 7. The colour combiner
 
 After texturing, each pixel's colour comes from one combiner pass, as the
 N64's one-cycle mode, for R, G and B and separately for A:
@@ -421,7 +425,7 @@ that fails the alpha test writes nothing, depth included, so cut-out
 textures (`ALPHA_TEST` = 2, `ALPHA_REF` = 128, ARGB4444 with alpha 0 or 15)
 hide what is behind them only where they are opaque, in any drawing order.
 
-### 0x40 `FRAME` (built)
+### 0x40 `FRAME`
 
 | Bits | Field |
 |---|---|
@@ -435,7 +439,9 @@ In order: if `PRESENT`, the frame being drawn is handed to the display
 then the clears apply to the buffer now being drawn. So one write,
 `PRESENT | CLEAR_COLOUR | CLEAR_DEPTH`, ends a frame and starts the next;
 the clears alone clear the current one (the first frame, or a depth-only
-clear mid-frame). Clearing colour and depth takes about 6.7 ms.
+clear mid-frame). Clearing colour and depth takes 9.1 ms, depth alone 4.5
+(§15): over half of a 60 fps frame, so a scene that covers the whole
+screen anyway can clear depth only.
 
 There are three colour buffers (ADR 0003): one shown, one drawn, the third
 finished and waiting or spare. A `PRESENT` waits, holding up the commands
@@ -445,24 +451,29 @@ the display, and a frame is never torn.
 
 ### 0x7E `STATUS`
 
-| Bits | Field | Status |
-|---|---|---|
-| 55:54 | the colour buffer being drawn, 0 to 2 | 15 |
-| 53:52 | link errors, sticky until the link resets: bit 52 a transaction arrived with the FIFO full, bit 53 a malformed byte | 15 |
-| 51:50 | the colour buffer on screen, 0 to 2 (§9.2) | 15 |
-| 49:40 | free FIFO entries | built |
-| 39:16 | cycles the last finished frame took to draw, at 75 MHz | built |
-| 15:0 | frames shown since reset (wraps) | built |
+| Bits | Field |
+|---|---|
+| 55:54 | the colour buffer being drawn, 0 to 2 |
+| 53:52 | link errors, sticky until the link resets: bit 52 a transaction arrived with the FIFO full, bit 53 a malformed byte |
+| 51:50 | the colour buffer on screen, 0 to 2 (§9.2) |
+| 49:40 | free FIFO entries |
+| 39:16 | cycles the last finished frame took to draw, at 75 MHz |
+| 15:0 | frames shown since reset (wraps) |
+
+A frame's cycles run from the end of the frame before to this one's
+`PRESENT`, leaving out only cycles spent waiting for the display with
+nothing left to draw. They include any wait for the link, so they measure
+the GPU only while the host keeps the FIFO from emptying (§15).
 
 ### 0x7F `ID`
 
 | Bits | Field |
 |---|---|
 | 63:32 | `0x50475332`, "PGS2" |
-| 31:16 | interface version: 1 now; 2 from Phase 15 |
+| 31:16 | interface version: 2 (v1.0); version 1 was Phase 13's |
 | 15:0 | 0 |
 
-## 9. GPU memory (Phase 15)
+## 9. GPU memory
 
 ### 0x70 `MEM_ADDR`, 0x71 `MEM_DATA`
 
@@ -516,7 +527,7 @@ y[8:3] × 5120 + x[9:3] × 64 + y[2:0] × 8 + x[2:0]
 of its buffer, which starts at dword `buffer × 0x100000`. `gs-proto` untiles
 it. The 230,400 pixels are 57,600 reads, about 2 s over the serial link.
 
-## 10. The serial link (built)
+## 10. The serial link
 
 The board's USB UART is an FT231X (the v1.3 PCB; its pin file calls it an
 FTDI): its TXD reaches the FPGA as `usb_rx` (ball K16), the FPGA drives its
@@ -529,7 +540,8 @@ and flow control goes over the data.
   About 300 KB/s: 33,000 transactions a second, about 550 a frame at
   60 fps. A vertex is one transaction, two when it has its own `ATTR0`, so
   a strip costs about two transactions a triangle and a frame can carry
-  about 250 triangles at 60 fps, 500 at 30.
+  about 250 triangles at 60 fps, 500 at 30. (Drawing has its own limits,
+  §15.)
 - **Host to GPU:** a write is 9 bytes, the 72 bits MSB first. A read is 1
   byte, bit 7 set and the address below.
 - **GPU to host:** a credit is `0x01`; a read's reply is `0x02` and the 8
@@ -579,7 +591,7 @@ the serial link's; SPI only carries them faster.
 `gs-proto` gets a `Link` trait (send bytes, receive bytes) with the serial
 port and SPI as two implementations; everything above it is shared.
 
-## 12. The built-in scene (built)
+## 12. The built-in scene
 
 The scene ROM holds transactions: the cube's `RENDER_MODE`, `ATTR0`,
 `VERTEX_*` and `FRAME` writes, generated by `models/setup` from the same
@@ -594,20 +606,24 @@ Sinter values are at most 64 bits, so the ROM is two of 2,048 entries:
 `ID`) marks the end. The cube is 1,825 transactions, 57 a frame.
 
 A host connecting inherits whatever state the ROM left (`RENDER_MODE`,
-and from Phase 16 the texture and combiner registers); it should write the
-state it relies on.
+`ATTR0`, the texture and combiner registers); it should write the state it
+relies on.
 
 ## 13. The host side
 
 - **`host/proto` (`gs-proto`)**: `no_std` Rust: register and field
   definitions, encoding transactions, the link framing and credit counting,
-  decoding replies; from Phase 15, tiling textures and untiling frames.
+  decoding replies, tiling textures and untiling frames.
   Used by the PC tool, the twin tests, the scene generator, and later the
   RP2350 firmware. A game project depends on it.
 - **`host/gs-host`**: a PC command-line tool. It opens the serial port,
-  reads `ID`, streams a live cube, and prints `STATUS` and the link's
-  throughput; `--status` reads `ID` and `STATUS` only. From Phase 15,
-  `--screenshot <file>` saves the frame on screen as a PNG.
+  reads `ID`, uploads the cube's texture and streams the textured cube,
+  filtered bilinear, for `--seconds` (10), and prints `STATUS` and the
+  link's throughput. `--nearest` samples nearest, `--untextured` draws the
+  plain cube, `--combiner` shows the combiner and alpha-test demo instead,
+  and `--status` reads `ID` and `STATUS` only. `--screenshot <file>` then
+  reads the frame on screen back, saves it as a PNG and compares it with
+  the reference renderer's.
   `just gs-host` builds it in the devcontainer (it needs only the C
   library) to run on the host, which has the USB port:
   `sim/target/release/gs-host --port /dev/ttyUSB0`.
@@ -629,9 +645,64 @@ Version 1 is Phase 13, as built. Version 2:
   bits, so untextured triangles can differ by one step in a channel.
 - `ID` reads interface version 2.
 
-## 15. Verification
+## 15. Performance
 
-As built in Phase 13 (`sim/tb/tests/`):
+Measured on the twin by `just perf` (`sim/tb/examples/perf.rs`), which
+draws each scene a few frames running from a host on the simulated link,
+checks the last frame pixel for pixel against the reference renderer, and
+reads its draw time as `STATUS` does. The host keeps the FIFO full, so the
+times are the GPU's alone; textures stay in the cache from frame to frame.
+A display frame is 1,237,500 cycles (16.5 ms at 75 MHz), so a frame drawn
+within that shows at 60 fps, and one within twice that at 30.
+
+| Scene | Transactions a frame | Cycles a frame | ms | Beyond the clear |
+|---|---|---|---|---|
+| clear colour and depth only | 1 | 681,114 | 9.1 | |
+| clear depth only | 1 | 336,779 | 4.5 | |
+| the screen, two untextured triangles | 11 | 2,407,224 | 32.1 | 7.5 cycles a pixel |
+| the screen, 64 × 64 texture, 1.4 to 2.5 pixels a texel, nearest or bilinear | 11 | 2,460,609 | 32.8 | 7.7 cycles a pixel |
+| the screen, 256 × 256 texture, 1.6 × 2.8 texels a pixel, nearest | 11 | 4,837,631 | 64.5 | 18.0 cycles a pixel |
+| the same, bilinear | 11 | 4,912,683 | 65.5 | 18.4 cycles a pixel |
+| the screen, 256 × 256 texture, 2.8 to 5 pixels a texel, bilinear | 11 | 2,533,353 | 33.8 | 8.0 cycles a pixel |
+| 320 untextured triangles, 8 × 8 pixels, in strips | 353 | 848,203 | 11.3 | 522 cycles a triangle |
+| 160 textured triangles, 8 × 8 pixels, in strips | 363 | 767,861 | 10.2 | 542 cycles a triangle |
+| 120 untextured triangles, 32 × 32 pixels, in strips | 141 | 1,240,490 | 16.5 | 4,661 cycles a triangle |
+| the cube, untextured | 57 | 1,250,699 | 16.7 | |
+| the cube, textured, nearest or bilinear | 65 | 1,256,638 | 16.8 | |
+
+**Where the time goes.** The rasteriser works through each 8 × 8 block a
+triangle touches in turn: it reads the block's depths (two 32-word SDRAM
+runs, about 90 cycles), steps the pixels (64), passes them through the
+texture pipeline and combiner (64 and 11 of latency, plus misses), and
+writes the colour and depth back (four runs, about 225 cycles), sharing
+the SDRAM with the display throughout. That is about 460 cycles a block,
+7 to 8 a pixel, whatever the triangle's size, and the passes don't overlap.
+
+What follows for a host:
+
+- **A 60 fps frame has room for about 1,200 blocks** after a full clear:
+  about a third of the screen's 3,600, counting a block once for each
+  triangle that touches it. At 30 fps, about the whole screen once. A depth-
+  only clear frees about 700 more blocks.
+- **Small triangles cost a block or two each**, about 520 cycles: a 60 fps
+  frame has room for about 1,000 after the clear, more than the link
+  carries (about 500 a frame untextured in strips, 250 textured, §10).
+- **Bilinear filtering is free**, and a texture costs about 3% while its
+  texels in view fit the cache's 64 × 64 window.
+- **Minifying a large texture is slow**: more than one texel a pixel misses
+  the cache on most blocks, more than doubling the cost. There are no
+  mipmaps, so use a smaller texture for a distant surface.
+- **Each change of `TEX0_CFG`, `CC_MODE`, `CONST0` or `CONST1` drains the
+  pipeline** (§3); group triangles by state.
+
+Faster drawing is for after v1.0, at the same interface: overlapping one
+block's writes with the next block's depth read and pixels could save up
+to about half of each block, and a fast clear (per-block flags) most of
+the clear.
+
+## 16. Verification
+
+Every test is in `just check`. As built in Phase 13 (`sim/tb/tests/`):
 
 - **`frame.rs`, from reset with no host:** the ROM scene's frames pixel-exact
   against the reference renderer on the same transactions.
@@ -653,8 +724,8 @@ As built in Phase 13 (`sim/tb/tests/`):
   colour on a depth-only clear; credits twice as often; `KICK_021` with the
   old odd-strip roles; a fan pivoting on two back: each fails a test.
 
-Planned, phase by phase: the reference renderer gains each feature first,
-and the twin tests compare against it pixel for pixel, as now.
+Then, phase by phase, the reference renderer gained each feature first,
+and the twin tests compare against it pixel for pixel:
 
 - **15, as built (`memory.rs`):** once the ROM's first frame is up, a host
   writes 40 words to an odd dword in bank 2's host memory, reads
@@ -718,9 +789,10 @@ and the twin tests compare against it pixel for pixel, as now.
   the tag banks ignoring column parity; a flush leaving one tag bank; a
   fetched word written to the wrong bank.
 
-## 16. Resources and timing
+## 17. Resources and timing
 
-As built (Phase 18): the GPU places and routes at 81.8 MHz (75 needed) in
+**v1.0, as built (Phase 18; unchanged at Phase 19, with Sinter
+v1.0.0-rc.3):** the GPU places and routes at 81.8 MHz (75 needed) in
 17,894 logic cells, 8,136 flip-flops, 34 DP16KD and 12 MULT18X18D (74%,
 33%, 61%, 43%). Bilinear filtering added about 2,700 cells, 1,250
 flip-flops and 7 DP16KD (three more tag banks, the texel addresses' two
@@ -787,15 +859,15 @@ Phase 18, bilinear, with every block of the frame now through the pass
 (the crossing triangles' too): 1,275 blocks, 59,756 lookups, the same
 256 misses: 99.6% hits.
 
-## 17. On the board
+## 18. On the board
 
 **Phase 18.** `gs-host --screenshot` uploaded the cube's texture in 0.03 s
 and streamed the cube, filtered bilinear, for 10 s: 609 frames sent and 608
 shown, 60.2 a second, at 3,976 transactions a second (12% of the line). The
 last frame drew in 1,226,858 cycles (61.1 frames a second), against Phase
 16's 1,165,810 for nearest. These are different frames, at different
-angles, so the numbers don't measure what filtering costs (the twin's
-cube fetches the same 256 blocks either way). The last frame read back
+angles; drawn at the same angle on the twin (§15), the cube takes the
+same cycles either way, to the cycle. The last frame read back
 matched the reference renderer's, bilinear filtering included, pixel for
 pixel.
 
