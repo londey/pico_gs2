@@ -472,8 +472,8 @@ serialisers and (later) the SPI link have clocks of their own.
       and up to four blocks are read and tested at once; blended by shifts
       and adds. Free in time; nearest misses only on its one block.
     - *Divide error:* within 1/8 texel down to Q = 1/256.
-    - *Cube:* every block fetched once, nearest or bilinear. On the board
-      (nearest): 64.3 fps drawn, read back pixel-exact.
+    - *Cube:* every block fetched once, nearest or bilinear. On the board:
+      bilinear read back pixel-exact, 61.1 fps drawn (nearest 64.3; different frames).
     - Left: the twin's frames, each pixel-exact against the reference.
   ],
 )

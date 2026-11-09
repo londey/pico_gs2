@@ -789,6 +789,16 @@ Phase 18, bilinear, with every block of the frame now through the pass
 
 ## 17. On the board
 
+**Phase 18.** `gs-host --screenshot` uploaded the cube's texture in 0.03 s
+and streamed the cube, filtered bilinear, for 10 s: 609 frames sent and 608
+shown, 60.2 a second, at 3,976 transactions a second (12% of the line). The
+last frame drew in 1,226,858 cycles (61.1 frames a second), against Phase
+16's 1,165,810 for nearest. These are different frames, at different
+angles, so the numbers don't measure what filtering costs (the twin's
+cube fetches the same 256 blocks either way). The last frame read back
+matched the reference renderer's, bilinear filtering included, pixel for
+pixel.
+
 **Phase 17.** `gs-host --combiner --screenshot` uploaded the demo's two
 textures and showed its three frames (the nine combiner settings, the
 four alpha tests and the cut-out, then the nine settings cut out by their
