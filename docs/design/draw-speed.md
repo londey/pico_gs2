@@ -6,7 +6,9 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done (§7), Phase 23 next.
+**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done (§7),
+Phase 23 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
+work counts in full only once blocks overlap.
 
 ## 1. Goal
 
@@ -70,7 +72,7 @@ the flags:
 - **Writes:** the first write to a cleared block writes all of it,
   unmasked, its undrawn pixels with the clear colour (or 0xFFFF), and
   clears its flag. A first touch that draws in only one half writes the
-  other half too, one extra 32-word run (none once Phase 23 writes a
+  other half too, one extra 32-word run (none once Phase 24 writes a
   block as one 64-word run).
 - **Scan-out:** a cleared block's half blocks fill their ring slots with
   the buffer's clear colour without an SDRAM read, so a sparse frame
@@ -88,7 +90,7 @@ would need a pass at each present writing the clear colour into its
 untouched blocks, which for a sparse frame gives back most of the colour
 clear (up to 4.5 ms).
 
-### 3.2 SDRAM throughput (Phase 23)
+### 3.2 SDRAM throughput (Phase 24)
 
 - **Overlapped runs:** while a run moves its words, the controller can
   accept the next request; if it is in another bank, it issues that bank's
@@ -101,9 +103,9 @@ clear (up to 4.5 ms).
 - **Ordering the rasteriser's runs** so that consecutive runs alternate
   between a colour bank and the depth bank, which the overlap needs.
 
-### 3.3 Overlapped blocks (Phases 24 and 25)
+### 3.3 Overlapped blocks (Phases 23 and 25)
 
-- **Phase 24, two sets of tile buffers:** the colour, depth and shade
+- **Phase 23, two sets of tile buffers:** the colour, depth and shade
   tiles and the texel-address tiles are doubled (the 64-entry LUT RAMs
   double in LUTs; `atile` and `btile` double in depth inside the block RAMs
   they already use). Block N's writes go out while block N + 1's depth
@@ -124,8 +126,8 @@ measurements.
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
-| 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
-| 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
+| 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Pixel-exact; tests of consecutive triangles in one block; mutations; resources and timing; on the board |
+| 24 | `phase-24-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
 
@@ -135,13 +137,15 @@ for the goal scene (one full-screen layer, 3,600 blocks, after a clear):
 | After | Clear | Per block, first touch | Per block, again | Goal scene |
 |---|---|---|---|---|
 | v1.0 | 681,000 | ~460 | ~460 | 2,460,000 (32.8 ms) |
-| 22, fast clear | ~7,200 | ~370 (no depth read) | ~460 | ~1,350,000 (18 ms) |
-| 23, SDRAM | ~7,200 | ~280 | ~350 | ~1,000,000 (13.5 ms) |
-| 24, writes overlapped | ~7,200 | ~220 | ~250 | ~800,000 |
-| 25, passes overlapped | ~7,200 | ~150 to 200 | ~200 | ~600,000 to 700,000 |
+| 22, fast clear (measured) | 3,603 | ~344 (no depth read) | ~440 | 1,279,202 (17.1 ms) |
+| 23, writes overlapped | 3,603 | ~190 | ~280 | ~750,000 (10 ms) |
+| 24, SDRAM | 3,603 | ~165 | ~240 | ~650,000 |
+| 25, passes overlapped | 3,603 | ~150 | ~200 | ~600,000 |
 
-So the goal may be met by Phase 23 for one layer; Phases 24 and 25 buy
-the room for overdraw, more triangles and textures that miss. If a phase
+(Rows 23 to 25 re-estimated after Phase 22, from its measurements and the
+controller's 5 cycles a run, §7.) So the goal should be met by Phase 23
+for one layer; Phases 24 and 25 buy the room for overdraw, more triangles
+and textures that miss. If a phase
 falls well short of its estimate, I report before going on.
 
 ## 5. Verification
@@ -149,12 +153,12 @@ falls well short of its estimate, I report before going on.
 - **Correctness:** every existing twin test stays pixel-exact against the
   reference renderer, which doesn't change: v1.1 changes when pixels are
   written, never what. Each phase adds the tests its change needs (Phase
-  22: read-backs of cleared buffers; Phase 23: back-to-back runs in each
-  bank pairing; Phases 24 and 25: blocks whose later triangle depends on
+  22: read-backs of cleared buffers; Phase 24: back-to-back runs in each
+  bank pairing; Phases 23 and 25: blocks whose later triangle depends on
   the earlier one's depth, so an overlap that reads stale depth fails),
   and deliberate breaks of its new logic, each caught.
 - **The SDRAM model** checks every datasheet rule on every cycle of every
-  test, which matters most in Phase 23.
+  test, which matters most in Phase 24.
 - **Scan-out** must never run short: from Phase 21 every twin test asserts
   it, since drawing will compete harder for the bus.
 - **Speed:** `just perf`'s figures are checked by `just check` from Phase
@@ -179,7 +183,7 @@ falls well short of its estimate, I report before going on.
   block's writes when they are the same block (two triangles in a row
   touching it). The rasteriser walks a triangle's blocks in order, so the
   same block comes back only for the next triangle; the overlap must
-  wait for the write when it does, and Phase 24's tests check it.
+  wait for the write when it does, and Phase 23's tests check it.
 - **Fast clear and memory access.** `MEM_DATA` reads of the GPU's buffers
   are part of the interface (frames read back); the flags must cover them
   exactly, and Phase 22's test reads back cleared, partly drawn and
@@ -288,3 +292,17 @@ The goal is 3.4% over a 60 fps frame (1,237,500). The estimate was about
 depth read and, with fewer requests from scan-out for sparse rows, the
 rasteriser's runs wait less. In a full-screen frame the SDRAM is now in
 no run for 39% of the frame: the passes, which Phases 24 and 25 overlap.
+
+### Phases 23 and 24 swapped
+
+Measured after Phase 22, the SDRAM controller's overhead is 5 cycles a
+run (ACTIVE, a wait, the words, write recovery, PRECHARGE, a wait: 37
+cycles for a 32-word write, 36 for a read), not the 8 to 10 §2 assumed.
+In the goal scene a block costs about 344 cycles: writes 183 (four runs,
+148, plus about 35 waiting for scan-out's runs), the texel pass 75, the
+pixel pass 64, the drain and the rest about 20. Overlapped runs and
+64-word runs would save about 25 cycles a block now (7%); overlapping a
+block's writes with the next block's passes would save about 150 (a
+block costs about the larger of its SDRAM time and its computing, not
+their sum). Once blocks overlap, the SDRAM is the limit, and the
+controller's savings count in full; so the overlap comes first.
