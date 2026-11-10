@@ -7,7 +7,8 @@ things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
 **Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done, and
-23 done (§7): **the goal is met** (746,840 cycles, 10 ms). Phase 24 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
+23 done (§7): **the goal is met** (746,840 cycles, 10 ms). Phase 24 in
+simulation; Phase 25 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
 work counts in full only once blocks overlap.
 
 ## 1. Goal
@@ -92,16 +93,23 @@ clear (up to 4.5 ms).
 
 ### 3.2 SDRAM throughput (Phase 24)
 
-- **Overlapped runs:** while a run moves its words, the controller can
-  accept the next request; if it is in another bank, it issues that bank's
-  ACTIVE during the current run and its first READ or WRITE right after
-  the last word, closing rows with auto-precharge (READA, WRITEA). A run
-  in the same bank waits as today. Every datasheet rule stays checked by
-  the pin-level SDRAM model.
-- **Whole-block runs:** runs of up to 64 words, so a block with both
-  halves drawn is one run, not two.
-- **Ordering the rasteriser's runs** so that consecutive runs alternate
-  between a colour bank and the depth bank, which the overlap needs.
+- **Auto-precharge:** each run's last READ or WRITE closes its row
+  (A10 high), so the next run's ACTIVE can follow the cycle after, in a
+  bank that is ready: the controller counts each bank down tWR + tRP
+  after a write and tRP after a read. A run then costs its words plus 2
+  (ACTIVE and tRCD), not plus 5. A write after a read waits one more
+  cycle, so the FPGA never drives DQ while the chip may still be floating
+  it (tHZ).
+- **Read data by when it was read:** a READ's word arrives three cycles
+  after it, by which time the next run may have started; read data goes
+  to the owner of the run three cycles before.
+- **Not done: 64-word runs.** The controller takes them, but writing a
+  block as one run would save about 4 cycles a block (2%) now that the
+  passes, not the SDRAM, set the pace (§7); worth revisiting if the
+  SDRAM becomes the limit again.
+- **Not possible at burst length 1:** opening the next bank's row during
+  a run. Every cycle of a run carries a READ or WRITE, so there is no
+  free command slot.
 
 ### 3.3 Overlapped blocks (Phases 23 and 25)
 
@@ -111,9 +119,19 @@ clear (up to 4.5 ms).
   they already use). Block N's writes go out while block N + 1's depth
   read and pixel pass run. A block then costs about the larger of its
   SDRAM traffic and its computing, not their sum.
-- **Phase 25, the two passes overlapped:** block N + 1's pixel pass runs
-  while block N's texel pass runs, so computing costs about one pass a
-  block, not two.
+- **Phase 25, the two halves of the fragment pipeline at once:** the
+  pipeline is per fragment, one a clock, but in two halves that today
+  take turns a block at a time. The front half steps the edges and
+  planes, tests depth and works out texel addresses; the back half looks
+  texels up (stalling on a cache miss), filters, combines and alpha
+  tests. Between them are per-block buffers (shades, texel addresses,
+  drawn pixels), so a miss stalls only the back half, which replays from
+  them, and hidden fragments never fetch texels. Doubling those buffers
+  lets the front half fill one block's while the back half drains the
+  last: a 64-fragment FIFO between the halves, the pipeline continuous,
+  about one pass a block instead of two. A second texture or combiner
+  stage would lengthen the back half, adding latency, not cycles a
+  fragment.
 
 ## 4. Phases
 
@@ -127,8 +145,8 @@ measurements.
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
 | 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
-| 24 | `phase-24-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
-| 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
+| 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done in simulation: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz. On the board: to do |
+| 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
 
 **Estimates**, per block a triangle touches (§2's 460 cycles today) and
@@ -357,3 +375,45 @@ the SDRAM, which is Phase 24's. Small triangles spend 17 to 19% of
 their time waiting in TEST for the writer to finish a block they share;
 Phase 25, or a later one, could test such a block's pixels against the
 writer's tile instead of waiting.
+
+### Phase 24: SDRAM
+
+- **The model first:** the pin-level SDRAM model reported any READ or
+  WRITE with A10 high as unmodelled. It now models auto-precharge from
+  the datasheet (§7.14, §11.15, §11.16): the row closes at the command;
+  a read's precharge starts the burst length after it, a write's tWR
+  after its last data; tRAS is checked from the ACTIVE to that start, and
+  tRP (so tDAL for a write) before the bank's next ACTIVE. Four new
+  datasheet tests: a run closed by its last access and the next bank's
+  ACTIVE right after, tDAL, tRAS, and no access after the row closed.
+- **The controller:** auto-precharge, a ready count per bank, the next
+  run accepted the cycle after a run's last access, a write after a read
+  a cycle later (§3.2). The first build drew wrong pictures with no
+  model violations: read data was routed to the owner of the run in
+  progress, and a read run's last words now arrive after the next run
+  has started; they now go to the owner three cycles back.
+- **Timing:** 77.2 MHz at first, the critical path a `MEM_DATA` read's
+  cleared-flag substitution (Phase 22's); the flag is now registered
+  (it is settled long before the data comes), and the GPU places at 83.5
+  MHz in 19,029 cells (78%), 8,398 flip-flops, 36 DP16KD.
+- **Tests:** pixel-exact, and the SDRAM model clean, on every twin test.
+  6 deliberate breaks, each caught: no auto-precharge; a write's bank
+  wait as a read's; every bank wait a cycle short; the next run ignoring
+  its bank's wait; a refresh not waiting for every bank; read data to
+  the current owner. The read-to-write cycle protects against overlap
+  within a cycle (tHZ), which a cycle-based model can't see; it rests
+  on the datasheet.
+
+| Scene | Phase 23 | Phase 24 |
+|---|---|---|
+| full screen, untextured | 723,086 | 698,541 |
+| **full screen, 64 × 64 bilinear (the goal)** | **746,840** | **726,644 (9.7 ms)** |
+| full screen, 256 × 256 magnified | 853,030 | 823,466 |
+| 320 triangles of 8 px | 92,627 | 92,885 |
+| 120 triangles of 32 px | 223,546 | 220,204 |
+| the cube, bilinear | 236,596 | 234,695 |
+
+About 3%, as the passes now set the pace: in the goal scene a block
+costs about 195 cycles, the pixel pass 64, the texel pass about 75, the
+drain about 13, and about 33 waiting at HANDOFF for the writer, whose
+four runs now take about 34 cycles each. Phase 25 overlaps the passes.

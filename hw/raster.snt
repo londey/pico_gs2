@@ -251,7 +251,7 @@ impl Parser {
             read: if self.state == P_READ { Some(self.t_addr[6:0]) } else { None },
             mode: self.mode,
             mem_req: if self.state == P_MEM & self.mem_step == M_REQ {
-                Some(SdramReq { write: !self.t_addr[7:7], addr: self.mem_addr @ 0_u2, len: MEM_WORDS })
+                Some(SdramReq { write: !self.t_addr[7:7], addr: self.mem_addr @ 0_u2, len: 0_u1 @ MEM_WORDS })
             } else {
                 None
             },

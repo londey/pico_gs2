@@ -115,11 +115,20 @@ struct Gpu {
     // The arbiter: the request in front of the controller, held in a
     // register until it is accepted (so that choosing it isn't on the
     // controller's paths), whose it is, and whose run the controller's
-    // words belong to.
+    // words belong to: write data as it is taken, and (`read_owner`, three
+    // cycles behind, as a READ's word arrives three cycles after it is on
+    // the pins) read data, since the next run can start right after a
+    // run's last READ.
     granted: u3 = 0,
     #[no_reset]
     granted_req: SdramReq,
     data_owner: u3 = 0,
+    // A host's MEM_DATA read is of a block cleared in its buffer (from the
+    // flags read a cycle before).
+    mem_cleared: u1 = 0,
+    owner_1: u3 = 0,
+    owner_2: u3 = 0,
+    read_owner: u3 = 0,
 
     // The host link and the triangle pipeline. `tri_flags`: the alpha
     // reference and test, write enables and depth test (RENDER_MODE bits
@@ -360,9 +369,9 @@ impl Gpu {
             OWNER_NONE
         };
         let chosen_req = if choice == OWNER_FILL {
-            SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: RUN }
+            SdramReq { write: 1, addr: 0_u6 @ self.fill_addr, len: 0_u1 @ RUN }
         } else if choice == OWNER_SCAN {
-            SdramReq { write: 0, addr: self.disp @ 0_u4 @ load_addr, len: RUN }
+            SdramReq { write: 0, addr: self.disp @ 0_u4 @ load_addr, len: 0_u1 @ RUN }
         } else if choice == OWNER_MEM {
             mem_req
         } else {
@@ -386,15 +395,18 @@ impl Gpu {
         let wtake_raster = mem.wtake & self.data_owner == OWNER_RASTER;
         let wtake_mem = mem.wtake & mem_run;
         let no_word: Option<u16> = None;
-        let rdata_scan = if self.data_owner == OWNER_SCAN { mem.rdata } else { no_word };
-        let rdata_raster = if self.data_owner == OWNER_RASTER { mem.rdata } else { no_word };
+        let rdata_scan = if self.read_owner == OWNER_SCAN { mem.rdata } else { no_word };
+        let rdata_raster = if self.read_owner == OWNER_RASTER { mem.rdata } else { no_word };
         // A host's MEM_DATA read of a block cleared in its buffer reads
         // the clear value (the rasteriser, idle, has the block's flags).
         let mem_bank = pout.mem_addr[21:20];
         let mem_in_buffers = pout.mem_addr[19:16] == 0 & pout.mem_addr[15:4] < BLOCKS;
-        let mem_cleared = mem_in_buffers & (rout.mem_flags >> mem_bank)[0:0] == 1;
+        // Registered (`mem_cleared`): MEM_ADDR is settled long before a
+        // read's first word arrives.
+        let mem_cleared_now = mem_in_buffers & (rout.mem_flags >> mem_bank)[0:0] == 1;
+        let mem_cleared = self.mem_cleared == 1;
         let mem_clear_word: u16 = if mem_bank == 3 { 0xFFFF } else { clear_colour_of(rout.clear_colours, mem_bank) };
-        let rdata_mem = if mem_run {
+        let rdata_mem = if self.read_owner == OWNER_MEM {
             match mem.rdata {
                 Some(w) => Some(if mem_cleared { mem_clear_word } else { w }),
                 None => no_word,
@@ -482,6 +494,10 @@ impl Gpu {
                 },
                 granted_req: if self.granted == OWNER_NONE { chosen_req } else { self.granted_req },
                 data_owner: if mem.accepted == 1 { self.granted } else { self.data_owner },
+                mem_cleared: if mem_cleared_now { 1 } else { 0 },
+                owner_1: self.data_owner,
+                owner_2: self.owner_1,
+                read_owner: self.owner_2,
                 link: link,
                 parser: self.parser.next(
                     !self.filling,

@@ -1,14 +1,14 @@
 clear only	3603
 depth clear only	3603
-full screen, untextured	723086
-full screen, 64x64 nearest	746840
-full screen, 64x64 bilinear	746840
-full screen, 256x256 nearest, minified	3255241
-full screen, 256x256 bilinear, minified	3351775
-full screen, 256x256 bilinear, magnified	853030
-320 triangles of 8 px, untextured	92627
-160 triangles of 8 px, nearest	49841
-120 triangles of 32 px, untextured	223546
-cube, untextured	232871
-cube, nearest	236596
-cube, bilinear	236596
+full screen, untextured	698541
+full screen, 64x64 nearest	726644
+full screen, 64x64 bilinear	726644
+full screen, 256x256 nearest, minified	3181440
+full screen, 256x256 bilinear, minified	3258290
+full screen, 256x256 bilinear, magnified	823466
+320 triangles of 8 px, untextured	92885
+160 triangles of 8 px, nearest	49674
+120 triangles of 32 px, untextured	220204
+cube, untextured	230570
+cube, nearest	234695
+cube, bilinear	234695

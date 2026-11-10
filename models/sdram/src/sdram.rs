@@ -427,7 +427,8 @@ impl Sdram {
 
     /// Cycles from `then` to now, or `u64::MAX` if it never happened.
     fn since(&self, then: Option<u64>) -> u64 {
-        then.map_or(u64::MAX, |t| self.cycle - t)
+        // A time still to come (an auto-precharge's start) is 0 cycles ago.
+        then.map_or(u64::MAX, |t| self.cycle.saturating_sub(t))
     }
 
     /// The CAS latency, or 0 before the mode register is set.
@@ -537,12 +538,7 @@ impl Sdram {
             ));
             return;
         };
-        if pins.a & A10 != 0 {
-            self.violation(format!(
-                "{} with auto-precharge (A10 high) isn't modelled",
-                command.name()
-            ));
-        }
+        let auto_precharge = pins.a & A10 != 0;
         let bank = self.banks[b];
         let Some(row) = bank.row else {
             self.violation(format!(
@@ -556,7 +552,7 @@ impl Sdram {
         });
         self.require_mode_settled(command);
         self.terminate_bursts(None);
-        if command == Command::Read {
+        let length = if command == Command::Read {
             for beat in 0..mode.burst_length {
                 self.reads.push_back(ReadBeat {
                     cycle: self.cycle + mode.cas_latency + beat,
@@ -565,6 +561,7 @@ impl Sdram {
                     column: burst_column(column, beat, mode.burst_length),
                 });
             }
+            mode.burst_length
         } else {
             let length = if mode.single_write {
                 1
@@ -578,7 +575,36 @@ impl Sdram {
                 beat: 0,
                 length,
             });
+            length
+        };
+        if auto_precharge {
+            self.auto_precharge(command, b, length);
         }
+    }
+
+    /// READ or WRITE with auto-precharge (A10 high; section 7.14): the
+    /// row closes by itself once the burst is done. A read's precharge
+    /// starts when a PRECHARGE could first have been issued, the burst
+    /// length after the READ (CAS latency - 1 clocks before its last data);
+    /// a write's tWR after its last data (so the bank can be activated
+    /// again tDAL = tWR + tRP after it). From the ACTIVE to the start of the
+    /// precharge must be at least tRAS. No other command may reach the bank
+    /// before then: its row is closed now.
+    fn auto_precharge(&mut self, command: Command, b: usize, length: u64) {
+        let start = if command == Command::Read {
+            self.cycle + length
+        } else {
+            self.cycle + (length - 1) + self.timing.wr
+        };
+        let activated = self.banks[b].activated.unwrap_or(0);
+        self.require(start.saturating_sub(activated) >= self.timing.ras, || {
+            format!(
+                "tRAS: {} with auto-precharge to bank {b} starts its precharge too soon after ACTIVE",
+                command.name()
+            )
+        });
+        self.banks[b].row = None;
+        self.banks[b].precharged = Some(start);
     }
 
     /// Ends bursts, in one bank or all: read data already in the CAS

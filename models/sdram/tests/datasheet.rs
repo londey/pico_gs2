@@ -89,6 +89,16 @@ impl Bus {
         self.drive((true, false, false), ba, column, Some(data))
     }
 
+    /// READ with auto-precharge.
+    fn read_ap(&mut self, ba: u8, column: u16) -> Dq {
+        self.drive((true, false, true), ba, column | ALL_BANKS, None)
+    }
+
+    /// WRITE with auto-precharge, driving the first data beat.
+    fn write_ap(&mut self, ba: u8, column: u16, data: u16) -> Dq {
+        self.drive((true, false, false), ba, column | ALL_BANKS, Some(data))
+    }
+
     /// PRECHARGE of one bank, or all with `a` = [`ALL_BANKS`].
     fn precharge(&mut self, ba: u8, a: u16) -> Dq {
         self.drive((false, true, false), ba, a, None)
@@ -381,4 +391,79 @@ fn reports_clock_too_fast_for_cas_latency_2() {
     let mut bus = Bus::with_timing(Timing::any_grade(7_500));
     bus.init(MODE_CL2_BL1);
     bus.assert_reported("CAS latency 2 needs tCK");
+}
+
+/// Auto-precharge (section 7.14): a run's last WRITE or READ with A10 high
+/// closes its row by itself, so another bank's ACTIVE can follow at once
+/// and the same bank's after tDAL (write) or tRP (read); the data reads
+/// back.
+#[test]
+fn auto_precharge_closes_the_row() {
+    let mut bus = Bus::new();
+    bus.init(MODE_CL2_BL1);
+    bus.active(0, 7);
+    bus.nops(bus.timing.rcd - 1);
+    bus.write(0, 1, 0x1111);
+    bus.write(0, 2, 0x2222);
+    bus.write(0, 3, 0x3333);
+    bus.write_ap(0, 4, 0x4444);
+    // Another bank at once (tRRD long met).
+    bus.active(1, 9);
+    bus.nops(bus.timing.rcd - 1);
+    bus.write(1, 0, 0x5555);
+    bus.write(1, 1, 0x6666);
+    bus.write(1, 2, 0x7777);
+    bus.write_ap(1, 3, 0x8888);
+    // Bank 0 again: tDAL after its last data has passed.
+    bus.nops(bus.timing.wr + bus.timing.rp);
+    bus.active(0, 7);
+    bus.nops(bus.timing.rcd - 1);
+    bus.read(0, 1);
+    bus.read(0, 2);
+    bus.read(0, 3);
+    let last = bus.read_ap(0, 4);
+    let after = bus.nops(3);
+    assert_eq!(last.word(), Some(0x2222));
+    assert_eq!(after[0].word(), Some(0x3333));
+    assert_eq!(after[1].word(), Some(0x4444));
+    // The read's precharge started the cycle after it: tRP later, ACTIVE.
+    bus.active(0, 8);
+    bus.assert_clean();
+    assert_eq!(bus.sdram.peek(1, 9, 3), 0x8888);
+}
+
+/// A bank written with auto-precharge can't be activated before tDAL.
+#[test]
+fn reports_tdal_after_write_with_auto_precharge() {
+    let mut bus = Bus::new();
+    bus.init(MODE_CL2_BL1);
+    bus.active(2, 5);
+    bus.nops(bus.timing.ras);
+    bus.write_ap(2, 0, 1);
+    bus.nops(bus.timing.wr);
+    bus.active(2, 5);
+    bus.assert_reported("tRP");
+}
+
+/// Auto-precharge must still meet tRAS from the ACTIVE.
+#[test]
+fn reports_tras_with_auto_precharge() {
+    let mut bus = Bus::new();
+    bus.init(MODE_CL2_BL1);
+    bus.active(3, 5);
+    bus.nops(bus.timing.rcd - 1);
+    bus.read_ap(3, 0);
+    bus.assert_reported("tRAS");
+}
+
+/// A READ or WRITE to a bank after its auto-precharge finds no open row.
+#[test]
+fn reports_access_after_auto_precharge() {
+    let mut bus = Bus::new();
+    bus.init(MODE_CL2_BL1);
+    bus.active(1, 5);
+    bus.nops(bus.timing.ras);
+    bus.read_ap(1, 0);
+    bus.read(1, 1);
+    bus.assert_reported("no open row");
 }
