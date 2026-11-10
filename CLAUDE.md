@@ -154,6 +154,12 @@ Verilator report a false combinational loop (UNOPTFLAT) when the parent
 computes those inputs from that output in its single `always_comb`; register
 such outputs (as `SdramController` does `accepted`).
 
+The colour and depth buffers carry cleared flags (`docs/design/draw-speed.md`
+§3.1): a cleared block's SDRAM words are stale, so a test reads a buffer as
+the GPU does, through `Bench::buffer_word` or `Bench::buffer`, never the
+SDRAM model directly; and reads the shown buffer while it is shown
+(`Bench::snapshot`), since the GPU may draw into it right after.
+
 The generated Verilog must stay lint-clean under `-Wall`. `just lint` passes
 `--unused-regexp '*debug*'`: module outputs named `debug_*` exist only for
 tests (the setup engine's write ports) and may go unused in the GPU. Verilator flags

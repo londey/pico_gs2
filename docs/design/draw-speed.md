@@ -6,7 +6,7 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** approved 2026-11-10 (Phase 20); Phase 21 done (§7), Phase 22 next.
+**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done (§7), Phase 23 next.
 
 ## 1. Goal
 
@@ -123,7 +123,7 @@ measurements.
 |---|---|---|---|
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
-| 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers, and a block first drawn in one half only; the clear about 7,200 cycles (0.1 ms); mutations; on the board, read-backs pixel-exact |
+| 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done in simulation: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz. On the board: to do |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
@@ -223,3 +223,62 @@ saturated (74% clearing, 20% scan-out, 6% between runs).
 | full screen, 64 × 64 bilinear (the goal) | 19.8% | 51.6% | 28.6% |
 | 320 triangles of 8 px, untextured | 20.0% | 67.3% | 12.7% |
 | the cube, bilinear | 19.7% | 59.4% | 20.9% |
+
+### Phase 22: fast clear
+
+- **As built:** the cleared flags are a word per block with a bit per
+  bank (`cflags`, 4,096 × 4 bits, two read ports, so 2 DP16KD), in the
+  rasteriser, which is their only writer. A clear is one pass over the
+  3,600 blocks, reading each word and writing it back a cycle later with
+  the cleared buffers' bits set: 3,603 cycles for colour and depth alike
+  (681,114 before). A block's flags are read in TEST; a cleared depth
+  skips the depth read and tests against 0xFFFF; a cleared buffer's runs
+  are both written, unmasked, the clear value where nothing was drawn;
+  its bit goes once both are out, and the word is written back in NEXT.
+  Scan-out reads the flags of its next load's block and skips a cleared
+  one (its ring slot marked, shown as the buffer's clear colour) when no
+  load is waiting or in flight. A `MEM_DATA` read of a cleared block
+  reads the clear value.
+- **Timing:** the first build placed at 52 MHz: scan-out used the flag
+  RAM's output to move its next load, whose address was the RAM's next
+  read address, a loop through the RAM in one cycle. Scan-out now reads
+  the flags at its current load's address and registers the bit; a load
+  waits until the bit is its own, two cycles after the address moved.
+  83.2 MHz, in 18,317 cells (75%), 8,263 flip-flops, 36 DP16KD and 12
+  multipliers (+378 cells, +61 flip-flops, +2 DP16KD). The critical path
+  is a `MEM_DATA` read's substitution, from the flag RAM to the parser's
+  read register.
+- **Tests:** every twin test stays pixel-exact. `frame.rs` read the shown
+  bank from the SDRAM after the run; the SDRAM no longer holds cleared
+  blocks, and with a 3,603-cycle clear the GPU starts drawing into that
+  buffer within the blanking, so the test now reads the buffer as the
+  GPU does (`Bench::buffer_word`, through the flags) at the frame's
+  start, while it is on screen. A new test, `fast_clear.rs`, reads back
+  through `MEM_DATA` a block drawn in its top half only, blocks drawn
+  with colour writes or depth writes off, and an untouched block, of the
+  colour and depth buffers, after a full clear and after a depth-only
+  clear; then shows three frames with different clear colours, the last
+  clearing colour only. 14 deliberate breaks, each caught: the depth
+  test ignoring the flag; a cleared run masked; a cleared block written
+  in one half; the flag kept after the write; the word not written back;
+  the clear stopping early; a colour-only clear clearing depth; every
+  clear colour stored as bank 0's; scan-out ignoring the flags, using
+  them a cycle early, skipping with a load in flight, or showing the
+  drawn buffer's clear colour; a `MEM_DATA` read using bank 0's flag, or
+  0xFFFF for bank 2.
+
+| Scene | Phase 21 | Phase 22 |
+|---|---|---|
+| clear (colour and depth, or depth only) | 681,114 | 3,603 |
+| full screen, untextured | 2,407,224 | 1,226,275 |
+| **full screen, 64 × 64 bilinear (the goal)** | **2,460,609 (32.8 ms)** | **1,279,202 (17.1 ms)** |
+| full screen, 256 × 256 minified | 4,837,631 | 3,640,073 |
+| 320 triangles of 8 px | 848,203 | 122,237 |
+| 120 triangles of 32 px | 1,240,490 | 389,436 |
+| the cube, bilinear | 1,256,638 | 398,407 |
+
+The goal is 3.4% over a 60 fps frame (1,237,500). The estimate was about
+1,350,000; it came in under because the first touch of a block skips its
+depth read and, with fewer requests from scan-out for sparse rows, the
+rasteriser's runs wait less. In a full-screen frame the SDRAM is now in
+no run for 39% of the frame: the passes, which Phases 24 and 25 overlap.

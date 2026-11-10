@@ -131,6 +131,11 @@ pub struct Shown {
 
     /// The colour buffer bank it was scanned out of.
     pub bank: usize,
+
+    /// With [`Bench::snapshot`] set, that bank as the GPU read it when the
+    /// frame began (RGB565, raster order): the buffer on screen, which the
+    /// GPU never draws into while it is shown.
+    pub pixels: Option<Vec<u16>>,
 }
 
 /// The core, the SDRAM and a host.
@@ -149,6 +154,13 @@ pub struct Bench<W: Write> {
 
     /// Core cycles stepped.
     pub cycle: usize,
+
+    /// Whether each frame shown carries the buffer it was shown from
+    /// ([`Shown::pixels`]).
+    pub snapshot: bool,
+
+    /// The snapshot of the frame being collected.
+    pixels: Option<Vec<u16>>,
 
     /// The core's transmit line, from the last cycle.
     gpu_tx: u8,
@@ -190,6 +202,8 @@ impl<W: Write> Bench<W> {
             host: Host::default(),
             dtr_n: 1,
             cycle: 0,
+            snapshot: false,
+            pixels: None,
             gpu_tx: 1,
             frame: Vec::with_capacity(FRAME),
             frame_start: (0, 0),
@@ -239,6 +253,7 @@ impl<W: Write> Bench<W> {
                 .and_then(|b| usize::try_from(b).ok())
                 .unwrap_or(0);
             self.frame_start = (out.debug_frames_q, bank);
+            self.pixels = self.snapshot.then(|| self.buffer(bank));
         }
         self.frame
             .push([out.tmds_blue_q, out.tmds_green_q, out.tmds_red_q]);
@@ -249,6 +264,7 @@ impl<W: Write> Bench<W> {
             symbols: std::mem::replace(&mut self.frame, Vec::with_capacity(FRAME)),
             presented: self.frame_start.0,
             bank: self.frame_start.1,
+            pixels: self.pixels.take(),
         };
         Ok((out, Some(shown)))
     }
@@ -273,24 +289,48 @@ impl<W: Write> Bench<W> {
         self.stimulus.flush()
     }
 
-    /// Whether a bank of the SDRAM holds a framebuffer, tiled.
+    /// A word of one of the GPU's buffers as the GPU reads it (scan-out,
+    /// `MEM_DATA`): the clear value where its block's cleared flag is set
+    /// (`docs/design/draw-speed.md` §3.1), else the SDRAM's.
     ///
     /// # Arguments
     ///
-    /// * `bank` - The bank.
-    /// * `fb` - The framebuffer, RGB565, `FB_WIDTH * FB_HEIGHT` in raster
-    ///   order.
+    /// * `bank` - The buffer's bank: 0 to 2 colour, 3 depth.
+    /// * `addr` - The word in the bank, below 3,600 blocks of 64.
     ///
     /// # Returns
     ///
-    /// The first pixel that differs, if one does.
-    pub fn bank_differs(&self, bank: usize, fb: &[u16]) -> Option<(usize, usize)> {
+    /// The word.
+    pub fn buffer_word(&self, bank: usize, addr: usize) -> u16 {
+        let flags = self
+            .sim
+            .memory("raster_cflags")
+            .and_then(|m| m.get(addr / 64).copied())
+            .unwrap_or(0);
+        if flags >> bank & 1 == 0 {
+            return self.bus.sdram.peek(bank, addr >> 9, addr & 0x1FF);
+        }
+        if bank == 3 {
+            return 0xFFFF;
+        }
+        let colours = self.sim.register("raster_clear_colours").unwrap_or(0);
+        u16::try_from(colours >> (16 * bank) & 0xFFFF).unwrap_or(0)
+    }
+
+    /// A colour buffer as the GPU reads it ([`Bench::buffer_word`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `bank` - Its bank.
+    ///
+    /// # Returns
+    ///
+    /// Its pixels, RGB565, `FB_WIDTH * FB_HEIGHT` in raster order.
+    pub fn buffer(&self, bank: usize) -> Vec<u16> {
         (0..FB_HEIGHT)
             .flat_map(|y| (0..FB_WIDTH).map(move |x| (x, y)))
-            .find(|&(x, y)| {
-                let addr = tiled(x, y);
-                self.bus.sdram.peek(bank, addr >> 9, addr & 0x1FF) != fb[y * FB_WIDTH + x]
-            })
+            .map(|(x, y)| self.buffer_word(bank, tiled(x, y)))
+            .collect()
     }
 }
 

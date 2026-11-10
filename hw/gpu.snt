@@ -41,6 +41,7 @@ mod video;
 use root::link::HostLink;
 use root::raster::Parser;
 use root::raster::Raster;
+use root::raster::clear_colour_of;
 use root::sdram::SdramController;
 use root::sdram::SdramPins;
 use root::sdram::SdramReq;
@@ -74,6 +75,8 @@ const LAST_SLOT: u8 = 191;
 
 // Half blocks in the frame: 90 half-block rows of 80.
 const FRAME_SLOTS: u13 = 7200;
+// The blocks of a buffer, 80 x 45: the ones with cleared flags.
+const BLOCKS: u12 = 3600;
 
 // Register addresses a host can read (docs/design/host-interface.md §3).
 const REG_TEX0_CFG: u7 = 0x10;
@@ -182,6 +185,11 @@ struct Gpu {
     scan_wants: u1 = 0,
     #[no_reset]
     scan_addr: u18 = 0,
+    // The next load's block is cleared in the buffer shown (from the flags
+    // read at `scan_addr` the cycle before last), and the cycles since
+    // `scan_addr` last moved, to 2: the flag is the load's at 2.
+    scan_flag: u1 = 0,
+    scan_age: u2 = 0,
     show_slot: u8 = 0,
     // 192 half blocks, slot s holding pixel (px, py) at word s @ py @ px:
     // slots 0 to 127 in `ring_lo`, 128 to 191 in `ring_hi` (a memory's
@@ -193,6 +201,11 @@ struct Gpu {
     ring_hi: mem<u16, 2048> = 0,
     #[no_reset]
     ring_hi_1: u1 = 0,
+    // Each ring slot's half block is cleared in the buffer shown (no load
+    // was needed): it shows the clear colour. Read with the ring.
+    #[storage(lutram)]
+    #[no_reset]
+    slot_cleared: mem<u1, 256> = 0,
 
     // The display.
     timing: VideoTiming,
@@ -260,11 +273,21 @@ impl Gpu {
         // SDRAM requests: the fill's writes, then half-block loads while
         // the ring has a free slot. Half block (bx, row) is the top
         // (row even) or bottom half of block (bx, row / 2).
-        let reading = self.scan_wants;
         let load_addr = self.scan_addr;
         // The triangle pipeline's outputs, from its registers.
         let pout = self.parser.out();
         let rout = self.raster.out(self.draw);
+        // Scan-out's next load, if its block is cleared in the buffer shown,
+        // needs no SDRAM: its slot shows the clear colour. Such a load is
+        // skipped (counted issued and received at once) when no load is
+        // waiting or in flight, so slots still fill in order. The flags
+        // are read at `scan_addr` and registered, so a load waits until
+        // they are its own: two cycles after `scan_addr` last moved.
+        let scan_known = self.scan_age == 2;
+        let scan_cleared = scan_known & self.scan_flag == 1;
+        let scan_in_flight = self.issued != self.received | self.granted == OWNER_SCAN;
+        let skip = self.scan_wants == 1 & scan_cleared & !scan_in_flight;
+        let reading: u1 = if scan_known & self.scan_flag == 0 { self.scan_wants } else { 0 };
         // A host's read: the register's value, to the link.
         let reply: Option<u64> = match pout.read {
             Some(a) => Some(if a == REG_ID {
@@ -365,7 +388,20 @@ impl Gpu {
         let no_word: Option<u16> = None;
         let rdata_scan = if self.data_owner == OWNER_SCAN { mem.rdata } else { no_word };
         let rdata_raster = if self.data_owner == OWNER_RASTER { mem.rdata } else { no_word };
-        let rdata_mem = if mem_run { mem.rdata } else { no_word };
+        // A host's MEM_DATA read of a block cleared in its buffer reads
+        // the clear value (the rasteriser, idle, has the block's flags).
+        let mem_bank = pout.mem_addr[21:20];
+        let mem_in_buffers = pout.mem_addr[19:16] == 0 & pout.mem_addr[15:4] < BLOCKS;
+        let mem_cleared = mem_in_buffers & (rout.mem_flags >> mem_bank)[0:0] == 1;
+        let mem_clear_word: u16 = if mem_bank == 3 { 0xFFFF } else { clear_colour_of(rout.clear_colours, mem_bank) };
+        let rdata_mem = if mem_run {
+            match mem.rdata {
+                Some(w) => Some(if mem_cleared { mem_clear_word } else { w }),
+                None => no_word,
+            }
+        } else {
+            no_word
+        };
 
         // The fill, in word order: px, then py, then bx, then by.
         let last_run = accepted_fill & self.fill_addr == LAST_RUN;
@@ -376,7 +412,7 @@ impl Gpu {
         let fill_bx: u7 = if next_by { 0 } else if next_bx { (self.fill_bx + 1) as u7 wrap } else { self.fill_bx };
 
         // The loads: the next request after each one is taken.
-        let took = accepted_scan;
+        let took = accepted_scan | skip;
         let row_done = took & self.load_bx == LAST_BX;
         let load_bx: u7 = if row_done { 0 } else if took { (self.load_bx + 1) as u7 wrap } else { self.load_bx };
         let load_rowbase = if row_done & self.load_row[0:0] == 1 {
@@ -392,6 +428,7 @@ impl Gpu {
         let n_load_rowbase: u18 = if frame_end { 0 } else { load_rowbase };
         let n_freed: u13 = if frame_end { 0 } else if next_row { (self.freed + ROW_SLOTS) as u13 wrap } else { self.freed };
         let n_in_use = (n_issued - n_freed) as u13 wrap;
+        let n_scan_addr = (n_load_rowbase + (0_u5 @ n_load_bx @ n_load_row[0:0] @ 0_u5)) as u18 wrap;
 
         // Words arriving go to the ring in order, a slot per 32.
         let (got, word) = match rdata_scan {
@@ -399,7 +436,8 @@ impl Gpu {
             None => (0_u1, 0_u16),
         };
         let slot_done = got & self.recv_word == 31;
-        let recv_slot: u8 = if !slot_done {
+        let slot_next = slot_done | skip;
+        let recv_slot: u8 = if !slot_next {
             self.recv_slot
         } else if self.recv_slot == LAST_SLOT {
             0
@@ -416,7 +454,15 @@ impl Gpu {
         let show = self.loading & beam.de;
         let next_show_sum = (0_u1 @ self.show_slot) + 80;
         let next_show: u8 = if next_show_sum >= 192 { (next_show_sum - 192) as u8 wrap } else { next_show_sum as u8 wrap };
-        let rgb: u16 = if self.show_1 == 0 { 0 } else if self.missing_1 == 1 { 0xF800 } else { ring_word };
+        let rgb: u16 = if self.show_1 == 0 {
+            0
+        } else if self.missing_1 == 1 {
+            0xF800
+        } else if self.slot_cleared.value() == 1 {
+            clear_colour_of(rout.clear_colours, self.disp)
+        } else {
+            ring_word
+        };
         // DVI carries HSYNC and VSYNC as C0 and C1 of the blue channel.
         let sync = self.vsync_1 @ self.hsync_1;
         let (enc_blue, blue) = self.enc_blue.step(rgb[4:0] @ rgb[4:2], sync, self.de_1, 1);
@@ -466,6 +512,9 @@ impl Gpu {
                     pout.cc,
                     pout.const0,
                     pout.const1,
+                    self.draw,
+                    pout.mem_addr[15:4],
+                    self.scan_addr[17:6],
                 ),
                 tri_flags: if starting == 1 { pout.mode[26:17] @ pout.mode[4:2] } else { self.tri_flags },
                 link_free: lout.free,
@@ -505,8 +554,10 @@ impl Gpu {
                 load_row: n_load_row,
                 load_rowbase: n_load_rowbase,
                 scan_wants: n_loading & n_issued != FRAME_SLOTS & n_in_use < RING,
-                scan_addr: (n_load_rowbase + (0_u5 @ n_load_bx @ n_load_row[0:0] @ 0_u5)) as u18 wrap,
-                received: if frame_end { 0 } else if slot_done { (self.received + 1) as u13 wrap } else { self.received },
+                scan_addr: n_scan_addr,
+                scan_flag: (rout.scan_flags >> self.disp)[0:0],
+                scan_age: if took | frame_end { 0 } else if self.scan_age == 2 { 2 } else { (self.scan_age + 1) as u2 wrap },
+                received: if frame_end { 0 } else if slot_next { (self.received + 1) as u13 wrap } else { self.received },
                 recv_word: if frame_end { 0 } else if got { (self.recv_word + 1) as u5 wrap } else { self.recv_word },
                 recv_slot: if frame_end { 0 } else { recv_slot },
                 freed: n_freed,
@@ -524,6 +575,7 @@ impl Gpu {
                     word,
                 ),
                 ring_hi_1: slot[7:7],
+                slot_cleared: self.slot_cleared.next(slot, self.loading & slot_next, self.recv_slot, if skip { 1 } else { 0 }),
                 timing: timing,
                 row_end: if row_end_next { 1 } else { 0 },
                 frame_end: if frame_end_next { 1 } else { 0 },

@@ -71,12 +71,14 @@ fn cube_frames_scan_out_from_sdram() -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(dir)?;
     }
     let mut bench = Bench::new(BufWriter::new(File::create(path)?), "sim/tb/tests/frame.rs")?;
+    bench.snapshot = true;
     let reference = expected();
     assert_eq!(reference.len(), CUBE_FRAMES);
 
     let mut shown: Option<usize> = None;
     let mut checked = 0;
     let mut last_bank = 0;
+    let mut last_pixels = None;
     let mut first_picture = None;
     let mut out = None;
     while checked < CHECKED_FRAMES && bench.cycle < MAX_FRAMES * FRAME + SYMBOL_LATENCY {
@@ -111,6 +113,7 @@ fn cube_frames_scan_out_from_sdram() -> Result<(), Box<dyn Error>> {
         println!("frame {checked} shows cube frame {k}");
         shown = Some(k);
         last_bank = frame.bank;
+        last_pixels = frame.pixels;
         first_picture.get_or_insert(picture);
         checked += 1;
     }
@@ -127,10 +130,18 @@ fn cube_frames_scan_out_from_sdram() -> Result<(), Box<dyn Error>> {
         bench.bus.sdram.violations()
     );
 
-    // The bank shown last holds that frame, tiled.
+    // The bank shown last held that frame, tiled, while it was shown (read
+    // as the GPU reads it, through the cleared flags). Not afterwards: the
+    // GPU may already be drawing the next frame into it.
     let last = &reference[shown.ok_or("no frames checked")?];
-    if let Some((x, y)) = bench.bank_differs(last_bank, last) {
-        return Err(format!("SDRAM bank {last_bank} differs at ({x}, {y})").into());
+    let pixels = last_pixels.ok_or("no snapshot of the bank shown")?;
+    if let Some(i) = (0..last.len()).find(|&i| pixels[i] != last[i]) {
+        return Err(format!(
+            "SDRAM bank {last_bank} differs at ({}, {})",
+            i % FB_WIDTH,
+            i / FB_WIDTH
+        )
+        .into());
     }
 
     let cycles = out.debug_render_cycles_q;
