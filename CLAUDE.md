@@ -51,7 +51,8 @@ docs/setup.md           the setup and bring-up plan
 docs/design/            design notes: triangle-pipeline.md (the rendering plan and
                         phases), setup-engine-brief.md (the setup engine spec),
                         setup-engine.md (its numerics, as built), host-interface.md
-                        (registers and the host link)
+                        (registers and the host link; v1.0), draw-speed.md (the
+                        v1.1 plan: faster drawing, same interface)
 docs/adr/               architecture decision records, NNNN-title.md
 docs/slides/            Typst architecture slides (Touying + Fletcher, the theme in
                         theme/pico.typ, Inter and JetBrains Mono); `just slides`

@@ -762,6 +762,7 @@ serialisers and (later) the SPI link have clocks of their own.
   [17], [colour combiner and alpha test], done,
   [18], [bilinear filtering: a banked texture cache], done,
   [19], [v1.0 frozen for games: performance figures], done,
+  [20–26], [v1.1: faster drawing (fast clear, SDRAM, overlapped blocks)], next,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 

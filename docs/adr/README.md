@@ -16,3 +16,4 @@ that supersedes the old one; the old one stays.
 | [0007](0007-fixed-point-notation.md) | Sinter fixed-point notation | Accepted |
 | [0008](0008-register-host-interface.md) | A register host interface | Accepted |
 | [0009](0009-v1-interface.md) | The v1.0 interface: textures, combiner, memory access | Accepted |
+| [0010](0010-v1-1-draw-speed.md) | v1.1: drawing speed at the v1.0 interface | Proposed |
