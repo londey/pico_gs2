@@ -793,7 +793,7 @@ serialisers and (later) the SPI link have clocks of their own.
   Verilator; `just perf` times a set of scenes.
 - Tests are checked by mutation: break the design on purpose, see them fail.
 
-== Resources and timing at v1.0
+== Resources and timing at v1.1
 
 #grid(
   columns: (1fr, 1fr),
@@ -803,16 +803,17 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [17944], [3841], [24288],
-      [flip-flops], [8200], [974], [24288],
-      [block RAM (DP16KD)], [34], [5], [56],
+      [logic cells], [19030], [3841], [24288],
+      [flip-flops], [8529], [974], [24288],
+      [block RAM (DP16KD)], [38], [5], [56],
       [multipliers], [12], [2], [28],
       [PLL], [1], [—], [2],
       [I/O], [52], [—], [197],
     )
-    _GPU_: today's bitstream, everything included; the scene ROM takes 11
-    block RAMs, the texture cache 8 and its pixels' addresses 4, the
-    link's FIFO 2.
+    _GPU_: the Phase 25 bitstream, everything included; the scene ROM
+    takes 11 block RAMs, the texture cache 8, its pixels' addresses 4, the
+    cleared flags 2, the depth tile 2, the link's FIFO 2. v1.1 added about
+    1,100 cells and 4 block RAMs to v1.0's 17,944 and 34.
     _Setup_: the engine placed and routed alone.
   ],
   [
@@ -820,8 +821,8 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [76.2 MHz], [75],
-      [`clk_sclk`], [389 MHz], [187.5],
+      [`clk_core`], [85.2 MHz], [75],
+      [`clk_sclk`], [337 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
     The brief's v1.0 budget (estimate, ±50%): about 15,000 cells, 17
@@ -919,7 +920,7 @@ serialisers and (later) the SPI link have clocks of their own.
   [18], [bilinear filtering: a banked texture cache], done,
   [19], [v1.0 frozen for games: performance figures], done,
   [20–25], [v1.1: faster drawing (fast clear, overlapped writes, SDRAM auto-precharge, both fragment pipeline halves at once)], done,
-  [26], [v1.1 frozen: performance figures], next,
+  [26], [v1.1 frozen: performance figures], done,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 

@@ -6,10 +6,11 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done, and
-23 done (§7): **the goal is met** (746,840 cycles, 10 ms). Phase 24 in
-simulation; Phase 25 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
-work counts in full only once blocks overlap.
+**Status:** done (Phase 26): every phase built and on the board (§7).
+**The goal is met**: 685,775 cycles, 9.1 ms, against 2,460,609 (32.8 ms)
+at v1.0. Host-interface §15 has v1.1's figures. Phases 23 and 24 swapped
+after Phase 22 (§7): the SDRAM work counts in full only once blocks
+overlap.
 
 ## 1. Goal
 
@@ -154,7 +155,7 @@ measurements.
 | 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
 | 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz; on the board, three read-backs pixel-exact |
 | 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Done: pixel-exact; 9 mutations caught; 85.2 MHz; the goal scene 685,775 cycles; on the board, three read-backs pixel-exact |
-| 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
+| 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Done: host-interface §15, §17, §18 and the slides updated |
 
 **Estimates**, per block a triangle touches (§2's 460 cycles today) and
 for the goal scene (one full-screen layer, 3,600 blocks, after a clear):

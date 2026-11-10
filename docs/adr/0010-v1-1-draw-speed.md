@@ -41,3 +41,23 @@ The goal is a whole screen, cleared and textured, at 60 fps.
   first. The built-in scene may shrink if room runs short.
 - The SDRAM controller gets more complex; the pin-level SDRAM model's
   datasheet checks are what keep it honest.
+
+## Outcome (Phase 26)
+
+The goal is met: the goal scene draws in 685,775 cycles (9.1 ms) against
+2,460,609 (32.8 ms) at v1.0, and every v1.0 test stays pixel-exact, on the
+twin and on the board. As built, against the decision above:
+
+- **Fast clear** as decided: a clear is 3,603 cycles.
+- **SDRAM:** auto-precharge, and the next run starting the cycle after
+  the last one's final access in any ready bank. Opening a row during
+  another bank's run is impossible at burst length 1 (every cycle of a run
+  carries a command); the controller takes runs of up to 64 words, but
+  nothing issues them yet (a few percent).
+- **Overlapped blocks:** three stages on three blocks at once, the front
+  half, the back half and the writer, with banked tile buffers between
+  them.
+- **Cost:** about 1,100 cells, 330 flip-flops and 4 block RAMs; 85.2 MHz.
+  The built-in scene didn't need to shrink.
+- **Now SDRAM-bound:** about 190 cycles a fully drawn block, the 128
+  words it writes and scan-out's fifth of the bus.

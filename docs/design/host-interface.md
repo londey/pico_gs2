@@ -13,6 +13,8 @@ records the register interface and ADR
 [0009](../adr/0009-v1-interface.md) its v1.0 scope.
 
 **Status:** v1.0, interface version 2, frozen at Phase 19 and approved 2026-11-10.
+v1.1 (Phases 20 to 26, [draw-speed.md](draw-speed.md)) draws several
+times faster at the same interface: only §15, §17 and §18 changed.
 Everything here is built and works on the board except what is marked
 *after v1.0* (the SPI link, §11, and reserved fields and codes). Version 1
 (Phase 13) was the first; §14 lists what version 2 changes. A later change
@@ -32,7 +34,8 @@ changes.
 | 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); `SCRATCH`, a register to test a link with; this document frozen as v1.0 | Done: approved 2026-11-10 |
 
 Phases 15 to 18 each passed their gate: §16 lists their tests and §18 their
-runs on the board.
+runs on the board. Phases 20 to 26, v1.1, are in
+[draw-speed.md](draw-speed.md).
 
 After v1.0, in an order to be decided: the SPI link (§11) and RP2350
 firmware; alpha blending (`ALPHA_BLEND`, `DST_COLOR`); `ATTR1`'s second
@@ -668,50 +671,54 @@ times are the GPU's alone; textures stay in the cache from frame to frame.
 A display frame is 1,237,500 cycles (16.5 ms at 75 MHz), so a frame drawn
 within that shows at 60 fps, and one within twice that at 30.
 
-| Scene | Transactions a frame | Cycles a frame | ms | Beyond the clear |
-|---|---|---|---|---|
-| clear colour and depth only | 1 | 681,114 | 9.1 | |
-| clear depth only | 1 | 336,779 | 4.5 | |
-| the screen, two untextured triangles | 11 | 2,407,224 | 32.1 | 7.5 cycles a pixel |
-| the screen, 64 × 64 texture, 1.4 to 2.5 pixels a texel, nearest or bilinear | 11 | 2,460,609 | 32.8 | 7.7 cycles a pixel |
-| the screen, 256 × 256 texture, 1.6 × 2.8 texels a pixel, nearest | 11 | 4,837,631 | 64.5 | 18.0 cycles a pixel |
-| the same, bilinear | 11 | 4,912,683 | 65.5 | 18.4 cycles a pixel |
-| the screen, 256 × 256 texture, 2.8 to 5 pixels a texel, bilinear | 11 | 2,533,353 | 33.8 | 8.0 cycles a pixel |
-| 320 untextured triangles, 8 × 8 pixels, in strips | 353 | 848,203 | 11.3 | 522 cycles a triangle |
-| 160 textured triangles, 8 × 8 pixels, in strips | 363 | 767,861 | 10.2 | 542 cycles a triangle |
-| 120 untextured triangles, 32 × 32 pixels, in strips | 141 | 1,240,490 | 16.5 | 4,661 cycles a triangle |
-| the cube, untextured | 57 | 1,250,699 | 16.7 | |
-| the cube, textured, nearest or bilinear | 65 | 1,256,638 | 16.8 | |
+| Scene | Transactions a frame | v1.0 cycles | v1.1 cycles | v1.1 ms | v1.1, beyond the clear |
+|---|---|---|---|---|---|
+| clear colour and depth only | 1 | 681,114 | 3,603 | 0.05 | |
+| clear depth only | 1 | 336,779 | 3,603 | 0.05 | |
+| the screen, two untextured triangles | 11 | 2,407,224 | 684,782 | 9.1 | 3.0 cycles a pixel |
+| the screen, 64 × 64 texture, 1.4 to 2.5 pixels a texel, nearest | 11 | 2,460,609 | 685,980 | 9.1 | 3.0 cycles a pixel |
+| the same, bilinear (v1.1's goal) | 11 | 2,460,609 | 685,775 | 9.1 | 3.0 cycles a pixel |
+| the screen, 256 × 256 texture, 1.6 × 2.8 texels a pixel, nearest | 11 | 4,837,631 | 3,077,507 | 41.0 | 13.3 cycles a pixel |
+| the same, bilinear | 11 | 4,912,683 | 3,186,341 | 42.5 | 13.8 cycles a pixel |
+| the screen, 256 × 256 texture, 2.8 to 5 pixels a texel, bilinear | 11 | 2,533,353 | 744,464 | 9.9 | 3.2 cycles a pixel |
+| 320 untextured triangles, 8 × 8 pixels, in strips | 353 | 848,203 | 86,543 | 1.2 | 259 cycles a triangle |
+| 160 textured triangles, 8 × 8 pixels, in strips | 363 | 767,861 | 46,023 | 0.6 | 265 cycles a triangle |
+| 120 untextured triangles, 32 × 32 pixels, in strips | 141 | 1,240,490 | 208,160 | 2.8 | 1,705 cycles a triangle |
+| the cube, untextured | 57 | 1,250,699 | 205,611 | 2.7 | |
+| the cube, textured, nearest or bilinear | 65 | 1,256,638 | 206,199 | 2.7 | |
 
-**Where the time goes.** The rasteriser works through each 8 × 8 block a
-triangle touches in turn: it reads the block's depths (two 32-word SDRAM
-runs, about 90 cycles), steps the pixels (64), passes them through the
-texture pipeline and combiner (64 and 11 of latency, plus misses), and
-writes the colour and depth back (four runs, about 225 cycles), sharing
-the SDRAM with the display throughout. That is about 460 cycles a block,
-7 to 8 a pixel, whatever the triangle's size, and the passes don't overlap.
+**Where the time goes (v1.1).** A clear sets a flag per 8 × 8 block and
+buffer (3,603 cycles); a cleared block's depths aren't read, and its
+first write writes it whole. Three stages then each work on a different
+block a triangle touches: the front half reads the block's depths (two
+32-word SDRAM runs, unless cleared) and steps its pixels, depth testing
+each and working out its texel address (64 cycles, one a pixel); the back
+half looks texels up, filters, combines and alpha tests (64, plus
+misses); the writer writes the drawn half blocks' colours and depths
+(up to four 32-word runs, about 34 cycles each), all sharing the SDRAM
+with the display. A block goes on as soon as the next stage is free. A
+fully drawn block costs about 190 cycles, set by the SDRAM: its 128
+words written, and the display's fifth of the bus.
+
+v1.0 took about 460 cycles a block, those steps one after another, and
+its clear wrote every word (9.1 ms).
 
 What follows for a host:
 
-- **A 60 fps frame has room for about 1,200 blocks** after a full clear:
-  about a third of the screen's 3,600, counting a block once for each
-  triangle that touches it. At 30 fps, about the whole screen once. A depth-
-  only clear frees about 700 more blocks.
-- **Small triangles cost a block or two each**, about 520 cycles: a 60 fps
-  frame has room for about 1,000 after the clear, more than the link
-  carries (about 500 a frame untextured in strips, 250 textured, §10).
-- **Bilinear filtering is free**, and a texture costs about 3% while its
-  texels in view fit the cache's 64 × 64 window.
+- **A 60 fps frame has room for about 6,500 fully drawn blocks** after a
+  clear: the screen's 3,600 about 1.8 times over, counting a block once
+  for each triangle that touches it. A block drawn again in the same
+  frame also reads its depths, which costs more.
+- **Small triangles cost about 260 cycles each** in strips: a 60 fps
+  frame has room for about 4,700, far more than the link carries (about
+  500 a frame untextured in strips, 250 textured, §10).
+- **Bilinear filtering is free**, and a texture costs nothing measurable
+  while its texels in view fit the cache's 64 × 64 window.
 - **Minifying a large texture is slow**: more than one texel a pixel misses
-  the cache on most blocks, more than doubling the cost. There are no
+  the cache on most blocks, more than four times the cost. There are no
   mipmaps, so use a smaller texture for a distant surface.
 - **Each change of `TEX0_CFG`, `CC_MODE`, `CONST0` or `CONST1` drains the
   pipeline** (§3); group triangles by state.
-
-Faster drawing is for after v1.0, at the same interface: overlapping one
-block's writes with the next block's depth read and pixels could save up
-to about half of each block, and a fast clear (per-block flags) most of
-the clear.
 
 ## 16. Verification
 
@@ -808,6 +815,15 @@ and the twin tests compare against it pixel for pixel:
 
 ## 17. Resources and timing
 
+**v1.1, as built (Phase 25):** the GPU places and routes at 85.2 MHz (75
+needed) in 19,030 logic cells, 8,529 flip-flops, 38 DP16KD and 12
+MULT18X18D (78%, 35%, 68%, 43%). v1.1 added about 1,100 cells, 330
+flip-flops and 4 DP16KD to v1.0: the cleared flags, the second and third
+banks of the tile buffers, the writer and the SDRAM controller's
+per-bank waits. Timing by phase: 83.5 MHz (Phase 21, registering
+scan-out's `presenting`), 83.2, 81.0, 83.5, 85.2;
+[draw-speed.md](draw-speed.md) §7 has each phase's critical path.
+
 **v1.0, as built (Phase 19, Sinter v1.0.0-rc.3):** the GPU places and
 routes at 76.2 MHz (75 needed) in 17,944 logic cells, 8,200 flip-flops, 34
 DP16KD and 12 MULT18X18D (74%, 34%, 61%, 43%). `SCRATCH` added 50 cells
@@ -885,6 +901,13 @@ Phase 18, bilinear, with every block of the frame now through the pass
 256 misses: 99.6% hits.
 
 ## 18. On the board
+
+**v1.1 (Phase 25).** `gs-host --status --screenshot` read back the
+built-in scene pixel for pixel, its frame drawn in 206,893 cycles (1.25
+M at v1.0); the streamed textured cube, 616 frames sent at 60.7 a second,
+each drawn in about 205,000 cycles, read back pixel for pixel; so did
+the combiner demo's last frame. Each of Phases 21 to 25 passed the same
+three read-backs (draw-speed.md §7).
 
 **Phase 19.** On the v1.0 bitstream (76.2 MHz), `gs-host --status` read
 `ID` (interface 2), wrote `SCRATCH` with its six patterns and read each
