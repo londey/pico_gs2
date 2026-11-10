@@ -29,7 +29,7 @@ changes.
 | 16 | `phase-16-textures` | `TEX0_CFG` (§6); RGB565 and ARGB4444; the texture cache; perspective-correct nearest sampling; the wrap modes; texture × shade | Pixel-exact against the reference renderer; a textured cube on the board; frame time and cache hit rate measured |
 | 17 | `phase-17-combiner` | `CC_MODE`, `CONST0`, `CONST1` (§7); alpha test (§8); `RENDER_MODE` version 2 | Pixel-exact; a scene with cut-out alpha and the combiner's presets on the board |
 | 18 | `phase-18-bilinear` | Bilinear filtering (§6.3): a banked texture cache reading four texels a cycle; `gs-host` filters its cube | Pixel-exact; resources and timing; the filtered cube on the board |
-| 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); this document frozen as v1.0 | Approved |
+| 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); `SCRATCH`, a register to test a link with; this document frozen as v1.0 | Approved |
 
 Phases 15 to 18 each passed their gate: §16 lists their tests and §18 their
 runs on the board.
@@ -104,6 +104,7 @@ cache, so the next textured triangle sees what was written.
 | 0x40 | `FRAME` | W | present the frame, and clear | built |
 | 0x70 | `MEM_ADDR` | R/W | the memory address `MEM_DATA` reads and writes | built |
 | 0x71 | `MEM_DATA` | R/W | 64 bits of GPU memory, then the next | built |
+| 0x7D | `SCRATCH` | R/W | no effect: reads back what was last written, to test a link | built |
 | 0x7E | `STATUS` | R | frames shown, the last frame's cycles, FIFO space, the buffers shown and drawn, link errors | built |
 | 0x7F | `ID` | R | identification and interface version | built |
 
@@ -465,6 +466,16 @@ A frame's cycles run from the end of the frame before to this one's
 nothing left to draw. They include any wait for the link, so they measure
 the GPU only while the host keeps the FIFO from emptying (§15).
 
+### 0x7D `SCRATCH`
+
+64 bits that do nothing but read back as last written: a host writes a
+value and reads it back to check that a link carries every bit both ways,
+before relying on it. Reset value 0; a link reset (DTR on the serial
+link) leaves it. Like any write, a write takes effect when the parser
+reaches it, but it doesn't wait for drawing; a read is answered in order
+like any other (§3). `gs-host` writes six patterns and reads each back
+each time it connects.
+
 ### 0x7F `ID`
 
 | Bits | Field |
@@ -621,7 +632,8 @@ relies on.
   filtered bilinear, for `--seconds` (10), and prints `STATUS` and the
   link's throughput. `--nearest` samples nearest, `--untextured` draws the
   plain cube, `--combiner` shows the combiner and alpha-test demo instead,
-  and `--status` reads `ID` and `STATUS` only. `--screenshot <file>` then
+  and `--status` reads `ID` and `STATUS` only. Every run first
+  round-trips `SCRATCH` (§8). `--screenshot <file>` then
   reads the frame on screen back, saves it as a PNG and compares it with
   the reference renderer's.
   `just gs-host` builds it in the devcontainer (it needs only the C
@@ -635,7 +647,8 @@ Version 1 is Phase 13, as built. Version 2:
 - `RENDER_MODE.TEXTURED` (bit 8) goes; `TEX0_CFG.ENABLE` replaces it.
 - `RENDER_MODE` gains `ALPHA_TEST` and `ALPHA_REF`, and reserves
   `ALPHA_BLEND` and `Z_COMPARE` at pico-gs's positions.
-- New: `TEX0_CFG`, `CC_MODE`, `CONST0`, `CONST1`, `MEM_ADDR`, `MEM_DATA`.
+- New: `TEX0_CFG`, `CC_MODE`, `CONST0`, `CONST1`, `MEM_ADDR`, `MEM_DATA`,
+  `SCRATCH` (added at Phase 19, before the freeze).
 - `STATUS` gains the buffers on screen and being drawn, and the link's
   error flags.
 - S′ and T′ are signed Q4.12 and Q is UQ1.15 (version 1 left them
@@ -708,7 +721,9 @@ Every test is in `just check`. As built in Phase 13 (`sim/tb/tests/`):
   against the reference renderer on the same transactions.
 - **`host.rs`, with a host:** the ROM scene; then a host (`tb::Host`, at 25
   cycles a bit, honouring credits) connects, reads `ID`, `STATUS` and
-  `RENDER_MODE`, and streams two frames: one with the depth test off, a
+  `RENDER_MODE`, reads `SCRATCH` (0), writes it and reads it back, writes
+  its complement (read back after the frames, so every bit has been 0
+  and 1), and streams two frames: one with the depth test off, a
   depth-only clear, a triangle that writes only depth and one that writes
   no depth; then a cube frame. Every frame shown is whole and pixel-exact,
   ROM then host; credits come back for every 64 transactions; the FIFO
@@ -723,6 +738,8 @@ Every test is in `just check`. As built in Phase 13 (`sim/tb/tests/`):
 - **Mutation:** ignoring `Z_TEST`, `COLOR_WRITE` or `Z_WRITE`; clearing
   colour on a depth-only clear; credits twice as often; `KICK_021` with the
   old odd-strip roles; a fan pivoting on two back: each fails a test.
+  (`SCRATCH`, Phase 19: its writes ignored, or its reads answered with
+  `MEM_DATA`'s value: each fails `host.rs`.)
 
 Then, phase by phase, the reference renderer gained each feature first,
 and the twin tests compare against it pixel for pixel:
@@ -791,10 +808,18 @@ and the twin tests compare against it pixel for pixel:
 
 ## 17. Resources and timing
 
-**v1.0, as built (Phase 18; unchanged at Phase 19, with Sinter
-v1.0.0-rc.3):** the GPU places and routes at 81.8 MHz (75 needed) in
-17,894 logic cells, 8,136 flip-flops, 34 DP16KD and 12 MULT18X18D (74%,
-33%, 61%, 43%). Bilinear filtering added about 2,700 cells, 1,250
+**v1.0, as built (Phase 19, Sinter v1.0.0-rc.3):** the GPU places and
+routes at 76.2 MHz (75 needed) in 17,944 logic cells, 8,200 flip-flops, 34
+DP16KD and 12 MULT18X18D (74%, 34%, 61%, 43%). `SCRATCH` added 50 cells
+and 64 flip-flops; the same design without it placed at 81.8. The
+critical path is still scan-out's request to the SDRAM arbiter, from the
+display's beam through `presenting` and the ring's count (3.5 ns of logic,
+9.7 of routing), which `SCRATCH` isn't on: placement moves it by several
+MHz from build to build. The margin is thin; the first thing to try if a
+later change misses 75 is registering `presenting`.
+
+Phase 18 placed at 81.8 MHz in 17,894 cells and 8,136 flip-flops.
+Bilinear filtering added about 2,700 cells, 1,250
 flip-flops and 7 DP16KD (three more tag banks, the texel addresses' two
 tiles), and no multiplier: its twelve blends are 4-bit weights, done by
 shifts and adds. The first build, with the texel addresses in LUT RAM,
@@ -849,7 +874,7 @@ filtering (Phase 18) needs four texels a cycle, which the one-port cache
 didn't give; the cache is now banked by texel parity (§6.4). All that v1.0
 added (texturing, the combiner, filtering) came to about 7,100 cells, 10
 multipliers and 13 DP16KD, against the brief's 4,400 LUT4, 15 and 13:
-more logic, fewer multipliers. The whole GPU, 17,894 cells, 12
+more logic, fewer multipliers. The whole GPU, 17,944 cells, 12
 multipliers and 34 DP16KD, against the brief's 15,000, 17 and 34.
 
 **Textured cube (twin):** Phase 16, nearest: 381 blocks through the

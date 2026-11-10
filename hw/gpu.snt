@@ -83,6 +83,7 @@ const REG_CONST1: u7 = 0x1B;
 const REG_RENDER_MODE: u7 = 0x30;
 const REG_MEM_ADDR: u7 = 0x70;
 const REG_MEM_DATA: u7 = 0x71;
+const REG_SCRATCH: u7 = 0x7D;
 const REG_STATUS: u7 = 0x7E;
 const REG_ID: u7 = 0x7F;
 
@@ -277,6 +278,8 @@ impl Gpu {
                 0_u42 @ pout.mem_addr
             } else if a == REG_MEM_DATA {
                 pout.mem_rdata
+            } else if a == REG_SCRATCH {
+                pout.scratch
             } else {
                 0
             }),

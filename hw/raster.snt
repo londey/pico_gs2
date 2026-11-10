@@ -46,6 +46,7 @@ const REG_RENDER_MODE: u8 = 0x30;
 const REG_FRAME: u8 = 0x40;
 const REG_MEM_ADDR: u8 = 0x70;
 const REG_MEM_DATA: u8 = 0x71;
+const REG_SCRATCH: u8 = 0x7D;
 
 // The scene ROM's end marker (models/setup/src/scene.rs): start again.
 const ROM_END: u8 = 0xFF;
@@ -168,6 +169,8 @@ pub struct ParserOut {
     pub cc: u32,
     pub const0: u32,
     pub const1: u32,
+    // SCRATCH: whatever the host last wrote, for it to read back.
+    pub scratch: u64,
 }
 
 pub struct Parser {
@@ -210,6 +213,8 @@ pub struct Parser {
     mem_rdata: u64 = 0,
     tex: u64 = 0,
     flush: u1 = 0,
+    // SCRATCH: no effect; a link reset leaves it.
+    scratch: u64 = 0,
     // The registered outputs.
     load_valid: u1 = 0,
     start_valid: u1 = 0,
@@ -264,6 +269,7 @@ impl Parser {
             cc: self.cc,
             const0: self.const0,
             const1: self.const1,
+            scratch: self.scratch,
         }
     }
 
@@ -522,6 +528,8 @@ impl Parser {
             } else {
                 self.const1
             },
+            // A write of SCRATCH needs nothing to wait for.
+            scratch: if st == P_EXEC & self.t_addr == REG_SCRATCH { self.t_data } else { self.scratch },
             // The cache's tags are whole addresses, so only new memory
             // contents make it stale, not a new texture.
             flush: host_gone | (mem_done & !mem_read),

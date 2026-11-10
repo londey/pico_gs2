@@ -399,8 +399,9 @@ serialisers and (later) the SPI link have clocks of their own.
       [0x07–09], [`VERTEX_KICK_*`], [the same, and draw: strip 012, 021, fan],
       [0x30], [`RENDER_MODE`], [cull, Z test, Z write, colour write],
       [0x40], [`FRAME`], [present, clear colour, clear depth],
+      [0x7D], [`SCRATCH`], [reads back what was written],
       [0x7E], [`STATUS`], [frames, draw cycles, FIFO free],
-      [0x7F], [`ID`], [`0x5047533200010000`],
+      [0x7F], [`ID`], [`0x5047533200020000`],
     )
   ],
   [
@@ -653,8 +654,8 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto, auto),
       [*Resource*], [*GPU*], [*Setup*], [*Of*],
-      [logic cells], [17894], [3841], [24288],
-      [flip-flops], [8136], [974], [24288],
+      [logic cells], [17944], [3841], [24288],
+      [flip-flops], [8200], [974], [24288],
       [block RAM (DP16KD)], [34], [5], [56],
       [multipliers], [12], [2], [28],
       [PLL], [1], [—], [2],
@@ -670,8 +671,8 @@ serialisers and (later) the SPI link have clocks of their own.
     #table(
       columns: (1fr, auto, auto),
       [*Clock*], [*Reaches*], [*Needs*],
-      [`clk_core`], [81.8 MHz], [75],
-      [`clk_sclk`], [317 MHz], [187.5],
+      [`clk_core`], [76.2 MHz], [75],
+      [`clk_sclk`], [389 MHz], [187.5],
       [setup engine], [82.5 MHz], [75],
     )
     The brief's v1.0 budget (estimate, ±50%): about 15,000 cells, 17
@@ -758,8 +759,9 @@ serialisers and (later) the SPI link have clocks of their own.
   and writes one after another, and a 9.1 ms clear in a 16.5 ms frame.
   Overlapping blocks and a fast clear (per-block flags) are the first work
   after v1.0.
-- *Core timing margin:* 81.8 MHz against 75, but placement moves it by
-  several MHz from build to build (one Phase 16 build placed at 74).
+- *Core timing margin:* 76.2 MHz against 75 (81.8 one build earlier):
+  placement moves it by several MHz from build to build, on the same
+  scan-out-to-arbiter path.
 - *`just check` time:* about 3 minutes since Sinter rc.3 compiles
   `sinter sim` (45 before); a 16M-cycle cosim still holds 11 GB (R11).
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);

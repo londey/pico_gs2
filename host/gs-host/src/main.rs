@@ -3,7 +3,8 @@
 //!
 //! It opens the serial port at 3 Mbaud, which asserts DTR# and so connects
 //! the link (the GPU hands over from its built-in scene at its next frame),
-//! reads `ID` and `STATUS`, uploads a texture and streams a textured cube
+//! reads `ID`, writes `SCRATCH` with a few patterns and reads each back (a
+//! test of the link both ways), reads `STATUS`, uploads a texture and streams a textured cube
 //! turned live over a dark blue background for a while, then reads `STATUS`
 //! again and reports the frames shown, the time a frame takes to draw and
 //! the link's throughput. The texture is filtered bilinear; `--nearest`
@@ -24,7 +25,7 @@
 //! Usage: `gs-host [--port /dev/ttyUSB0] [--seconds 10] [--status]
 //! [--screenshot file.png] [--nearest | --untextured | --combiner]`
 //! (`--status` reads
-//! `ID` and `STATUS` and streams nothing).
+//! `ID`, round-trips `SCRATCH` and reads `STATUS`, and streams nothing).
 
 #![deny(unsafe_code)]
 
@@ -611,6 +612,43 @@ fn print_status(label: &str, s: Status) {
     }
 }
 
+/// Values `SCRATCH` is written with and read back: zeros and ones, every
+/// byte different, its complement, and alternating bits both ways.
+const SCRATCH_PATTERNS: [u64; 6] = [
+    0,
+    u64::MAX,
+    0x0123_4567_89AB_CDEF,
+    0xFEDC_BA98_7654_3210,
+    0x5555_5555_5555_5555,
+    0xAAAA_AAAA_AAAA_AAAA,
+];
+
+/// Tests the link both ways: writes `SCRATCH` with each pattern and reads
+/// it back.
+///
+/// # Arguments
+///
+/// * `link` - The link.
+///
+/// # Returns
+///
+/// How many round trips matched (all of them).
+///
+/// # Errors
+///
+/// The port fails, a reply doesn't come, or one differs from what was
+/// written.
+fn scratch_check(link: &mut Link) -> Result<usize> {
+    for &p in &SCRATCH_PATTERNS {
+        link.send(&[Transaction::write(reg::SCRATCH, p)])?;
+        let got = link.read(reg::SCRATCH)?;
+        if got != p {
+            bail!("SCRATCH: wrote {p:#018x}, read {got:#018x}: the link is corrupting data");
+        }
+    }
+    Ok(SCRATCH_PATTERNS.len())
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     println!("{}", set_latency_timer(&args.port));
@@ -627,6 +665,8 @@ fn main() -> Result<()> {
     } else {
         println!("ID {id:#018x} (not what pico-gs2 reads!)");
     }
+    let trips = scratch_check(&mut link)?;
+    println!("SCRATCH: {trips} round trips, each read back as written");
     let before = Status::from_bits(link.read(reg::STATUS)?);
     print_status("STATUS", before);
     if args.status_only {

@@ -2,9 +2,12 @@
 //! core with the SDRAM model on its bus and a host on its USB UART.
 //!
 //! 1. No host (DTR# high): the built-in scene plays; its first frame shows.
-//! 2. A host connects (DTR# low), reads `ID`, `STATUS` and `RENDER_MODE`,
-//!    and streams two frames of its own over the link at 3 Mbaud, both
-//!    over a dark blue background, then reads `STATUS` again. The first
+//! 2. A host connects (DTR# low), reads `ID`, `STATUS` and `RENDER_MODE`;
+//!    reads `SCRATCH` (0 from reset), writes it and reads it back, and
+//!    writes its complement; streams two frames of its own over the link
+//!    at 3 Mbaud, both over a dark blue background; then reads `SCRATCH`
+//!    (the complement, every bit having been both 0 and 1) and `STATUS`
+//!    again. The first
 //!    exercises `RENDER_MODE` and `FRAME`: the test card with the depth test
 //!    off (so painter's order), a depth-only clear, a triangle that writes
 //!    only depth (hiding part of the one behind it) and one that doesn't
@@ -24,6 +27,10 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
+
+/// What the host writes to `SCRATCH`, then its complement: every byte
+/// different, every bit both ways.
+const SCRATCH_PATTERN: u64 = 0x0123_4567_89AB_CDEF;
 
 use gs_proto::{
     reg, Attr0, Frame as FrameReg, Position, RenderMode, Status, Transaction, CREDIT_BATCH,
@@ -249,12 +256,20 @@ fn host_takes_over_and_hands_back() -> Result<(), Box<dyn Error>> {
                     Transaction::Read {
                         addr: reg::RENDER_MODE,
                     },
+                    Transaction::Read { addr: reg::SCRATCH },
+                    Transaction::write(reg::SCRATCH, SCRATCH_PATTERN),
+                    Transaction::Read { addr: reg::SCRATCH },
+                    Transaction::write(reg::SCRATCH, !SCRATCH_PATTERN),
                 ]);
                 bench.host.send(host_txns.iter().copied());
-                bench.host.send([Transaction::Read { addr: reg::STATUS }]);
-                sent = host_txns.len() + 4;
+                // STATUS last, so it sees the FIFO empty.
+                bench.host.send([
+                    Transaction::Read { addr: reg::SCRATCH },
+                    Transaction::Read { addr: reg::STATUS },
+                ]);
+                sent = host_txns.len() + 9;
             }
-            Stage::Host if now == (true, 1) && bench.host.replies.len() == 4 => {
+            Stage::Host if now == (true, 1) && bench.host.replies.len() == 7 => {
                 // The host's last frame is up and everything answered:
                 // disconnect.
                 stage = Stage::Back;
@@ -277,7 +292,13 @@ fn host_takes_over_and_hands_back() -> Result<(), Box<dyn Error>> {
         RenderMode::default(),
         "RENDER_MODE as the ROM's last primitive left it"
     );
-    let (before, after) = (Status::from_bits(r[1]), Status::from_bits(r[3]));
+    assert_eq!(r[3], 0, "SCRATCH from reset");
+    assert_eq!(r[4], SCRATCH_PATTERN, "SCRATCH written");
+    assert_eq!(
+        r[5], !SCRATCH_PATTERN,
+        "SCRATCH written again, after drawing"
+    );
+    let (before, after) = (Status::from_bits(r[1]), Status::from_bits(r[6]));
     println!("STATUS before {before:?}, after {after:?}");
     assert!(before.frames >= 1, "STATUS frames {}", before.frames);
     assert_eq!(after.fifo_free, 512, "the FIFO drained");

@@ -60,6 +60,9 @@ pub mod reg {
     /// 64 bits of GPU memory at `MEM_ADDR`, which then moves on by one.
     pub const MEM_DATA: u8 = 0x71;
 
+    /// No effect: reads back what was last written, to test a link.
+    pub const SCRATCH: u8 = 0x7D;
+
     /// Frames shown, the last frame's cycles, free FIFO entries, the
     /// buffers shown and drawn, the link's errors.
     pub const STATUS: u8 = 0x7E;
