@@ -123,7 +123,7 @@ measurements.
 |---|---|---|---|
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
-| 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done in simulation: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz. On the board: to do |
+| 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
@@ -276,6 +276,12 @@ saturated (74% clearing, 20% scan-out, 6% between runs).
 | 320 triangles of 8 px | 848,203 | 122,237 |
 | 120 triangles of 32 px | 1,240,490 | 389,436 |
 | the cube, bilinear | 1,256,638 | 398,407 |
+
+**On the board:** `gs-host --status --screenshot` read back the built-in
+scene pixel for pixel (its frame 16), drawn in 391,732 cycles (191.5 fps;
+1,252,161 before); the streamed textured cube, 616 frames sent and 615
+shown at 60.7 fps, each drawn in about 395,000 cycles, read back pixel
+for pixel; so did the combiner demo's last frame.
 
 The goal is 3.4% over a 60 fps frame (1,237,500). The estimate was about
 1,350,000; it came in under because the first touch of a block skips its
