@@ -17,9 +17,11 @@ v1.1 makes drawing faster without changing the interface: no register,
 field or visible behaviour changes, and `ID` still reads interface
 version 2. In order (docs/design/draw-speed.md):
 
-- **Fast clear:** a cleared flag per half block of each colour buffer and
-  the depth buffer. A clear sets flags; depth reads, writes, scan-out and
-  `MEM_DATA` reads honour them.
+- **Fast clear:** a cleared flag per 8 × 8 block of each of the four
+  buffers (three colour, one depth), one bit at `bank @ block` in a block
+  RAM. A clear sets flags; depth reads, writes, scan-out and `MEM_DATA`
+  reads honour them. All three colour buffers have flags because with
+  triple buffering the shown and waiting buffers hold untouched blocks too.
 - **SDRAM throughput:** the controller overlaps a run in one bank with the
   next run's row opening in another, closes rows with auto-precharge, and
   takes runs of up to 64 words.

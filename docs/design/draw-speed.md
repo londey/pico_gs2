@@ -53,28 +53,40 @@ Three things make it slow:
 
 ### 3.1 Fast clear (Phase 22)
 
-A *cleared* flag for every half block of each colour buffer and of the
-depth buffer: 7,200 half blocks × 4 buffers, 28,800 bits, in block RAM
-(2 DP16KD). A `FRAME` clear sets the drawn buffer's flags (and depth's)
-and records its clear colour, a few hundred cycles in place of 681,000.
-Then everything that reads a buffer honours the flags:
+A *cleared* flag for every 8 × 8 block of every buffer, addressed by the
+block's SDRAM bank and block number: `bank @ block`, 2 + 12 bits (3,600
+blocks a buffer), 16,384 × 1 bit, exactly one DP16KD (two if scan-out and
+the rasteriser need a read port each). Banks 0 to 2 are the colour
+buffers and bank 3 the depth buffer, so every reader looks its flag up
+from the SDRAM address it already has, with no mapping of which buffer is
+shown, waiting or drawn. A `FRAME` clear sets the drawn buffer's flags
+(and depth's), 3,600 cycles each, and records that buffer's clear colour
+(one for each colour buffer). Then everything that reads a buffer honours
+the flags:
 
-- **Depth read:** a cleared half block reads as 0xFFFF without touching
-  SDRAM. Most blocks are touched first after a clear, so most depth
-  reads go away.
-- **Writes:** a cleared half block is written whole, unmasked, its undrawn
-  pixels with the clear colour (or 0xFFFF), and its flag cleared. This
-  costs the same cycles as a masked run.
-- **Scan-out:** a cleared half block fills its ring slot with the buffer's
-  clear colour without an SDRAM read, so a sparse frame frees most of
-  scan-out's 23% for drawing.
+- **Depth read:** a cleared block reads as 0xFFFF without touching SDRAM.
+  Most blocks are touched first after a clear, so most depth reads go
+  away.
+- **Writes:** the first write to a cleared block writes all of it,
+  unmasked, its undrawn pixels with the clear colour (or 0xFFFF), and
+  clears its flag. A first touch that draws in only one half writes the
+  other half too, one extra 32-word run (none once Phase 23 writes a
+  block as one 64-word run).
+- **Scan-out:** a cleared block's half blocks fill their ring slots with
+  the buffer's clear colour without an SDRAM read, so a sparse frame
+  frees most of scan-out's 23% for drawing.
 - **`MEM_DATA` reads** of a buffer's words return the clear colour (or
   0xFFFF) where the flag is set, so a host reading a frame back sees
   exactly what v1.0 shows. (`MEM_DATA` writes into the GPU's buffers stay
   undefined, as in v1.0 §9.2; they clear no flag.)
 
-The flags are per half block, not per block, because the SDRAM runs, the
-write masks and scan-out's ring all work in half blocks.
+Every colour buffer needs its flags, not only the one being drawn: with
+triple buffering the buffer on screen and the one waiting were cleared
+and partly drawn too, and scan-out and `MEM_DATA` must see their
+untouched blocks as the clear colour. Flags for the drawn buffer alone
+would need a pass at each present writing the clear colour into its
+untouched blocks, which for a sparse frame gives back most of the colour
+clear (up to 4.5 ms).
 
 ### 3.2 SDRAM throughput (Phase 23)
 
@@ -111,7 +123,7 @@ measurements.
 |---|---|---|---|
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Approved |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | ≥ 80 MHz; the perf check in `just check`; no change in any figure |
-| 22 | `phase-22-fast-clear` | Cleared flags (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers; the clear under 1,000 cycles; mutations; on the board, read-backs pixel-exact |
+| 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers, and a block first drawn in one half only; the clear about 7,200 cycles (0.1 ms); mutations; on the board, read-backs pixel-exact |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
@@ -123,10 +135,10 @@ for the goal scene (one full-screen layer, 3,600 blocks, after a clear):
 | After | Clear | Per block, first touch | Per block, again | Goal scene |
 |---|---|---|---|---|
 | v1.0 | 681,000 | ~460 | ~460 | 2,460,000 (32.8 ms) |
-| 22, fast clear | < 1,000 | ~370 (no depth read) | ~460 | ~1,350,000 (18 ms) |
-| 23, SDRAM | < 1,000 | ~280 | ~350 | ~1,000,000 (13.5 ms) |
-| 24, writes overlapped | < 1,000 | ~220 | ~250 | ~800,000 |
-| 25, passes overlapped | < 1,000 | ~150 to 200 | ~200 | ~600,000 to 700,000 |
+| 22, fast clear | ~7,200 | ~370 (no depth read) | ~460 | ~1,350,000 (18 ms) |
+| 23, SDRAM | ~7,200 | ~280 | ~350 | ~1,000,000 (13.5 ms) |
+| 24, writes overlapped | ~7,200 | ~220 | ~250 | ~800,000 |
+| 25, passes overlapped | ~7,200 | ~150 to 200 | ~200 | ~600,000 to 700,000 |
 
 So the goal may be met by Phase 23 for one layer; Phases 24 and 25 buy
 the room for overdraw, more triangles and textures that miss. If a phase
@@ -161,7 +173,7 @@ falls well short of its estimate, I report before going on.
   controller's overlap might take 1,500 to 2,500 cells. If it gets short,
   the built-in scene can shrink (a shorter cube animation frees block RAMs
   and some logic), as agreed for v1.1.
-- **Block RAM.** 34 of 56 in use; the flags need 2 and the doubled
+- **Block RAM.** 34 of 56 in use; the flags need 1 or 2 and the doubled
   address tiles fit in the ones they use. Room to spare.
 - **Correctness of overlap.** A block's depth read must see the previous
   block's writes when they are the same block (two triangles in a row
