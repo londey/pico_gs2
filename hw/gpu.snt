@@ -99,6 +99,8 @@ const OWNER_MEM: u3 = 4;
 
 // The screen's active area: the first pixel after it, and its last line.
 const H_ACTIVE: u11 = 1280;
+// The last active column.
+const H_LAST: u11 = 1279;
 const V_LAST: u11 = 719;
 
 // The ring and the display's pipeline registers are #[no_reset] (ADR 0006):
@@ -194,6 +196,11 @@ struct Gpu {
 
     // The display.
     timing: VideoTiming,
+    // The beam is at the end of a half-block row (`row_end`), and of the
+    // frame (`frame_end`): decoded a pixel early, from the beam one column
+    // before, so the compares are off scan-out's and the arbiter's paths.
+    row_end: u1 = 0,
+    frame_end: u1 = 0,
     // Sticky: an active pixel's half-block row wasn't in the ring.
     underflow: u1 = 0,
     // The beam, one cycle behind `timing`, to meet the ring's read.
@@ -243,9 +250,12 @@ impl Gpu {
         // The display finishes a half-block row after the last active pixel
         // of every eighth screen line, and the frame after its last line.
         // The ring restarts there, so a frame's loads start at slot 0.
-        let row_end = beam.x == H_ACTIVE & beam.y[2:0] == 7 & beam.y <= V_LAST;
-        let frame_end = row_end & beam.y == V_LAST;
+        let row_end = self.row_end == 1;
+        let frame_end = self.frame_end == 1;
         let next_row = row_end & !frame_end;
+        // Next cycle's: the beam moves one column along the same line.
+        let row_end_next = beam.x == H_LAST & beam.y[2:0] == 7 & beam.y <= V_LAST;
+        let frame_end_next = row_end_next & beam.y == V_LAST;
 
         // SDRAM requests: the fill's writes, then half-block loads while
         // the ring has a free slot. Half block (bx, row) is the top
@@ -515,6 +525,8 @@ impl Gpu {
                 ),
                 ring_hi_1: slot[7:7],
                 timing: timing,
+                row_end: if row_end_next { 1 } else { 0 },
+                frame_end: if frame_end_next { 1 } else { 0 },
                 underflow: self.underflow | (show & !row_ready),
                 de_1: beam.de,
                 hsync_1: beam.hsync,

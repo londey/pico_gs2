@@ -6,7 +6,7 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** approved 2026-11-10 (Phase 20); Phase 21 next.
+**Status:** approved 2026-11-10 (Phase 20); Phase 21 done (§7), Phase 22 next.
 
 ## 1. Goal
 
@@ -122,7 +122,7 @@ measurements.
 | Phase | Branch | Work | Gate |
 |---|---|---|---|
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
-| 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | ≥ 80 MHz; the perf check in `just check`; no change in any figure |
+| 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers, and a block first drawn in one half only; the clear about 7,200 cycles (0.1 ms); mutations; on the board, read-backs pixel-exact |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
@@ -184,3 +184,38 @@ falls well short of its estimate, I report before going on.
   are part of the interface (frames read back); the flags must cover them
   exactly, and Phase 22's test reads back cleared, partly drawn and
   depth-only-cleared buffers.
+
+## 7. Results
+
+### Phase 21: groundwork
+
+- **Timing:** the end of a half-block row and of the frame were decoded
+  from the beam's position and fed scan-out's next state and the
+  arbiter's request in the same cycle. They are now registers decoded a
+  pixel early (the beam's previous column on the same line), which changes
+  no cycle's behaviour. The GPU places at 83.5 MHz (76.2 at v1.0), in
+  17,939 cells, 8,202 flip-flops, 34 DP16KD and 12 multipliers. The
+  critical path is now the texture cache's: an address tile read through
+  the fill check to a texel bank's address (6.8 ns logic, 5.2 routing).
+- **`just perf`** also reports the SDRAM's use over a frame by requester,
+  and prints the v1.1 goal's figure against 60 fps. `just perf --record`
+  writes every scene's figure to `sim/tb/perf-baseline.txt`, and `just
+  check` runs `perf --check`, which fails if a scene is more than 0.5%
+  slower than recorded (checked by lowering one recorded figure), or
+  link-bound, or the display ran short.
+- **The display never runs short:** the host, memory, texture and
+  combiner twin tests now assert it, as the frame test did.
+- **Every figure is v1.0's**, to the cycle (host-interface §15).
+
+The SDRAM over a frame, from `just perf`: during the full-screen quad it
+is in no run for 28% of the frame (the pixel and texel passes, with the
+bus idle), drawing 52% and scan-out 20%; during the clear it is
+saturated (74% clearing, 20% scan-out, 6% between runs).
+
+| Scene | scan-out | drawing | no run |
+|---|---|---|---|
+| clear only | 19.7% | 74.0% | 6.3% |
+| full screen, untextured | 19.8% | 52.8% | 27.5% |
+| full screen, 64 × 64 bilinear (the goal) | 19.8% | 51.6% | 28.6% |
+| 320 triangles of 8 px, untextured | 20.0% | 67.3% | 12.7% |
+| the cube, bilinear | 19.7% | 59.4% | 20.9% |

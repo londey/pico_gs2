@@ -1,5 +1,8 @@
 //! Performance figures for `docs/design/host-interface.md` §15, measured on
-//! the twin: `just perf` runs it.
+//! the twin: `just perf` runs it. With `--check` (`just check` passes it)
+//! it fails if a scene draws more than 0.5% slower than its figure in
+//! `sim/tb/perf-baseline.txt`; `just perf --record` writes the figures
+//! there. It also fails if a scene is link-bound or the display ran short.
 //!
 //! Each scene is one frame (a clear of colour and depth, then the scene's
 //! triangles, then a present), which a host on the USB UART sends
@@ -431,6 +434,14 @@ struct Measured {
     /// Cycles in each rasteriser state over the last frame.
     states: [u32; 16],
 
+    /// The SDRAM over the last frame: cycles in a run of each owner
+    /// (`hw/gpu.snt`'s `OWNER_*`), and at 0 the cycles in no run (idle,
+    /// refresh, or opening and closing rows between runs).
+    bus: [u32; 8],
+
+    /// Whether the display ever ran short of pixels.
+    underflow: bool,
+
     /// Transactions a frame.
     transactions: usize,
 }
@@ -483,6 +494,8 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
     let mut starving = 0;
     let mut states = [0_u32; 16];
     let mut last_states = [0_u32; 16];
+    let mut bus = [0_u32; 8];
+    let mut last_bus = [0_u32; 8];
     let mut counting = 0;
     let mut last_done = 0;
     let mut last_picture = None;
@@ -496,6 +509,8 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
                 cycles.push(u32::try_from(reg("debug_render_cycles"))?);
                 starved.push(starving);
                 last_states = states;
+                last_bus = bus;
+                bus = [0; 8];
                 starving = 0;
                 states = [0; 16];
                 last_done = bench.cycle;
@@ -505,6 +520,10 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
                     starving += 1;
                 }
                 states[usize::try_from(reg("raster_state") & 0xF)?] += 1;
+                // The controller's Access and Close states: in a run.
+                let in_run = matches!(reg("sdram_state"), 3 | 4);
+                let owner = if in_run { reg("data_owner") & 7 } else { 0 };
+                bus[usize::try_from(owner)?] += 1;
             }
             counting = count;
         }
@@ -541,12 +560,119 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
         cycles,
         starved,
         states: last_states,
+        bus: last_bus,
+        underflow: bench.underflow(),
         transactions: one.len(),
     })
 }
 
-/// Measures every scene, in parallel, and prints the table.
+/// The draw time a frame may take for 60 fps: one display frame, 1650 ×
+/// 750 cycles.
+const FRAME_60: u32 = 1_237_500;
+
+/// The scene v1.1 must draw within [`FRAME_60`]
+/// (`docs/design/draw-speed.md` §1).
+const GOAL: &str = "full screen, 64x64 bilinear";
+
+/// The recorded figures `--check` compares against, one `name<TAB>cycles`
+/// a line.
+const BASELINE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/perf-baseline.txt");
+
+/// How much slower than its recorded figure a scene may be before
+/// `--check` fails, as a fraction: 1/200, 0.5%.
+const SLOWER_ALLOWED: u32 = 200;
+
+/// What to do with the recorded figures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Print the tables only.
+    Report,
+    /// Fail if a scene is slower than recorded.
+    Check,
+    /// Write the figures as the new record.
+    Record,
+}
+
+/// Prints a table of each scene's SDRAM use by owner.
+fn print_bus(scenes: &[Scene], results: &[Measured]) {
+    println!();
+    println!("The SDRAM over the last frame (% of its cycles):");
+    println!();
+    println!("| Scene | scan-out | drawing | memory access | no run |");
+    println!("|---|---|---|---|---|");
+    for (scene, m) in scenes.iter().zip(results) {
+        let total = f64::from(m.bus.iter().sum::<u32>().max(1));
+        let pc = |k: usize| f64::from(m.bus[k]) * 100.0 / total;
+        // OWNER_SCAN 2, OWNER_RASTER 3, OWNER_MEM 4; 0 no run.
+        println!(
+            "| {} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            scene.name,
+            pc(2),
+            pc(3),
+            pc(4),
+            pc(0)
+        );
+    }
+}
+
+/// Compares the figures with the record, or writes them as the record.
+///
+/// # Errors
+///
+/// In `Check` mode, if a scene is slower than recorded or has no record;
+/// any error reading or writing the record.
+fn baseline(mode: Mode, figures: &[(&str, u32)]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if mode == Mode::Record {
+        let text: String = figures
+            .iter()
+            .map(|(name, c)| format!("{name}\t{c}\n"))
+            .collect();
+        std::fs::write(BASELINE, text)?;
+        println!();
+        println!("recorded {} figures in {BASELINE}", figures.len());
+        return Ok(());
+    }
+    if mode != Mode::Check {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(BASELINE)?;
+    let recorded: Vec<(&str, u32)> = text
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(n, c)| c.trim().parse().ok().map(|c| (n, c)))
+        .collect();
+    let mut failures = Vec::new();
+    println!();
+    for &(name, now) in figures {
+        match recorded.iter().find(|(n, _)| *n == name) {
+            None => failures.push(format!("{name}: no recorded figure")),
+            Some(&(_, was)) if now > was + was / SLOWER_ALLOWED => {
+                failures.push(format!("{name}: {now} cycles, recorded {was}"));
+            }
+            Some(&(_, was)) if now + was / SLOWER_ALLOWED < was => {
+                println!("{name}: {now} cycles, faster than the recorded {was}: `just perf --record` keeps it");
+            }
+            Some(_) => {}
+        }
+    }
+    if failures.is_empty() {
+        println!("perf check: every scene within 0.5% of its recorded figure or faster");
+        Ok(())
+    } else {
+        Err(format!("slower than recorded:\n  {}", failures.join("\n  ")).into())
+    }
+}
+
+/// Measures every scene, in parallel, and prints the tables; with
+/// `--check`, fails if a scene is slower than its recorded figure; with
+/// `--record`, records the figures.
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mode = match std::env::args().nth(1).as_deref() {
+        None => Mode::Report,
+        Some("--check") => Mode::Check,
+        Some("--record") => Mode::Record,
+        Some(a) => return Err(format!("unknown argument {a}: --check or --record").into()),
+    };
     let scenes = scenes();
     let results: Vec<_> = thread::scope(|s| {
         let handles: Vec<_> = scenes
@@ -565,6 +691,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .first()
         .and_then(|m| m.cycles.last().copied())
         .ok_or("no clear figure")?;
+    let mut figures = Vec::new();
+    let mut problems = Vec::new();
     println!("| Scene | Transactions a frame | Cycles a frame | ms | fps | Beyond the clear |");
     println!("|---|---|---|---|---|---|");
     for (scene, m) in scenes.iter().zip(&results) {
@@ -572,6 +700,13 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (last, starved) = (m.cycles[n - 1], m.starved[n - 1]);
         // Link-bound if the parser waited on the link for over 0.5% of it.
         let steady = starved * 200 <= last;
+        if !steady {
+            problems.push(format!("{}: link-bound", scene.name));
+        }
+        if m.underflow {
+            problems.push(format!("{}: the display ran short of pixels", scene.name));
+        }
+        figures.push((scene.name, last));
         let extra = last.saturating_sub(clear);
         #[allow(clippy::cast_precision_loss)]
         let per = match scene.per {
@@ -580,8 +715,13 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Per::Triangles(t) => format!("{:.0} cycles a triangle", f64::from(extra) / t as f64),
         };
         println!(
-            "| {} | {} | {} | {:.2} | {:.1} | {}{} |",
+            "| {}{} | {} | {} | {:.2} | {:.1} | {}{} |",
             scene.name,
+            if scene.name == GOAL {
+                " (v1.1 goal)"
+            } else {
+                ""
+            },
             m.transactions,
             last,
             ms(last),
@@ -617,5 +757,24 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .collect();
         println!("| {} | {} |", scene.name, cells.join(" | "));
     }
-    Ok(())
+    print_bus(&scenes, &results);
+
+    let goal = figures
+        .iter()
+        .find(|(n, _)| *n == GOAL)
+        .map(|&(_, c)| c)
+        .ok_or("no goal scene")?;
+    println!();
+    println!(
+        "v1.1 goal ({GOAL}, within {FRAME_60} cycles for 60 fps): {goal} cycles, {}",
+        if goal <= FRAME_60 {
+            "met"
+        } else {
+            "not yet met"
+        }
+    );
+    if !problems.is_empty() {
+        return Err(problems.join("; ").into());
+    }
+    baseline(mode, &figures)
 }

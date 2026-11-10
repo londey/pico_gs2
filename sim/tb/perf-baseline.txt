@@ -1,0 +1,14 @@
+clear only	681114
+depth clear only	336779
+full screen, untextured	2407224
+full screen, 64x64 nearest	2460609
+full screen, 64x64 bilinear	2460609
+full screen, 256x256 nearest, minified	4837631
+full screen, 256x256 bilinear, minified	4912683
+full screen, 256x256 bilinear, magnified	2533353
+320 triangles of 8 px, untextured	848203
+160 triangles of 8 px, nearest	767861
+120 triangles of 32 px, untextured	1240490
+cube, untextured	1250699
+cube, nearest	1256638
+cube, bilinear	1256638

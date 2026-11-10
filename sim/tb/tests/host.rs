@@ -316,6 +316,7 @@ fn host_takes_over_and_hands_back() -> Result<(), Box<dyn Error>> {
     assert_eq!(bench.host.unknown_bytes, 0);
     assert!(bench.host.credits() <= FIFO_ENTRIES);
     assert_eq!(out.debug_link_errors_q, 0, "host link errors");
+    assert!(!bench.underflow(), "the display ran short of pixels");
     assert!(
         bench.bus.sdram.violations().is_empty(),
         "{} SDRAM violations",

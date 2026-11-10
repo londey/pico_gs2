@@ -139,6 +139,7 @@ fn combiner_and_alpha_test() -> Result<(), Box<dyn Error>> {
         "the host's frames were never all shown"
     );
     assert_eq!(out.debug_link_errors_q, 0, "host link errors");
+    assert!(!bench.underflow(), "the display ran short of pixels");
     assert!(
         bench.bus.sdram.violations().is_empty(),
         "{} SDRAM violations",

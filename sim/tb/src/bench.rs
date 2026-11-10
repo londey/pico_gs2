@@ -253,6 +253,17 @@ impl<W: Write> Bench<W> {
         Ok((out, Some(shown)))
     }
 
+    /// Whether the display has ever run short of pixels: an active pixel
+    /// whose half-block row wasn't in scan-out's ring (the core's sticky
+    /// `underflow`, `led[3]`). It never should.
+    ///
+    /// # Returns
+    ///
+    /// True if it has.
+    pub fn underflow(&self) -> bool {
+        self.sim.register("underflow").unwrap_or(0) != 0
+    }
+
     /// Flushes the stimulus.
     ///
     /// # Errors

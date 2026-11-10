@@ -150,4 +150,8 @@ for csv in $(ls -S build/stimulus/*.csv); do
     echo "cosim $csv"
 done | parallel stimulus "$slots"
 
+# Drawing speed: no scene slower than its recorded figure (docs/design/
+# draw-speed.md).
+scripts/perf.sh --check
+
 echo "==> check passed"
