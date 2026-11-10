@@ -145,7 +145,7 @@ measurements.
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
 | 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
-| 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done in simulation: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz. On the board: to do |
+| 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz; on the board, three read-backs pixel-exact |
 | 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
 
@@ -417,3 +417,10 @@ About 3%, as the passes now set the pace: in the goal scene a block
 costs about 195 cycles, the pixel pass 64, the texel pass about 75, the
 drain about 13, and about 33 waiting at HANDOFF for the writer, whose
 four runs now take about 34 cycles each. Phase 25 overlaps the passes.
+
+**On the board:** the built-in scene read back pixel for pixel; the
+streamed textured cube, 615 frames at 60.7 fps, read back pixel for
+pixel; so did the combiner demo's last frame. Draw times are about 0.8%
+shorter than Phase 23's on the board, as in simulation: 218,676 cycles
+for a built-in scene frame that took 220,500, and 232,060 for a streamed
+cube frame that took 233,854.
