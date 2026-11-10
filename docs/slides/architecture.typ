@@ -88,14 +88,13 @@
 - *Language:* Sinter. One source compiles to SystemVerilog for the FPGA *and*
   a cycle-accurate Rust simulator, the design's digital twin. There is no
   separate hand-written model.
-- *Today:* 1280×720 DVI from a tiled, triple-buffered 640×360 framebuffer
-  in SDRAM: a spinning Gouraud-shaded cube, depth-tested against a 16-bit Z
-  buffer, drawn by the setup engine and rasteriser at 66 frames per second,
-  shown at 60. Perspective-correct textures through an on-chip cache. A PC
-  drives it with register writes over USB serial, uploads textures and reads
-  frames back; with no PC it plays a built-in scene. Pixel-exact against a
-  reference renderer in simulation, and on the board. The colour combiner
-  and alpha test are next.
+- *v1.0:* 1280×720 DVI from a tiled, triple-buffered 640×360 framebuffer
+  in SDRAM. Gouraud-shaded triangles, depth-tested against a 16-bit Z
+  buffer; perspective-correct textures (RGB565, ARGB4444), nearest or
+  bilinear, through an on-chip cache; an N64-style colour combiner and an
+  alpha test. A PC drives it with register writes over USB serial, uploads
+  textures and reads frames back; with no PC it plays a built-in scene.
+  Pixel-exact against a reference renderer in simulation, and on the board.
 
 #v(0.5em)
 #key
@@ -147,6 +146,8 @@
   built((3, 0), [triangle\ setup], name: <setup>),
   built((4, 0), [traversal +\ iterators], name: <trav>),
   built((5, 0), [tile buffers\ colour + Z], name: <tile>),
+  built((4, -1), [texture pipeline\ + cache], name: <tex>),
+  built((5, -1), [combiner +\ alpha test], name: <comb>),
   built((0, 1), [scene ROM\ (transactions)], name: <rom>),
   built((2, 1), [test-pattern\ fill], name: <fill>),
   built((4, 1), [SDRAM\ arbiter], name: <arb>),
@@ -162,7 +163,10 @@
   edge(<cmd>, <ring>, "-|>"),
   edge(<ring>, <setup>, "-|>"),
   edge(<setup>, <trav>, "-|>"),
-  edge(<trav>, <tile>, "-|>"),
+  edge(<trav>, <tex>, "-|>"),
+  edge(<tex>, <comb>, "-|>"),
+  edge(<comb>, <tile>, "-|>"),
+  edge(<arb>, <tex>, "-|>", bend: 40deg),
   edge(<tile>, <arb>, "<|-|>"),
   edge(<fill>, <arb>, "-|>", bend: -10deg),
   edge(<arb>, <ctl>, "-|>"),
@@ -201,8 +205,9 @@ serialisers and (later) the SPI link have clocks of their own.
 - The simulator *is* the model: tests drive it cycle by cycle against Rust
   models of the SDRAM chip, and the setup engine against its microcode
   interpreter.
-- `just check` replays every stimulus file, including the 6.2M cycles the
-  frame test records, through Verilator, and fails on any difference.
+- `just check` replays every stimulus file, including the 55M cycles the
+  twin tests record, through Verilator, and fails on any difference: about
+  2 minutes, since Sinter rc.3 compiles its simulator.
 - Generated Verilog, crates and bitstreams live in `build/`; never committed.
 
 = Built and running
@@ -325,30 +330,33 @@ serialisers and (later) the SPI link have clocks of their own.
 == From vertices to pixels
 
 #align(center, text(size: 13pt, diagram(
-  spacing: (11mm, 14mm),
+  spacing: (11mm, 18mm),
   node-inset: 6pt,
   built((0, 0), [register writes\ (ROM or host)], name: <pk>),
   built((1, 0), [vertex ring\ 4 slots], name: <vr>),
   built((2, 0), [setup\ 99 cycles / triangle], name: <su>),
   built((3, 0), [traversal\ 8×8 blocks, 1 px/clk], name: <tr>),
-  built((4, 0), [tile buffers\ colour + Z], name: <tb>),
-  chip((4, 1), [SDRAM], name: <sd>),
+  built((4, 0), [texels, combiner\ alpha test], name: <tx>),
+  built((5, 0), [tile buffers\ colour + Z], name: <tb>),
+  chip((4.5, 1), [SDRAM], name: <sd>),
   edge(<pk>, <vr>, "-|>"),
   edge(<vr>, <su>, "-|>"),
   edge(<su>, <tr>, "-|>"),
-  edge(<tr>, <tb>, "-|>"),
-  edge(<sd>, <tb>, "-|>", [Z read], bend: -40deg, label-side: right),
-  edge(<tb>, <sd>, "-|>", [colour + Z,\ masked], bend: -40deg, label-side: right),
+  edge(<tr>, <tx>, "-|>"),
+  edge(<tx>, <tb>, "-|>"),
+  edge(<sd>, <tx>, "-|>", [texels], label-side: left),
+  edge(<tb>, <sd>, "<|-|>", [Z read;\ colour, Z written], label-side: left),
 )))
 
 - *Traversal:* skip blocks wholly outside an edge; step three edge functions
-  and R, G, B with adders; top-left fill rule; colour rounded to RGB565.
-- *Per block:* read its 64 depths (two runs); a pixel is drawn if covered and
-  nearer; then one masked 32-word run per half block with a drawn pixel, for
-  colour and for Z. Setup of the next triangle overlaps traversal of this one.
-- *Per frame:* a clear (colour and Z, 14,400 runs), the triangles, a
-  present. The cube frame takes 1.13 M cycles (15 ms): 66 fps, about half
-  of it the clear.
+  and colour, depth, S′, T′, Q with adders; top-left fill rule.
+- *Per block:* read its 64 depths (two runs); a pixel pass (64 cycles);
+  a texel and combiner pass (64, plus misses); a pixel is drawn if covered,
+  nearer and passing the alpha test; then one masked 32-word run per half
+  block with a drawn pixel, for colour and for Z. About 460 cycles a block.
+- *Per frame:* a clear (colour and Z, 14,400 runs, 9.1 ms), the triangles,
+  a present. The built-in cube frame takes 1.25 M cycles (16.7 ms), over
+  half of it the clear.
 
 == Depth and triple buffering
 
@@ -389,18 +397,20 @@ serialisers and (later) the SPI link have clocks of their own.
   columns: (1fr, 1fr),
   gutter: 1.2em,
   [
-    #set text(size: 14pt)
+    #set text(size: 13pt)
     A *transaction* is 72 bits: read/write, a 7-bit address, 64 bits of data.
     #table(
       columns: (auto, auto, 1fr),
       [*Addr*], [*Register*], [*Holds*],
       [0x00], [`ATTR0`], [RGBA, S′T′ (latched)],
-      [0x06], [`VERTEX_NOKICK`], [X, Y, Z, Q: 16 bits each],
-      [0x07–09], [`VERTEX_KICK_*`], [the same, and draw: strip 012, 021, fan],
-      [0x30], [`RENDER_MODE`], [cull, Z test, Z write, colour write],
-      [0x40], [`FRAME`], [present, clear colour, clear depth],
-      [0x7D], [`SCRATCH`], [reads back what was written],
-      [0x7E], [`STATUS`], [frames, draw cycles, FIFO free],
+      [0x06–09], [`VERTEX_*`], [X, Y, Z, Q; kicks draw],
+      [0x10], [`TEX0_CFG`], [the texture],
+      [0x18–1B], [`CC_MODE` …], [combiner, 2 colours],
+      [0x30], [`RENDER_MODE`], [cull, Z, alpha test],
+      [0x40], [`FRAME`], [present, clears],
+      [0x70–71], [`MEM_*`], [GPU memory access],
+      [0x7D], [`SCRATCH`], [reads back as written],
+      [0x7E], [`STATUS`], [frames, cycles, FIFO],
       [0x7F], [`ID`], [`0x5047533200020000`],
     )
   ],
@@ -445,8 +455,9 @@ serialisers and (later) the SPI link have clocks of their own.
       taken; there is no flow-control wire.
     - *DTR\#* connects the host: the GPU leaves its ROM scene at the next
       present, and goes back to it when the port closes.
-    - *On the board:* a live cube at 60.7 fps; 3,520 transactions/s, 11% of
-      the line. Credits, replies and the hand-over are twin-tested.
+    - *On the board:* `SCRATCH` round-trips six patterns; a live textured
+      cube at 60.2 fps, 3,976 transactions/s, 12% of the line; a frame read
+      back in 1.75 s. Credits, replies and the hand-over are twin-tested.
   ],
 )
 
@@ -473,8 +484,8 @@ serialisers and (later) the SPI link have clocks of their own.
       and up to four blocks are read and tested at once; blended by shifts
       and adds. Free in time; nearest misses only on its one block.
     - *Divide error:* within 1/8 texel down to Q = 1/256.
-    - *Cube:* every block fetched once, nearest or bilinear. On the board:
-      bilinear read back pixel-exact, 61.1 fps drawn (nearest 64.3; different frames).
+    - *Cube:* every block fetched once, nearest or bilinear, in the same
+      cycles. On the board, bilinear, read back pixel-exact.
     - Left: the twin's frames, each pixel-exact against the reference.
   ],
 )
@@ -508,14 +519,26 @@ serialisers and (later) the SPI link have clocks of their own.
 == In simulation
 
 #align(center, image("images/cube-sim.png", height: 80%))
-#align(center, text(size: 14pt)[Cube frame 0 as the frame test decodes it from the simulated DVI
-  output: pixel-exact against the reference renderer, as are the three frames after it.])
+#align(center, text(size: 14pt)[The built-in scene's cube frame 0 as the frame test decodes it
+  from the simulated DVI output: pixel-exact against the reference renderer, as are the three
+  frames after it.])
 
 == On the board
 
-#align(center, image("images/board-phase11.jpg", height: 80%))
-#align(center, text(size: 14pt)[The test card over the test pattern, Phase 11: the same as the
-  simulated frame, which the frame test checks pixel for pixel.])
+#grid(
+  columns: (1fr, 1fr),
+  gutter: 1em,
+  [
+    #align(center, image("images/board-phase11.jpg", height: 62%))
+    #align(center, text(size: 13pt)[Phase 11: the test card over the test pattern, on
+      a monitor.])
+  ],
+  [
+    #align(center, image("images/board-cube-bilinear.png", height: 62%))
+    #align(center, text(size: 13pt)[Phase 18: the bilinear cube `gs-host` streams, read back
+      from the board's SDRAM over the link: pixel for pixel the reference renderer's.])
+  ],
+)
 
 == Triangle setup: what it computes
 
@@ -633,15 +656,16 @@ serialisers and (later) the SPI link have clocks of their own.
   edge(<v>, <b>, "<|-|>", [bitstream]),
 )))
 
-- *Video and SDRAM today:* stimulus CSVs; a frame test decoding four 720p
-  frames pixel-exactly; the SDRAM chip model's datasheet checks; the gearbox
-  testbench; all through `--cosim`.
+- *Video and SDRAM:* directed stimulus CSVs; the SDRAM chip model's
+  datasheet checks; the gearbox testbench.
 - *Setup:* reciprocal over every mantissa, accuracy by triangle shape,
   edge cases, watertightness, interpreter against the bit-exact model, and
   the Sinter engine against the interpreter, its Verilog through `--cosim`.
-- *Drawing:* the frame test checks four consecutive cube frames as shown,
-  and the bank on screen in SDRAM, against a reference renderer built from
-  the same models; it reports the time to draw a frame.
+- *The whole core:* twin tests decode the DVI output with a host on the
+  simulated UART: the built-in scene, the host taking over, memory access,
+  texturing, the combiner. Every frame pixel-exact against a reference
+  renderer built from the same models; every run replayed through
+  Verilator; `just perf` times a set of scenes.
 - Tests are checked by mutation: break the design on purpose, see them fail.
 
 == Resources and timing at v1.0
@@ -743,7 +767,7 @@ serialisers and (later) the SPI link have clocks of their own.
 
 == Open issues
 
-#set text(size: 15pt)
+#set text(size: 13.5pt)
 
 - *Setup speed:* 99 cycles against the brief's 85. A 5-cycle multiplier
   misses 75 MHz. Not the bottleneck at v1.0: a block's SDRAM traffic is.
