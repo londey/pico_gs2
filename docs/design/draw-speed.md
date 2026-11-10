@@ -7,7 +7,7 @@ things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
 **Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done, and
-23 in simulation (§7): **the goal is met** (746,840 cycles, 10 ms). Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
+23 done (§7): **the goal is met** (746,840 cycles, 10 ms). Phase 24 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
 work counts in full only once blocks overlap.
 
 ## 1. Goal
@@ -126,7 +126,7 @@ measurements.
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
-| 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done in simulation: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met. On the board: to do |
+| 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
 | 24 | `phase-24-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
@@ -345,6 +345,11 @@ controller's savings count in full; so the overlap comes first.
 | 320 triangles of 8 px | 122,237 | 92,627 |
 | 120 triangles of 32 px | 389,436 | 223,546 |
 | the cube, bilinear | 398,407 | 236,596 |
+
+**On the board:** the built-in scene read back pixel for pixel, drawn in
+231,418 cycles (324 fps; 391,732 at Phase 22); the streamed textured
+cube, 615 frames at 60.7 fps, each drawn in about 234,000 cycles, read
+back pixel for pixel; so did the combiner demo's last frame.
 
 The goal scene now takes 60% of a 60 fps frame. In it the SDRAM is busy
 90% of the time (drawing 70%, scan-out 20%), so drawing is now limited by
