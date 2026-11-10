@@ -120,18 +120,25 @@ clear (up to 4.5 ms).
   read and pixel pass run. A block then costs about the larger of its
   SDRAM traffic and its computing, not their sum.
 - **Phase 25, the two halves of the fragment pipeline at once:** the
-  pipeline is per fragment, one a clock, but in two halves that today
-  take turns a block at a time. The front half steps the edges and
-  planes, tests depth and works out texel addresses; the back half looks
-  texels up (stalling on a cache miss), filters, combines and alpha
-  tests. Between them are per-block buffers (shades, texel addresses,
-  drawn pixels), so a miss stalls only the back half, which replays from
-  them, and hidden fragments never fetch texels. Doubling those buffers
-  lets the front half fill one block's while the back half drains the
-  last: a 64-fragment FIFO between the halves, the pipeline continuous,
-  about one pass a block instead of two. A second texture or combiner
-  stage would lengthen the back half, adding latency, not cycles a
-  fragment.
+  pipeline is per fragment, one a clock, but in two halves that took turns
+  a block at a time. The front half (TEST, the depth read, PIXELS and
+  DRAIN) steps the edges and planes, tests depth and works out texel
+  addresses; the back half (TEXEL) looks texels up (stalling on a cache
+  miss), filters, combines and alpha tests. Between them are per-block
+  buffers (shades, texel addresses, drawn pixels), so a miss stalls only
+  the back half, which replays from them, and hidden fragments never fetch
+  texels. As built: those buffers have two banks, so the front half fills
+  one block's while the back half reads the last's (in the block RAMs and
+  LUT RAM they already used, not flip-flops); the colour tile has two (the
+  back half's, the writer's); the depth tile three (the front half's, the
+  block the back half holds, the writer's). Three blocks are in flight: the
+  front half's, the back half's and the writer's. A stage hands its block
+  on as soon as the next stage is free, without waiting for anything to
+  drain; a block with no pixel drawn isn't handed on at all. TEST waits
+  while the back half or the writer holds the same block. The front
+  half's depth read and the back half's texel fetch share the read data,
+  so only one is in flight at a time. A second texture or combiner stage
+  would lengthen the back half, adding latency, not cycles a fragment.
 
 ## 4. Phases
 
@@ -146,7 +153,7 @@ measurements.
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
 | 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
 | 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz; on the board, three read-backs pixel-exact |
-| 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
+| 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Done in simulation: pixel-exact; 9 mutations caught; 85.2 MHz; the goal scene 685,775 cycles. On the board: to do |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
 
 **Estimates**, per block a triangle touches (§2's 460 cycles today) and
@@ -424,3 +431,58 @@ pixel; so did the combiner demo's last frame. Draw times are about 0.8%
 shorter than Phase 23's on the board, as in simulation: 218,676 cycles
 for a built-in scene frame that took 220,500, and 232,060 for a streamed
 cube frame that took 233,854.
+
+### Phase 25: both halves at once
+
+- **As built (§3.3):** the rasteriser's one state machine became three
+  stages, each on its own block: the front half (TEST, the depth read,
+  PIXELS, DRAIN, then HANDOFF to the back half), the back half (TEXEL,
+  then HANDOFF to the writer) and the writer. The shade and texel-address
+  tiles have two banks, in the LUT RAM and block RAMs they already used
+  (the address tiles deeper in the same block RAMs); the colour tile two;
+  the depth tile three. The front half used to write each pixel's shade
+  into the colour tile, which TEXEL then overwrote; it no longer does, so
+  the colour tile has one writer. A block with no pixel drawn stops at
+  the front half. TEST waits while the back half or the writer holds its
+  block, and the depth read and a texel fetch are never in flight
+  together (the read data has no owner tag within the rasteriser).
+- **Timing:** the three-bank depth tile is in a block RAM (in LUT RAM it
+  would have doubled), whose output reached the depth test at 68.3 MHz.
+  It is now read a pixel ahead and registered, so the RAM's output only
+  reaches a register: 85.2 MHz (83.5 at Phase 24) in 19,030 cells (78%,
+  unchanged), 8,529 flip-flops (+131), 38 DP16KD (+2).
+- **Tests:** pixel-exact, and the SDRAM model clean, on every twin test.
+  9 deliberate breaks, each caught: TEST not waiting for the back half;
+  two depth banks, not three; the back half reading the front half's
+  bank; the alpha test or the writer's enables taken from the front
+  half's triangle; the depth read and a texel fetch in flight together;
+  the front half handing on while the back half is busy, or the back
+  half while the writer is; the depth tile not read a pixel ahead.
+- **`just perf`** gains a table of what the back half and the writer did.
+
+| Scene | Phase 24 | Phase 25 |
+|---|---|---|
+| full screen, untextured | 698,541 | 684,782 |
+| **full screen, 64 × 64 bilinear (the goal)** | **726,644** | **685,775 (9.1 ms)** |
+| full screen, 256 × 256 bilinear, minified | 3,258,290 | 3,186,341 |
+| full screen, 256 × 256 magnified | 823,466 | 744,464 |
+| 320 triangles of 8 px | 92,885 | 86,543 |
+| 120 triangles of 32 px | 220,204 | 208,160 |
+| the cube, bilinear | 234,695 | 206,199 |
+
+6% on the goal scene, short of the ~600,000 estimated: the writer is
+busy 98.4% of it, so the SDRAM sets the pace. A block is 128 words
+written (64 colours, 64 depths, four runs of about 34 cycles), and
+scan-out takes 19% of the bus; the goal scene runs at 190 cycles a block,
+the bus 91% busy. My Phase 24 reading, that the passes set the pace, was
+only half right: at 195 cycles a block the writer was within a few
+percent of the limit already. Scenes that read depth (the cube, 12%) or
+fetch texels (magnified, 10%) gain more, since that work now overlaps
+the writer's. Small triangles spend about a third of their time in TEST,
+waiting for a block the previous triangle still holds in the back half
+or the writer.
+
+What could go further: 64-word runs (a few percent); fewer words written
+a block; or testing a later triangle's pixels against the block in
+flight instead of waiting for it.
+

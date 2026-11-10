@@ -19,7 +19,10 @@
 //           block from SDRAM) and multiplies it by the shade; and writes the
 //           block's colours and depths back, each half block with a drawn
 //           pixel as one masked 32-word SDRAM run, as the triangle's render
-//           mode allows.
+//           mode allows. Three stages work on three blocks at once (docs/
+//           design/draw-speed.md §3.3): the front half (depth read, pixels,
+//           texel addresses), the back half (texels, combiner, alpha test)
+//           and the writer, with banked tile buffers between them.
 //
 // The golden model is models/setup's reference renderer (render.rs) on what
 // scene.rs's `interpret` makes of the same transactions; the frame tests
@@ -85,22 +88,30 @@ const M_MOVE: u2 = 2;
 // Words in a MEM_DATA access: 64 bits.
 const MEM_WORDS: u6 = 4;
 
-// Raster states.
+// Raster states: the front half of the fragment pipeline (and the clear,
+// the copy and the flush).
 const R_IDLE: u4 = 0;
 const R_COPY: u4 = 1;
 const R_INIT: u4 = 2;
 const R_TEST: u4 = 3;
 const R_PIXELS: u4 = 4;
-// HANDOFF: the passes are done with a block; it goes to the writer once
-// the writer is free.
+// HANDOFF: the front half is done with a block; it goes to the back half
+// once the back half is free (or nowhere, if no pixel of it is drawn).
 const R_HANDOFF: u4 = 5;
 const R_NEXT: u4 = 6;
 const R_DECIDE: u4 = 7;
 const R_ZREAD: u4 = 8;
 const R_CLEAR: u4 = 9;
 const R_DRAIN: u4 = 10;
-const R_TEXEL: u4 = 11;
+// (11 was TEXEL, now the back half's.)
 const R_FLUSH: u4 = 12;
+
+// The back half's states: free; TEXEL, its block's texels looked up,
+// filtered, combined and alpha tested; HANDOFF, the block goes to the
+// writer once the writer is free.
+const B_FREE: u2 = 0;
+const B_TEXEL: u2 = 1;
+const B_HANDOFF: u2 = 2;
 
 // DRAIN: cycles after a block's last pixel until its depth test is done,
 // and until its texel address is (the texture pipeline's depth).
@@ -658,6 +669,11 @@ pub struct Raster {
     zt_cov: u1 = 0,
     #[no_reset]
     zt_z: u16 = 0,
+    // The depth there, from the depth tile (read a pixel ahead, so that
+    // the block RAM's slow output only reaches this register), or FAR for
+    // a block whose depth is cleared.
+    #[no_reset]
+    zt_zbuf: u16 = 0,
     #[no_reset]
     zt_shade: u32 = 0,
     // DRAIN: cycles left.
@@ -792,7 +808,8 @@ pub struct Raster {
     // bank.
     need_flush: u1 = 1,
     flush_line: u8 = 0,
-    // Which of the block's pixels are drawn (covered and nearer).
+    // Which of the front half's block's pixels are drawn (covered and
+    // nearer).
     #[no_reset]
     mask: u64 = 0,
     // TEST's verdict, acted on in DECIDE.
@@ -802,20 +819,45 @@ pub struct Raster {
     zgot: u7 = 0,
     // TEXEL: whether the missing block's request has been taken.
     requested: u1 = 0,
-    // Which of the passes (1) and the writer (2) has its run in front of
-    // the SDRAM arbiter, held until accepted (0: neither).
+    // Whose run is in front of the SDRAM arbiter, held until accepted: the
+    // front half's depth read (1), the writer's (2), the back half's
+    // texture block (3); 0 none.
     pres: u2 = 0,
-    // The tile buffers' bank the passes use; the writer uses the other.
-    sel: u1 = 0,
-    // The writer: writes a block the passes have finished (HANDOFF) while
-    // they go on to the next. Its state (0 free, 1 writing its runs, 2
-    // writing its block's flags back), its tile bank, its block (word
+    // The banks of the buffers between the stages (two of each, three of
+    // the depth tile): the shade and texel-address tiles the front half
+    // fills (`fsel`) and the back half reads (`bsel`); the colour tile the
+    // back half fills (`csel`) and the writer reads (`w_sel`); the depth
+    // tile the front half fills (`fz`, 0 to 2), the back half holds (`bz`)
+    // and the writer reads (`w_z`).
+    fsel: u1 = 0,
+    bsel: u1 = 0,
+    csel: u1 = 0,
+    fz: u2 = 0,
+    bz: u2 = 0,
+    // The back half: looks texels up for a block the front half has
+    // finished (HANDOFF) while the front half goes on to the next. Its
+    // state (`B_*`), its block (word base and number), drawn pixels (the
+    // alpha test may clear some), cleared flags and the triangle's
+    // RENDER_MODE bits.
+    b_state: u2 = 0,
+    #[no_reset]
+    b_base: u19 = 0,
+    #[no_reset]
+    b_blk: u12 = 0,
+    #[no_reset]
+    b_mask: u64 = 0,
+    b_bflags: u4 = 0,
+    b_flags: u13 = 7,
+    // The writer: writes a block the back half has finished (its HANDOFF)
+    // while it goes on to the next. Its state (0 free, 1 writing its runs,
+    // 2 writing its block's flags back), its tile banks, its block (word
     // base and number), drawn pixels, cleared flags and the triangle's
     // colour and depth write enables; its run (bit 0 the half block, bit 1
     // depth rather than colour), the word being sent, and whether the run
     // has been taken.
     w_state: u2 = 0,
     w_sel: u1 = 0,
+    w_z: u2 = 0,
     #[no_reset]
     w_base: u19 = 0,
     #[no_reset]
@@ -853,29 +895,32 @@ pub struct Raster {
     // triangle being drawn, and for the one waiting to be copied.
     flags: u13 = 7,
     pending_flags: u13 = 7,
-    // The block's colours and depths, in raster order: two banks (`sel`),
-    // one for the passes, one for the writer. Read ports: `tile` the
-    // writer; `ztile` the depth test, then the writer.
+    // A block's colours, in raster order: two banks, one the back half
+    // fills (`csel`), one the writer reads (`w_sel`).
     #[storage(lutram)]
     #[no_reset]
     tile: mem<u16, 128> = 0,
-    #[storage(lutram)]
-    #[no_reset]
-    ztile: mem<u16, 128, 2> = 0,
-    // The block's shades, and its pixels' texel addresses, in raster
-    // order: the tags of the blocks of the four texels a pixel takes, then
-    // the texels' columns and rows (low 6 bits; first, second), and the
-    // weights of the second column and row (`atile`: tags 00 and 01, then
-    // the columns and rows; `btile`: tags 10 and 11, then the weights).
-    #[storage(lutram)]
-    #[no_reset]
-    stile: mem<u32, 64> = 0,
+    // A block's depths: three banks (of four), the front half's (`fz`),
+    // the back half's (`bz`, held for the writer) and the writer's (`w_z`).
+    // Read ports: the depth test, the writer.
     #[storage(bram)]
     #[no_reset]
-    atile: mem<u64, 64> = 0,
+    ztile: mem<u16, 256, 2> = 0,
+    // A block's shades, and its pixels' texel addresses, in raster order:
+    // the tags of the blocks of the four texels a pixel takes, then the
+    // texels' columns and rows (low 6 bits; first, second), and the weights
+    // of the second column and row (`atile`: tags 00 and 01, then the
+    // columns and rows; `btile`: tags 10 and 11, then the weights). Two
+    // banks, the front half's (`fsel`) and the back half's (`bsel`).
+    #[storage(lutram)]
+    #[no_reset]
+    stile: mem<u32, 128> = 0,
     #[storage(bram)]
     #[no_reset]
-    btile: mem<u48, 64> = 0,
+    atile: mem<u64, 128> = 0,
+    #[storage(bram)]
+    #[no_reset]
+    btile: mem<u48, 128> = 0,
     // The texture cache: 256 lines, each a 4x4 block of texels, line
     // (by mod 16, bx mod 16). The texels are in four banks by the parity
     // of their column and row (bank v[0] @ u[0], at line @ v[1] @ u[1]),
@@ -1150,10 +1195,25 @@ impl Raster {
         drawn & enabled == 1
     }
 
-    // The passes want a run: a depth read in ZREAD, a texture block in
-    // TEXEL; not yet taken.
-    fn want_passes(self) -> u1 {
-        (self.state == R_ZREAD & self.zreq != 2) | (self.state == R_TEXEL & self.filling == 1 & self.requested == 0)
+    // The front half's depth read has a run accepted and its data still
+    // coming; the back half's texture block has.
+    fn z_inflight(self) -> u1 {
+        self.state == R_ZREAD & self.zreq != 0
+    }
+
+    fn fill_inflight(self) -> u1 {
+        self.b_state == B_TEXEL & self.filling == 1 & self.requested == 1
+    }
+
+    // The front half wants a depth run, not yet taken; the back half its
+    // missing texture block. Neither while the other's data is coming:
+    // the words that come back are then the one in flight's.
+    fn want_z(self) -> u1 {
+        self.state == R_ZREAD & self.zreq != 2 & !self.fill_inflight()
+    }
+
+    fn want_fill(self) -> u1 {
+        self.b_state == B_TEXEL & self.filling == 1 & self.requested == 0 & !self.z_inflight()
     }
 
     // The writer wants its run, not yet taken.
@@ -1162,13 +1222,15 @@ impl Raster {
     }
 
     // Whose run is in front of the arbiter: the one already there until it
-    // is accepted, else the passes', else the writer's (1 passes, 2
-    // writer, 0 none).
+    // is accepted, else the front half's, else the back half's, else the
+    // writer's (1 front, 3 back, 2 writer, 0 none).
     fn presenting(self, draw: u2) -> u2 {
         if self.pres != 0 {
             self.pres
-        } else if self.want_passes() == 1 {
+        } else if self.want_z() == 1 {
             1
+        } else if self.want_fill() == 1 {
+            3
         } else if self.want_writer(draw) == 1 {
             2
         } else {
@@ -1183,7 +1245,7 @@ impl Raster {
         let req = if who == 2 {
             let addr = (self.w_base + (0_u13 @ self.w_run[0:0] @ 0_u5)) as u19 wrap;
             SdramReq { write: 1, addr: self.run_bank(draw) @ 0_u3 @ addr, len: 32 }
-        } else if self.state == R_ZREAD {
+        } else if who == 1 {
             let addr = (base + (0_u13 @ self.zreq[0:0] @ 0_u5)) as u19 wrap;
             SdramReq { write: 0, addr: DEPTH_BANK @ 0_u3 @ addr, len: 32 }
         } else {
@@ -1204,7 +1266,7 @@ impl Raster {
         RasterOut {
             out_raddr: copy_slot(self.copy),
             pending: self.pending,
-            busy: self.state != R_IDLE | self.pending == 1 | self.w_state != 0,
+            busy: self.state != R_IDLE | self.pending == 1 | self.b_state != B_FREE | self.w_state != 0,
             req: if who != 0 { Some(req) } else { None },
             wdata: wdata,
             wmask: if cleared { 0 } else { !drawn_here },
@@ -1280,6 +1342,9 @@ impl Raster {
         // ---- ZREAD: the block's 64 depths, two runs. ---------------------
         let reading = st == R_ZREAD;
         let zread_done = reading & self.zgot == 64;
+        // Read data is the depth read's while it is in flight, else the
+        // texture block's.
+        let z_word = zin & self.z_inflight();
 
         // ---- PIXELS: each pixel's coverage, depth and shade, then (a cycle
         // later, in the depth test's stage) drawn if covered and (with the
@@ -1287,9 +1352,7 @@ impl Raster {
         let stepping = st == R_PIXELS;
         let covered = inside(self.e0) & inside(self.e1) & inside(self.e2);
         let shade = s8(self.pr.pix) @ s8(self.pg.pix) @ s8(self.pb.pix) @ s8(self.pa.pix);
-        // A block whose depth is cleared wasn't read: it is all FAR.
-        let zbuf = if self.bflags[3:3] == 1 { FAR } else { self.ztile.value()[0] };
-        let nearer = self.zt_z < zbuf | self.flags[0:0] == 0;
+        let nearer = self.zt_z < self.zt_zbuf | self.flags[0:0] == 0;
         let drawn = self.zt_valid == 1 & self.zt_cov == 1 & nearer;
         let row_end = self.pix[2:0] == 7;
         let block_end = self.pix == 63;
@@ -1334,13 +1397,14 @@ impl Raster {
         let entry = tag00 @ tag01 @ t12.tu[5:0] @ t12.tu1[5:0] @ t12.tv[5:0] @ t12.tv1[5:0];
         let entry2 = tag10 @ tag11 @ t12.fu @ t12.fv;
 
-        // ---- TEXEL: each pixel's texels through the cache, in order: its
+        // ---- The back half, TEXEL: each pixel's texels through the cache,
+        // in order: its
         // addresses read; the cache's banks and its shade read, each bank's
         // tag and texel routed to the block and texel it serves; then a
         // hit, or a pixel not drawn, goes on to the filter, and a miss
         // fetches the first missing block and looks that pixel up again. A
         // second column or row with no weight is not needed. ---------------
-        let texeling = st == R_TEXEL;
+        let texeling = self.b_state == B_TEXEL;
         let pass = texeling & self.filling == 0;
         let a1 = self.atile.value();
         let b1 = self.btile.value();
@@ -1401,8 +1465,8 @@ impl Raster {
         let c5 = self.tx5;
         let c6 = self.tx6;
         let c7 = self.tx7;
-        let alpha_test = self.flags[4:3];
-        let alpha_ref = self.flags[12:5];
+        let alpha_test = self.b_flags[4:3];
+        let alpha_ref = self.b_flags[12:5];
         let alpha = c7.out[7:0];
         let alpha_pass = alpha_test == 0
             | (alpha_test == 1 & alpha < alpha_ref)
@@ -1411,7 +1475,7 @@ impl Raster {
         let tx_write = texeling & self.tx7_valid == 1;
         let alpha_fail = tx_write & c7.drawn == 1 & !alpha_pass;
         let texel_done = tx_write & c7.pix == 63;
-        let fill_word = texeling & self.filling == 1 & zin == 1;
+        let fill_word = texeling & self.filling == 1 & self.requested == 1 & zin == 1;
         let fill_done = fill_word & self.fill_got == 15;
 
         // ---- FLUSH: every cache line's tag cleared. ----------------------
@@ -1420,16 +1484,22 @@ impl Raster {
 
         // ---- The SDRAM: whose run was accepted (the one presented). ------
         let who = self.presenting(draw);
-        let acc_passes = accepted & who == 1;
+        let acc_z = accepted & who == 1;
+        let acc_fill = accepted & who == 3;
         let acc_writer = accepted & who == 2;
 
-        // ---- HANDOFF: the block goes to the writer once it is free. -------
-        let handing = st == R_HANDOFF & self.w_state == 0;
+        // ---- HANDOFF: the front half's block goes to the back half once
+        // it is free; a block with no pixel drawn goes nowhere. The back
+        // half's goes to the writer once it is free. ---------------------
+        let f_handing = st == R_HANDOFF & (self.b_state == B_FREE | self.mask == 0);
+        let to_back = f_handing & self.mask != 0;
+        let b_handing = self.b_state == B_HANDOFF & self.w_state == 0;
         let blk = block_base(self.bx, self.by)[17:6];
-        // A block the writer still has (its flags not yet written back) is
-        // not tested again until it has written it: a later triangle's
-        // block must see the earlier one's depths and flags.
-        let wait_writer = self.w_state != 0 & self.w_blk == blk;
+        // A block the back half or the writer still has (its flags not yet
+        // written back) is not tested again until it has been written: a
+        // later triangle's block must see the earlier one's depths and
+        // flags.
+        let wait_writer = (self.b_state != B_FREE & self.b_blk == blk) | (self.w_state != 0 & self.w_blk == blk);
 
         // ---- The writer: colours then depths, each half block with a
         // drawn pixel one run (both halves for a cleared buffer); then the
@@ -1451,7 +1521,8 @@ impl Raster {
             if clearing == 1 {
                 R_CLEAR
             } else if self.pending == 1 & self.need_flush == 1 {
-                R_FLUSH
+                // The back half uses the cache: it must be done.
+                if self.b_state == B_FREE { R_FLUSH } else { R_IDLE }
             } else if self.pending == 1 {
                 R_COPY
             } else {
@@ -1460,11 +1531,9 @@ impl Raster {
         } else if flushing {
             if flush_done { R_IDLE } else { R_FLUSH }
         } else if draining {
-            if !drained { R_DRAIN } else { R_TEXEL }
-        } else if texeling {
-            if texel_done { R_HANDOFF } else { R_TEXEL }
+            if !drained { R_DRAIN } else { R_HANDOFF }
         } else if st == R_HANDOFF {
-            if handing { R_NEXT } else { R_HANDOFF }
+            if f_handing { R_NEXT } else { R_HANDOFF }
         } else if st == R_CLEAR {
             if clear_done { R_IDLE } else { R_CLEAR }
         } else if st == R_COPY {
@@ -1507,15 +1576,15 @@ impl Raster {
         } else {
             M_HOLD
         };
-        // The depth tile: filled by ZREAD, read in PIXELS for the depth
-        // test a cycle later (a memory read takes a cycle) and written with
-        // each pixel's depth there, read with the colours in WRITE.
-        let zraddr: u6 = if stepping { self.pix } else { 0 };
-        let zwe = (reading & zin) | self.zt_valid;
+        // The depth tile: filled by ZREAD; read a pixel ahead in PIXELS (and
+        // pixel 0 the cycle before), so that each pixel's depth is there as
+        // it is stepped, registered for the depth test a cycle later, and
+        // written with the pixel's depth there; read by the writer.
+        let zraddr: u6 = if stepping { (self.pix + 1) as u6 wrap } else { 0 };
+        let zwe = (reading & z_word) | self.zt_valid;
         let zwaddr: u6 = if reading { self.zgot[5:0] } else { self.zt_pix };
         let zwdata: u16 = if reading { zword } else { self.zt_z };
-        // The colour tile: each pixel's shade from the depth test's stage,
-        // then, textured, texture x shade from TEXEL's last.
+        // The colour tile: each pixel's colour from TEXEL's last stage.
         // The cache's writes: a fetched block's words, each to its texel's
         // bank; its tag when the last arrives; or, in FLUSH, a tag of each
         // bank cleared each cycle.
@@ -1524,9 +1593,7 @@ impl Raster {
         let tag_bank = self.fill_line[4:4] @ self.fill_line[0:0];
         let tag_waddr = if flushing { self.flush_line[5:0] } else { self.fill_line[7:5] @ self.fill_line[3:1] };
         let tag_wdata: u21 = if flushing { 0 } else { 1_u1 @ self.fill_tag };
-        let cwe = self.zt_valid | tx_write;
-        let cwaddr: u6 = if texeling { c7.pix } else { self.zt_pix };
-        let cwdata: u24 = if texeling { c7.out[31:8] } else { self.zt_shade[31:8] };
+        let cwdata = c7.out[31:8];
 
         // The cleared flags: CLEAR reads each block and writes it back a
         // cycle later with the cleared buffers' bits set; TEST reads the
@@ -1590,6 +1657,8 @@ impl Raster {
                 zt_pix: self.pix,
                 zt_cov: covered,
                 zt_z: depth(self.pz.pix),
+                // A block whose depth is cleared wasn't read: it is all FAR.
+                zt_zbuf: if self.bflags[3:3] == 1 { FAR } else { self.ztile.value()[0] },
                 zt_shade: shade,
                 drain: if stepping { if textured { DRAIN_TEXTURED } else { DRAIN_PLAIN } } else { (self.drain - 1) as u4 wrap },
                 tp1: t0,
@@ -1674,7 +1743,7 @@ impl Raster {
                 tx2_pix: self.tx1_pix,
                 tx2_addr: a1,
                 tx2_addr2: b1,
-                tx2_drawn: (self.mask >> self.tx1_pix)[0:0],
+                tx2_drawn: (self.b_mask >> self.tx1_pix)[0:0],
                 tx3_valid: pass & !tx_miss & self.tx2_valid == 1,
                 tx3_pix: self.tx2_pix,
                 tx3_addr: e2,
@@ -1758,19 +1827,41 @@ impl Raster {
                     0
                 } else if drawn {
                     self.mask | ((0_u63 @ drawn) << self.zt_pix)
-                } else if alpha_fail {
-                    // A pixel the alpha test fails writes neither colour
-                    // nor depth.
-                    self.mask & (((0_u63 @ 1_u1) << c7.pix) ^ 0xFFFFFFFFFFFFFFFF)
                 } else {
                     self.mask
                 },
-                zreq: if reading { (self.zreq + acc_passes) as u2 wrap } else { 0 },
-                zgot: if reading { (self.zgot + zin) as u7 wrap } else { 0 },
-                requested: if texeling & self.filling == 1 & !fill_done { self.requested | acc_passes } else { 0 },
+                b_mask: if to_back {
+                    self.mask
+                } else if alpha_fail {
+                    // A pixel the alpha test fails writes neither colour
+                    // nor depth.
+                    self.b_mask & (((0_u63 @ 1_u1) << c7.pix) ^ 0xFFFFFFFFFFFFFFFF)
+                } else {
+                    self.b_mask
+                },
+                zreq: if reading { (self.zreq + acc_z) as u2 wrap } else { 0 },
+                zgot: if reading { (self.zgot + z_word) as u7 wrap } else { 0 },
+                requested: if texeling & self.filling == 1 & !fill_done { self.requested | acc_fill } else { 0 },
                 pres: if accepted == 1 { 0 } else { who },
-                sel: if handing { !self.sel } else { self.sel },
-                w_state: if handing {
+                fsel: if to_back { !self.fsel } else { self.fsel },
+                bsel: if to_back { self.fsel } else { self.bsel },
+                csel: if b_handing { !self.csel } else { self.csel },
+                fz: if to_back { if self.fz == 2 { 0 } else { (self.fz + 1) as u2 wrap } } else { self.fz },
+                bz: if to_back { self.fz } else { self.bz },
+                b_state: if to_back {
+                    B_TEXEL
+                } else if texel_done {
+                    B_HANDOFF
+                } else if b_handing {
+                    B_FREE
+                } else {
+                    self.b_state
+                },
+                b_base: if to_back { block_base(self.bx, self.by) } else { self.b_base },
+                b_blk: if to_back { blk } else { self.b_blk },
+                b_bflags: if to_back { self.bflags } else { self.b_bflags },
+                b_flags: if to_back { self.flags } else { self.b_flags },
+                w_state: if b_handing {
                     1
                 } else if run_done & self.w_run == 3 {
                     2
@@ -1779,12 +1870,13 @@ impl Raster {
                 } else {
                     self.w_state
                 },
-                w_sel: if handing { self.sel } else { self.w_sel },
-                w_base: if handing { block_base(self.bx, self.by) } else { self.w_base },
-                w_blk: if handing { blk } else { self.w_blk },
-                w_mask: if handing { self.mask } else { self.w_mask },
-                w_bflags: if handing {
-                    self.bflags
+                w_sel: if b_handing { self.csel } else { self.w_sel },
+                w_z: if b_handing { self.bz } else { self.w_z },
+                w_base: if b_handing { self.b_base } else { self.w_base },
+                w_blk: if b_handing { self.b_blk } else { self.w_blk },
+                w_mask: if b_handing { self.b_mask } else { self.w_mask },
+                w_bflags: if b_handing {
+                    self.b_bflags
                 } else if run_done & self.w_run[0:0] == 1 & used {
                     // Both of this buffer's runs are out: the block is in
                     // SDRAM now.
@@ -1792,9 +1884,9 @@ impl Raster {
                 } else {
                     self.w_bflags
                 },
-                w_en: if handing { self.flags[2:1] } else { self.w_en },
-                w_run: if handing { 0 } else if run_done { next_run } else { self.w_run },
-                w_pix: if handing {
+                w_en: if b_handing { self.b_flags[2:1] } else { self.w_en },
+                w_run: if b_handing { 0 } else if run_done { next_run } else { self.w_run },
+                w_pix: if b_handing {
                     0
                 } else if run_done {
                     // The next run's half block.
@@ -1816,11 +1908,11 @@ impl Raster {
                 } else {
                     self.clear_colours
                 },
-                tile: self.tile.next(self.w_sel @ read_ptr, cwe, self.sel @ cwaddr, cwdata[23:19] @ cwdata[15:10] @ cwdata[7:3]),
-                ztile: self.ztile.next([self.sel @ zraddr, self.w_sel @ read_ptr], zwe, self.sel @ zwaddr, zwdata),
-                stile: self.stile.next(self.tx1_pix, self.zt_valid, self.zt_pix, self.zt_shade),
-                atile: self.atile.next(self.tx_issue[5:0], t13.valid, t13.pix, t13.entry),
-                btile: self.btile.next(self.tx_issue[5:0], t13.valid, t13.pix, t13.entry2),
+                tile: self.tile.next(self.w_sel @ read_ptr, tx_write, self.csel @ c7.pix, cwdata[23:19] @ cwdata[15:10] @ cwdata[7:3]),
+                ztile: self.ztile.next([self.fz @ zraddr, self.w_z @ read_ptr], zwe, self.fz @ zwaddr, zwdata),
+                stile: self.stile.next(self.bsel @ self.tx1_pix, self.zt_valid, self.fsel @ self.zt_pix, self.zt_shade),
+                atile: self.atile.next(self.bsel @ self.tx_issue[5:0], t13.valid, self.fsel @ t13.pix, t13.entry),
+                btile: self.btile.next(self.bsel @ self.tx_issue[5:0], t13.valid, self.fsel @ t13.pix, t13.entry2),
                 ctag0: self.ctag0.next(tag_index(0, a1), (fill_done & tag_bank == 0) | flushing, tag_waddr, tag_wdata),
                 ctag1: self.ctag1.next(tag_index(1, a1), (fill_done & tag_bank == 1) | flushing, tag_waddr, tag_wdata),
                 ctag2: self.ctag2.next(tag_index(2, a1), (fill_done & tag_bank == 2) | flushing, tag_waddr, tag_wdata),

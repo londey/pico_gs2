@@ -455,7 +455,7 @@ fn textured_frames() -> Result<(), Box<dyn Error>> {
         // The cube is drawn after the host's third present (the fourth
         // counted: the ROM's last, at which the host takes over, is one).
         if host_presents == 4 {
-            let texel = reg("raster_state") == 11;
+            let texel = reg("raster_b_state") == 1;
             let filling = reg("raster_filling") == 1;
             lookups += u64::from(
                 texel && !filling && reg("raster_tx3_valid") == 1 && reg("raster_tx3_drawn") == 1,

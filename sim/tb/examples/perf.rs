@@ -415,10 +415,20 @@ fn frame(present: bool, clear_colour: bool) -> Transaction {
     )
 }
 
-/// The rasteriser's states (`hw/raster.snt`, `R_*`), by value.
+/// The rasteriser's front half's states (`hw/raster.snt`, `R_*`), by
+/// value; 11 is unused.
 const RASTER_STATES: [&str; 13] = [
     "idle", "copy", "init", "test", "pixels", "handoff", "next", "decide", "zread", "clear",
-    "drain", "texel", "flush",
+    "drain", "-", "flush",
+];
+
+/// What the stages after the front half were doing, counted in
+/// [`Measured::stages`].
+const STAGES: [&str; 4] = [
+    "back: texels",
+    "back: fetching",
+    "back: waiting for the writer",
+    "writer: busy",
 ];
 
 /// One scene's result.
@@ -433,6 +443,9 @@ struct Measured {
 
     /// Cycles in each rasteriser state over the last frame.
     states: [u32; 16],
+
+    /// Cycles of the last frame in each of [`STAGES`].
+    stages: [u32; 4],
 
     /// The SDRAM over the last frame: cycles in a run of each owner
     /// (`hw/gpu.snt`'s `OWNER_*`), and at 0 the cycles in no run (idle,
@@ -494,6 +507,8 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
     let mut starving = 0;
     let mut states = [0_u32; 16];
     let mut last_states = [0_u32; 16];
+    let mut stages = [0_u32; 4];
+    let mut last_stages = [0_u32; 4];
     let mut bus = [0_u32; 8];
     let mut last_bus = [0_u32; 8];
     let mut counting = 0;
@@ -509,6 +524,8 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
                 cycles.push(u32::try_from(reg("debug_render_cycles"))?);
                 starved.push(starving);
                 last_states = states;
+                last_stages = stages;
+                stages = [0; 4];
                 last_bus = bus;
                 bus = [0; 8];
                 starving = 0;
@@ -520,6 +537,16 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
                     starving += 1;
                 }
                 states[usize::try_from(reg("raster_state") & 0xF)?] += 1;
+                let filling = reg("raster_filling") == 1;
+                match reg("raster_b_state") {
+                    1 if filling => stages[1] += 1,
+                    1 => stages[0] += 1,
+                    2 => stages[2] += 1,
+                    _ => {}
+                }
+                if reg("raster_w_state") != 0 {
+                    stages[3] += 1;
+                }
                 // The controller's Access and Close states: in a run.
                 let in_run = matches!(reg("sdram_state"), 3 | 4);
                 let owner = if in_run { reg("data_owner") & 7 } else { 0 };
@@ -560,6 +587,7 @@ fn measure(scene: &Scene) -> Result<Measured, Box<dyn Error + Send + Sync>> {
         cycles,
         starved,
         states: last_states,
+        stages: last_stages,
         bus: last_bus,
         underflow: bench.underflow(),
         transactions: one.len(),
@@ -591,6 +619,25 @@ enum Mode {
     Check,
     /// Write the figures as the new record.
     Record,
+}
+
+/// Prints a table of what the back half and the writer did in each
+/// scene's last frame.
+fn print_stages(scenes: &[Scene], results: &[Measured]) {
+    println!();
+    println!("The back half and the writer over the last frame (% of its cycles):");
+    println!();
+    println!("| Scene | {} |", STAGES.join(" | "));
+    println!("|---|{}", "---|".repeat(STAGES.len()));
+    for (scene, m) in scenes.iter().zip(results) {
+        let total: u32 = m.states.iter().sum();
+        let cells: Vec<String> = m
+            .stages
+            .iter()
+            .map(|&c| format!("{:.1}", f64::from(c) * 100.0 / f64::from(total.max(1))))
+            .collect();
+        println!("| {} | {} |", scene.name, cells.join(" | "));
+    }
 }
 
 /// Prints a table of each scene's SDRAM use by owner.
@@ -757,6 +804,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .collect();
         println!("| {} | {} |", scene.name, cells.join(" | "));
     }
+    print_stages(&scenes, &results);
     print_bus(&scenes, &results);
 
     let goal = figures

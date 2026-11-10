@@ -350,13 +350,14 @@ serialisers and (later) the SPI link have clocks of their own.
 
 - *Traversal:* skip blocks wholly outside an edge; step three edge functions
   and colour, depth, S′, T′, Q with adders; top-left fill rule.
-- *Per block:* read its 64 depths (two runs); a pixel pass (64 cycles);
-  a texel and combiner pass (64, plus misses); a pixel is drawn if covered,
-  nearer and passing the alpha test; then one masked 32-word run per half
-  block with a drawn pixel, for colour and for Z. About 460 cycles a block.
-- *Per frame:* a clear (colour and Z, 14,400 runs, 9.1 ms), the triangles,
-  a present. The built-in cube frame takes 1.25 M cycles (16.7 ms), over
-  half of it the clear.
+- *Per block:* read its 64 depths (two runs, none if cleared); the front
+  half (64 cycles); the back half (64, plus misses); a pixel is drawn if
+  covered, nearer and passing the alpha test; then one masked 32-word run
+  per half block with a drawn pixel, for colour and for Z. Front half,
+  back half and writer each work on a different block (next slides).
+- *Per frame:* a clear (flags only: 3,603 cycles), the triangles, a
+  present. The built-in cube frame takes about 0.2 M cycles (2.8 ms; 1.25
+  M at v1.0).
 
 == Depth and triple buffering
 
@@ -388,6 +389,130 @@ serialisers and (later) the SPI link have clocks of their own.
       seamlessly; two triangles crossing in depth test the Z buffer.
   ],
 )
+
+== The fragment pipeline (v1.1)
+
+// A stall point: where a stage can wait, keyed in the list below.
+#let stall-colour = rgb("#dc2626")
+#let stall(n) = box(
+  fill: stall-colour,
+  radius: 50%,
+  inset: (x: 3.5pt, y: 2pt),
+  text(fill: white, weight: "bold", size: 9pt, n),
+)
+
+#align(center, text(size: 11pt, diagram(
+  spacing: (7mm, 12mm),
+  node-inset: 5pt,
+  built((0, 0), [setup\ 99 cycles\ a triangle #stall("1")], name: <su>),
+  built((1, 0), [*front half* #stall("2") #stall("3")\
+    TEST, Z read, then\ 1 fragment / clock:\ edges, planes,\ depth test;\ texel addresses\ (13 stages)], name: <fh>),
+  built((2, 0), [shades, texel\ addresses: 2 banks\ depths: 3 banks\ drawn mask], name: <bf>),
+  built((3, 0), [*back half* #stall("4") #stall("5")\
+    1 fragment / clock:\ cache lookup (3),\ filter (4),\ combiner (4),\ alpha test], name: <bh>),
+  built((4, 0), [colour tile\ 2 banks], name: <ct>),
+  built((5, 0), [*writer*\ ≤ 4 masked\ 32-word runs], name: <wr>),
+  built((3, 1), [SDRAM arbiter #stall("6")\ scan-out first], name: <arb>),
+  chip((5, 1), [SDRAM], name: <sd>),
+  edge(<su>, <fh>, "-|>"),
+  edge(<fh>, <bf>, "-|>"),
+  edge(<bf>, <bh>, "-|>"),
+  edge(<bh>, <ct>, "-|>"),
+  edge(<ct>, <wr>, "-|>"),
+  edge(<fh>, <arb>, "<|-", [Z read], label-side: right),
+  edge(<bh>, <arb>, "<|-", [texels], label-side: left),
+  edge(<wr>, <arb>, "-|>", [writes], label-side: right),
+  edge(<arb>, <sd>, "<|-|>"),
+)))
+
+#text(size: 11.5pt, grid(
+  columns: (1fr, 1fr),
+  gutter: 1.2em,
+  [
+    - #stall("1") The front half waits for the next triangle's setup.
+    - #stall("2") TEST waits while the back half or the writer still holds
+      the same block (a later triangle over it).
+    - #stall("3") HANDOFF waits for the back half to be free; a block with
+      no pixel drawn goes nowhere.
+  ],
+  [
+    - #stall("4") A cache miss: a 16-word fetch, then that pixel again.
+      Only the back half stops.
+    - #stall("5") HANDOFF waits for the writer to be free.
+    - #stall("6") Every run waits for scan-out and its bank. A Z read and a
+      texel fetch are never in flight at once.
+  ],
+))
+
+== What overlaps: three blocks in flight
+
+// A block timeline: lanes of stages, a box per block a stage works on,
+// widths in cycles (the goal scene's figures, depth cleared, so no Z read).
+#let tl-scale = 0.0235cm
+#let tl-height = 0.62cm
+#let block-fills = (rgb("#c7d2fe"), rgb("#bbf7d0"), rgb("#fde68a"), rgb("#fbcfe8"), rgb("#bae6fd"))
+#let tl-box(start, len, label, fill) = place(dx: start * tl-scale, box(
+  width: len * tl-scale,
+  height: tl-height,
+  fill: fill,
+  stroke: 0.6pt + white,
+  radius: 2pt,
+  align(center + horizon, text(size: 8.5pt, label)),
+))
+#let tl-wait(start, len) = place(dx: start * tl-scale, box(
+  width: len * tl-scale,
+  height: tl-height,
+  stroke: (paint: stall-colour, thickness: 0.6pt, dash: "dotted"),
+  radius: 2pt,
+  align(center + horizon, text(size: 8pt, fill: stall-colour, [wait])),
+))
+#let lane(name, items) = (
+  align(right + horizon, text(size: 10pt, name)),
+  box(width: 900 * tl-scale, height: tl-height, items.join()),
+)
+#let b(k, start, len, label: none) = tl-box(start, len, if label == none [#k] else [#k #label], block-fills.at(calc.rem(k, 5)))
+
+#text(size: 10pt, grid(
+  columns: (3.4cm, 1fr),
+  row-gutter: 5pt,
+  column-gutter: 6pt,
+  align(right, text(fill: muted)[cycles]),
+  box(width: 900 * tl-scale, height: 1em, for c in (0, 150, 300, 450, 600, 750, 900) {
+    place(dx: c * tl-scale - 1em, box(width: 2em, align(center, text(fill: muted, [#c]))))
+  }),
+  [*v1.0*], [],
+  ..lane([one after another], (
+    b(0, 0, 90, label: [Z]), b(0, 90, 64, label: [pixels]), b(0, 154, 75, label: [texels]), b(0, 229, 225, label: [writes]),
+    b(1, 454, 90, label: [Z]), b(1, 544, 64, label: [pixels]), b(1, 608, 75, label: [texels]), b(1, 683, 217, label: [writes]),
+  )),
+  [*Phase 23*], [],
+  ..lane([both halves], (
+    b(0, 0, 152), b(1, 152, 152), tl-wait(304, 33), b(2, 337, 152), tl-wait(489, 33), b(3, 522, 152), tl-wait(674, 33), b(4, 707, 152),
+  )),
+  ..lane([writer], (
+    b(0, 152, 185), b(1, 337, 185), b(2, 522, 185), b(3, 707, 185),
+  )),
+  [*Phase 25*], [],
+  ..lane([front half], (
+    b(0, 0, 80), b(1, 80, 80), b(2, 160, 80), tl-wait(240, 105), b(3, 345, 80), tl-wait(425, 110), b(4, 535, 80), tl-wait(615, 110), b(5, 725, 80),
+  )),
+  ..lane([back half], (
+    b(1, 160, 75), tl-wait(235, 110), b(2, 345, 75), tl-wait(420, 115), b(3, 535, 75), tl-wait(610, 115), b(4, 725, 75),
+  ) + (b(0, 80, 75),)),
+  ..lane([writer], (
+    b(0, 155, 190), b(1, 345, 190), b(2, 535, 190), b(3, 725, 175),
+  )),
+))
+
+#text(size: 12.5pt)[
+  - Within each half, one fragment a clock; between the stages, whole
+    blocks, through the banked buffers: a stage hands a block on as soon as
+    the next stage is free, and doesn't wait for anything to drain.
+  - The writer now sets the pace: 64 colours and 64 depths a block, 128
+    words, while scan-out takes a fifth of the SDRAM. The goal scene keeps
+    it busy 98% of the time; Phase 23 had nearly reached that limit, so
+    overlapping the halves gained 6% there, 12% on the cube (depth reads).
+]
 
 = The host interface
 
@@ -741,6 +866,37 @@ serialisers and (later) the SPI link have clocks of their own.
   ],
 )
 
+== Performance at v1.1 (Phase 25)
+
+#grid(
+  columns: (1.15fr, 1fr),
+  gutter: 1.2em,
+  [
+    #set text(size: 13pt)
+    #table(
+      columns: (1fr, auto, auto),
+      [*Scene (twin, `just perf`)*], [*v1.0 ms*], [*now ms*],
+      [clear colour and depth], [9.1], [0.05],
+      [the screen, untextured], [32.1], [9.1],
+      [the screen, 64×64 bilinear (goal)], [32.8], [9.1],
+      [the screen, 256×256 minified], [64.5], [42.5],
+      [320 triangles of 8×8 px], [11.3], [1.2],
+      [120 triangles of 32×32 px], [16.5], [2.8],
+      [the cube, bilinear], [16.8], [2.7],
+    )
+  ],
+  [
+    #set text(size: 14pt)
+    - *Goal met:* the clear and a full-screen bilinear quad in 9.1 ms, a
+      60 fps frame being 16.5 ms.
+    - Fast clear (flags per block), overlapped writes, auto-precharge, then
+      the two halves of the fragment pipeline at once.
+    - *Now SDRAM-bound:* the writer's 128 words a block, with scan-out
+      taking a fifth of the bus; the writer is busy 98% of the goal scene.
+    - Minifying a large texture is still slow: texel fetches (no mipmaps).
+  ],
+)
+
 == Status by phase
 
 #text(size: 11.5pt, table(
@@ -762,7 +918,8 @@ serialisers and (later) the SPI link have clocks of their own.
   [17], [colour combiner and alpha test], done,
   [18], [bilinear filtering: a banked texture cache], done,
   [19], [v1.0 frozen for games: performance figures], done,
-  [20–26], [v1.1: faster drawing (fast clear, SDRAM, overlapped blocks)], next,
+  [20–25], [v1.1: faster drawing (fast clear, overlapped writes, SDRAM auto-precharge, both fragment pipeline halves at once)], done,
+  [26], [v1.1 frozen: performance figures], next,
   [—], [SPI from an RP2350; alpha blending; meshes kept in SDRAM], later,
 ))
 
@@ -780,13 +937,11 @@ serialisers and (later) the SPI link have clocks of their own.
   accumulator are checked at run time over the test corpus.
 - *Link bandwidth:* 3 Mbaud carries about 550 transactions a frame at 60
   fps, roughly 250 triangles; SPI or meshes in SDRAM lift it after v1.0.
-- *Drawing speed:* about 460 cycles per 8×8 block, its SDRAM reads, pixels
-  and writes one after another, and a 9.1 ms clear in a 16.5 ms frame.
-  Overlapping blocks and a fast clear (per-block flags) are the first work
-  after v1.0.
-- *Core timing margin:* 76.2 MHz against 75 (81.8 one build earlier):
-  placement moves it by several MHz from build to build, on the same
-  scan-out-to-arbiter path.
+- *Drawing speed:* about 190 cycles per 8×8 block (460 at v1.0), bound by
+  the SDRAM: 128 words written a block, and scan-out. 64-word runs would
+  save a few percent; more needs fewer words or a faster bus.
+- *Core timing margin:* 85.2 MHz against 75 at Phase 25 (76.2 at v1.0);
+  placement moves it by several MHz from build to build.
 - *`just check` time:* about 3 minutes since Sinter rc.3 compiles
   `sinter sim` (45 before); a 16M-cycle cosim still holds 11 GB (R11).
 - *Sinter gaps:* const generics; a slow `async_fifo` (needed for SPI);
