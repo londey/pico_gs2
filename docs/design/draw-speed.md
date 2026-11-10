@@ -6,8 +6,8 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done (§7),
-Phase 23 next. Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
+**Status:** approved 2026-11-10 (Phase 20); Phases 21 and 22 done, and
+23 in simulation (§7): **the goal is met** (746,840 cycles, 10 ms). Phases 23 and 24 swapped after Phase 22 (§7): the SDRAM
 work counts in full only once blocks overlap.
 
 ## 1. Goal
@@ -126,7 +126,7 @@ measurements.
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
-| 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Pixel-exact; tests of consecutive triangles in one block; mutations; resources and timing; on the board |
+| 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done in simulation: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met. On the board: to do |
 | 24 | `phase-24-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 25 | `phase-25-overlap-passes` | The pixel pass of one block overlaps the texel pass of the one before (§3.3) | Pixel-exact; mutations; **the goal scene at 60 fps** |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
@@ -306,3 +306,49 @@ block's writes with the next block's passes would save about 150 (a
 block costs about the larger of its SDRAM time and its computing, not
 their sum). Once blocks overlap, the SDRAM is the limit, and the
 controller's savings count in full; so the overlap comes first.
+
+### Phase 23: overlapped writes
+
+- **As built:** the passes hand a finished block (HANDOFF) to a writer in
+  the rasteriser, with its tile bank, drawn pixels, cleared flags, block
+  and the triangle's write enables, and go on to the next block; the
+  writer writes its runs, then the block's flags. `tile` and `ztile` are
+  128 words, two banks of a block (`ztile` with a second read port, for
+  the depth test and the writer at once). The passes' runs (depth reads,
+  texture blocks) and the writer's share the rasteriser's request, the
+  passes' first, a run held in front of the arbiter until accepted. A
+  block the writer still has is not tested again until its flags are
+  written back: a later triangle's block sees the earlier one's depths
+  and flags. 81.0 MHz in 18,862 cells (77%), 8,375 flip-flops, 36
+  DP16KD (+545 cells, +112 flip-flops); the critical path is the writer's
+  request into the arbiter, mostly routing.
+- **Tests:** every twin test stays pixel-exact. Removing the wait for the
+  writer passed all six of them (their consecutive triangles never
+  depended on a block still being written) but failed `just perf`'s
+  small-triangle scene's pixel check; so a new test, `overlap.rs`,
+  draws three layers of strips of small triangles (the second, farther,
+  hidden by the first's depths), and pairs of triangles over the same
+  blocks at alternating depths, some writing depth only or colour only.
+  10 deliberate breaks, each caught: no wait for the writer; the wait
+  ending before the flags are written back; a handoff while the writer
+  is busy; the passes' bank not swapped; the writer reading the passes'
+  colour or depth bank; the writer using the passes' drawn pixels or
+  write enables; a run not held until accepted; the flags written to the
+  passes' block.
+
+| Scene | Phase 22 | Phase 23 |
+|---|---|---|
+| full screen, untextured | 1,226,275 | 723,086 |
+| **full screen, 64 × 64 bilinear (the goal)** | **1,279,202 (17.1 ms)** | **746,840 (10.0 ms)** |
+| full screen, 256 × 256 minified | 3,640,073 | 3,255,241 |
+| full screen, 256 × 256 magnified | 1,356,226 | 853,030 |
+| 320 triangles of 8 px | 122,237 | 92,627 |
+| 120 triangles of 32 px | 389,436 | 223,546 |
+| the cube, bilinear | 398,407 | 236,596 |
+
+The goal scene now takes 60% of a 60 fps frame. In it the SDRAM is busy
+90% of the time (drawing 70%, scan-out 20%), so drawing is now limited by
+the SDRAM, which is Phase 24's. Small triangles spend 17 to 19% of
+their time waiting in TEST for the writer to finish a block they share;
+Phase 25, or a later one, could test such a block's pixels against the
+writer's tile instead of waiting.

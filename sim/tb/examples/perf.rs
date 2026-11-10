@@ -417,8 +417,8 @@ fn frame(present: bool, clear_colour: bool) -> Transaction {
 
 /// The rasteriser's states (`hw/raster.snt`, `R_*`), by value.
 const RASTER_STATES: [&str; 13] = [
-    "idle", "copy", "init", "test", "pixels", "write", "next", "decide", "zread", "clear", "drain",
-    "texel", "flush",
+    "idle", "copy", "init", "test", "pixels", "handoff", "next", "decide", "zread", "clear",
+    "drain", "texel", "flush",
 ];
 
 /// One scene's result.
