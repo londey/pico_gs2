@@ -1,7 +1,7 @@
 # 0009: The v1.0 interface
 
 **Status:** Accepted (2026-11-08). Built in Phases 15 to 18, all of it,
-bilinear included; frozen as v1.0 at Phase 19 (2026-11-09).
+bilinear included; frozen as v1.0 at Phase 19 and approved 2026-11-10.
 
 ## Context
 

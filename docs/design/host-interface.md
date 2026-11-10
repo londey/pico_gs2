@@ -12,7 +12,7 @@ field means the same thing. ADR [0008](../adr/0008-register-host-interface.md)
 records the register interface and ADR
 [0009](../adr/0009-v1-interface.md) its v1.0 scope.
 
-**Status:** v1.0, interface version 2, frozen at Phase 19 (2026-11-09).
+**Status:** v1.0, interface version 2, frozen at Phase 19 and approved 2026-11-10.
 Everything here is built and works on the board except what is marked
 *after v1.0* (the SPI link, §11, and reserved fields and codes). Version 1
 (Phase 13) was the first; §14 lists what version 2 changes. A later change
@@ -29,7 +29,7 @@ changes.
 | 16 | `phase-16-textures` | `TEX0_CFG` (§6); RGB565 and ARGB4444; the texture cache; perspective-correct nearest sampling; the wrap modes; texture × shade | Pixel-exact against the reference renderer; a textured cube on the board; frame time and cache hit rate measured |
 | 17 | `phase-17-combiner` | `CC_MODE`, `CONST0`, `CONST1` (§7); alpha test (§8); `RENDER_MODE` version 2 | Pixel-exact; a scene with cut-out alpha and the combiner's presets on the board |
 | 18 | `phase-18-bilinear` | Bilinear filtering (§6.3): a banked texture cache reading four texels a cycle; `gs-host` filters its cube | Pixel-exact; resources and timing; the filtered cube on the board |
-| 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); `SCRATCH`, a register to test a link with; this document frozen as v1.0 | Approved |
+| 19 | `phase-19-v1` | Resources, timing and performance figures (§15, §17); `SCRATCH`, a register to test a link with; this document frozen as v1.0 | Done: approved 2026-11-10 |
 
 Phases 15 to 18 each passed their gate: §16 lists their tests and §18 their
 runs on the board.
