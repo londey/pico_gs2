@@ -153,7 +153,7 @@ measurements.
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Done: pixel-exact; `fast_clear.rs`; the clear 3,603 cycles; 14 mutations caught; 83.2 MHz; on the board, three read-backs pixel-exact |
 | 23 | `phase-23-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and passes (§3.3) | Done: pixel-exact; `overlap.rs`; 10 mutations caught; 81.0 MHz; the goal met; on the board, three read-backs pixel-exact |
 | 24 | `phase-24-sdram` | Auto-precharge and back-to-back runs (§3.2); the SDRAM model taught auto-precharge | Done: no model violations; pixel-exact; 6 mutations caught; 83.5 MHz; on the board, three read-backs pixel-exact |
-| 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Done in simulation: pixel-exact; 9 mutations caught; 85.2 MHz; the goal scene 685,775 cycles. On the board: to do |
+| 25 | `phase-25-overlap-passes` | The two halves of the fragment pipeline run at once (§3.3) | Done: pixel-exact; 9 mutations caught; 85.2 MHz; the goal scene 685,775 cycles; on the board, three read-backs pixel-exact |
 | 26 | `phase-26-v1-1` | Performance figures (host-interface §15 updated), resources, slides; v1.1 | Approved |
 
 **Estimates**, per block a triangle touches (§2's 460 cycles today) and
@@ -486,3 +486,10 @@ What could go further: 64-word runs (a few percent); fewer words written
 a block; or testing a later triangle's pixels against the block in
 flight instead of waiting for it.
 
+**On the board:** the built-in scene read back pixel for pixel; the
+streamed textured cube, 616 frames sent at 60.7 fps, read back pixel for
+pixel; so did the combiner demo's last frame. Draw times are about 11%
+shorter than Phase 24's on the board, as in simulation: 206,893 cycles
+for the built-in scene's frame 15 (231,309), 195,366 for a comparable
+frame that took 218,676, and 204,914 for a streamed cube frame
+(232,060).
