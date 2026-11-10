@@ -886,6 +886,11 @@ Phase 18, bilinear, with every block of the frame now through the pass
 
 ## 18. On the board
 
+**Phase 19.** On the v1.0 bitstream (76.2 MHz), `gs-host --status` read
+`ID` (interface 2), wrote `SCRATCH` with its six patterns and read each
+back as written, and read `STATUS`: the built-in scene, a frame drawn in
+1,252,161 cycles.
+
 **Phase 18.** `gs-host --screenshot` uploaded the cube's texture in 0.03 s
 and streamed the cube, filtered bilinear, for 10 s: 609 frames sent and 608
 shown, 60.2 a second, at 3,976 transactions a second (12% of the line). The
