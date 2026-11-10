@@ -122,7 +122,7 @@ measurements.
 | Phase | Branch | Work | Gate |
 |---|---|---|---|
 | 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
-| 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged |
+| 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | Done: 83.5 MHz; the perf check in `just check`; every figure unchanged; on the board |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers, and a block first drawn in one half only; the clear about 7,200 cycles (0.1 ms); mutations; on the board, read-backs pixel-exact |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
 | 24 | `phase-24-overlap-writes` | Two sets of tile buffers: one block's writes overlap the next block's depth read and pixel pass (§3.3) | Pixel-exact; mutations; resources and timing; on the board |
@@ -206,6 +206,10 @@ falls well short of its estimate, I report before going on.
 - **The display never runs short:** the host, memory, texture and
   combiner twin tests now assert it, as the frame test did.
 - **Every figure is v1.0's**, to the cycle (host-interface §15).
+- **On the board:** `gs-host --status --screenshot` read the built-in
+  scene back from the 83.5 MHz bitstream, pixel for pixel its frame 14,
+  with `SCRATCH`'s round trips and a frame drawn in 1,252,161 cycles, as
+  before.
 
 The SDRAM over a frame, from `just perf`: during the full-screen quad it
 is in no run for 28% of the frame (the pixel and texel passes, with the
