@@ -1,6 +1,6 @@
 # 0010: v1.1, drawing speed at the v1.0 interface
 
-**Status:** Proposed (2026-11-10)
+**Status:** Accepted (2026-11-10)
 
 ## Context
 

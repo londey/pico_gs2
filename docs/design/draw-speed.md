@@ -6,7 +6,7 @@ register, field or behaviour a host can see changes, except how long
 things take. ADR [0010](../adr/0010-v1-1-draw-speed.md) records the
 decision.
 
-**Status:** Phase 20, the plan, for approval (2026-11-10).
+**Status:** approved 2026-11-10 (Phase 20); Phase 21 next.
 
 ## 1. Goal
 
@@ -121,7 +121,7 @@ measurements.
 
 | Phase | Branch | Work | Gate |
 |---|---|---|---|
-| 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Approved |
+| 20 | `phase-20-draw-plan` | This plan and ADR 0010 | Done: approved 2026-11-10 |
 | 21 | `phase-21-groundwork` | Timing headroom back above 80 MHz (registering scan-out's `presenting` path, the critical path at v1.0); `just perf` with SDRAM bus use by requester, and a regression check in `just check` against recorded figures; every twin test asserts the display never ran short; the v1.1 goal scene in `just perf` | ≥ 80 MHz; the perf check in `just check`; no change in any figure |
 | 22 | `phase-22-fast-clear` | Cleared flags per block (§3.1): clear, depth reads, writes, scan-out, `MEM_DATA` reads | Pixel-exact; a new twin test reading back cleared, partly drawn and depth-only-cleared buffers, and a block first drawn in one half only; the clear about 7,200 cycles (0.1 ms); mutations; on the board, read-backs pixel-exact |
 | 23 | `phase-23-sdram` | Overlapped runs in other banks, auto-precharge, 64-word runs (§3.2) | No SDRAM model violations; pixel-exact; scan-out never short; per-block SDRAM time measured; on the board |
