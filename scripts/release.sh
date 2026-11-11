@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 tag="${1:-$(git describe --tags --exact-match 2>/dev/null || true)}"
 if [[ -z "$tag" ]]; then
-    echo "error: HEAD has no tag; pass one: just release v1.1" >&2
+    echo "error: HEAD has no tag; pass one: just release v1.1.0" >&2
     exit 1
 fi
 if [[ ! -f "docs/releases/$tag.md" ]]; then

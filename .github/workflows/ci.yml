@@ -95,6 +95,7 @@ jobs:
           verilator --version
           typst --version
           rustc --version
+          df -h /
 
       - name: just ci
         run: just ci

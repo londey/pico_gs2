@@ -83,15 +83,20 @@ root_of() {
 # expectation or any difference between the two. Each run builds its own
 # simulator, in build/sim/<case>/: sinter sim writes the stimulus to a fixed
 # file in its --sim-dir, so runs sharing one would overwrite each other's
-# (docs/sinter-requirements.md R12).
+# (docs/sinter-requirements.md R12). A failing run's Verilator traces stay in
+# build/cosim/<case>/.
 cosim() {
     local csv=$1
     local name root
     name=$(basename "$csv" .csv)
     root=$(root_of "$csv")
     echo "==> sinter sim $root --stimulus $csv --cosim"
+    rm -rf "build/cosim/$name"
     RUST_LOG=warn sinter sim "$root" --stimulus "$csv" --quiet \
-        --sim-dir "build/sim/$name" --cosim --cosim-dir "build/cosim/$name" > /dev/null
+        --sim-dir "build/sim/$name" --cosim --cosim-dir "build/cosim/$name" > /dev/null || return
+    # A passing run's traces (up to 2 GB) only fill the disk, which a CI
+    # runner hasn't room for; a failing run's stay, to look into.
+    rm -rf "build/cosim/$name"
 }
 
 # Directed tests: hw/tests/<root>.<case>.csv.
