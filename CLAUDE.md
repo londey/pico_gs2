@@ -57,6 +57,7 @@ docs/adr/               architecture decision records, NNNN-title.md
 docs/slides/            Typst architecture slides (Touying + Fletcher, the theme in
                         theme/pico.typ, Inter and JetBrains Mono); `just slides`
 docs/sinter-requirements.md  Sinter gaps pico_gs2 needs closed, with stopgaps
+docs/releases/          release notes, <tag>.md: the GitHub release's text
 build/                  (git-ignored) generated Verilog, simulator crates, bitstreams
 ```
 
@@ -76,6 +77,7 @@ bitstreams all live in `build/`.
 | `just setup-report` | place and route the setup engine alone at 75 MHz; resources, Fmax, critical path |
 | `just slides` | `typst compile` each `docs/slides/*.typ` into `build/slides/*.pdf` |
 | `just gs-host` | build `sim/target/release/gs-host`, the PC tool for the host link (the user runs it on the host) |
+| `just release [tag]` | gather a release into `build/release/<tag>/`: the bitstream, `gs-proto` as a standalone crate, its rustdoc and the design docs, `gs-host`, the slides, checksums (needs `just bitstream` and `just slides` first); CI runs it for a pushed `v*` tag and publishes a GitHub release |
 | `just flash` | `openFPGALoader -b icepi-zero build/fpga/top.bit` (the user runs this) |
 | `just ci` | everything CI runs, in order |
 | `just clean` | remove `build/` and `sim/target/` |

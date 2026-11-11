@@ -52,3 +52,8 @@ flash:
 # Everything CI runs, in order.
 ci:
     scripts/ci.sh
+
+# Gather a release's files into build/release/<tag>/ (after bitstream and
+# slides); the tag defaults to the one on HEAD.
+release *tag:
+    scripts/release.sh {{tag}}

@@ -823,11 +823,11 @@ impl Wrap {
 /// A texel format (host-interface.md §6.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TexFormat {
-    /// R[15:11] G[10:5] B[4:0], opaque.
+    /// `R[15:11] G[10:5] B[4:0]`, opaque.
     #[default]
     Rgb565,
 
-    /// A[15:12] R[11:8] G[7:4] B[3:0].
+    /// `A[15:12] R[11:8] G[7:4] B[3:0]`.
     Argb4444,
 }
 

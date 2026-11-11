@@ -1,11 +1,17 @@
 # Builds the design, runs every check and test, lints the Verilog and builds
 # a bitstream that must meet timing. Tool versions match .devcontainer/Dockerfile.
+# A pushed v* tag also publishes a GitHub release (scripts/release.sh), with
+# docs/releases/<tag>.md as its notes.
 name: CI
 
 on:
   push:
     branches: [master]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 env:
   OSS_CAD_SUITE_DATE: "2026-01-27"
@@ -19,6 +25,9 @@ env:
 jobs:
   ci:
     runs-on: ubuntu-24.04
+    permissions:
+      # Creating a release on a tag.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -104,3 +113,18 @@ jobs:
         with:
           name: slides
           path: build/slides/*.pdf
+
+      - name: Gather the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: just release "${GITHUB_REF_NAME}"
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "pico_gs2 ${GITHUB_REF_NAME}" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
+            --verify-tag \
+            build/release/"${GITHUB_REF_NAME}"/*
