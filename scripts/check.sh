@@ -109,6 +109,8 @@ done | parallel directed
 # them by lint.sh, above.)
 echo "==> verilator board/tb/tmds_gearbox_tb.sv"
 tb=build/verilator/tmds_gearbox_tb
+# Verilator makes -Mdir but not its parents, which a fresh checkout lacks.
+mkdir -p "$tb"
 verilator --binary --timing -Wall -Wno-UNUSEDSIGNAL --top-module tmds_gearbox_tb \
     -Mdir "$tb" -o tb board/tb/tmds_gearbox_tb.sv board/tmds_gearbox.sv > /dev/null
 for offset in 0 1333 2666 4000; do
